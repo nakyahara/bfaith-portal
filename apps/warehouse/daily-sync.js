@@ -20,6 +20,7 @@ import { planFinanceMonths, writePendingMonths, FINANCE_DIRTY_DAYS, accountFeesM
 import { financeCoordinatorEnabled, settlementStep, financePushStep, FINANCE_COORDINATOR_ENV, legacyGateCheck } from './finance-coordinator-switch.js';
 import { skipAfterCompare, gateRetryJobs, STEP_NAME as NEW_ENTRY_GATE_STEP } from '../company-db/master-compare/new-entry-gate.mjs';
 import { readLzCodeNotice } from '../master-decisions/lz-code-notice.mjs';
+import { neApiUsageForDailySync } from './ne-api-usage.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(__dirname, '..', '..');
@@ -1717,8 +1718,20 @@ async function main() {
   // 「NE の商品コードの書き方」の問題 (NE に大文字・小文字だけ違う書き方が 2 つ・NE とロジザードで書き方が違う など) を、商品と直し方つきでまとめの最後に出す (10/16 中原さん)。
   // 材料 = いま流した lz-daily の報告 (この回の証跡・sha256 が合うときだけ)。新しい問い合わせ・定期実行はしない・lz-daily の合否は変えない。
   // 読めない = 何も足さない (まとめを止めない・壊さない)。段の結果 (results) には足さない = 見出しの ✅ / ⚠️ と retry は今のまま
+  // 🆕 2026-10-21 (lzd-v4): 「ロジザードに送れなかった商品」(外した行 = 原価が無い・仕入先が無い なども) を全部、商品のページへのリンクと直し方つきで出す
+  //   (lz-daily の段の 1 行にも件数と先頭の 3 つのコード。外した行があっても、ほかが全部通れば合格 = その夜に取り込む)
   const lzCodeNotice = readLzCodeNotice({ dataDir: process.env.DATA_DIR || path.join(PROJECT_DIR, 'data'), asOf: lzDailyAsOf, syncRunId: process.env.DAILY_SYNC_RUN_ID,
     warn: (s) => console.warn(s) });
+
+  // ─── NE へ送る (AI_reference CompanyDB構想/25・2026-10-19 中原さん「差分がある部分を CSV で 1 日 1 回アップ」・migration 0094) ───
+  // 照合 ② (今朝の NE の値) とロジザードの影 (今朝のロジザードの書き方) の後に 1 回。自社で直したけれど今朝の NE と違う欄だけを CSV にして NE の API で上げる。
+  // 🚨 最初は止めて出す: miniPC の .env に NE_UPDATE_UPLOAD=1 と NE_UPDATE_AUTO=1 が無ければ上げない (差の数だけまとめに出す・exit 0)。
+  // 多すぎる朝 (100 行を超える・ふだんの 5 倍) は DB が作らない = ⚠️「送りませんでした」(exit 0)。上げられなかった・NE が断った = ❌ (exit 1)。
+  // 同じ今朝の NE の回で 2 回目は前の答え (retry に載せない = 載せても 2 回は送らない)。照合が失敗した朝は流さない
+  const neUpdateResult = masterCompareResult.success
+    ? runScript('scripts/company-db/ne-update-send.mjs --daily', 'NEへ送る', 600000)
+    : { success: true, skipped: true, summary: '⏭️ 見送り (マスタ照合が失敗 = 今朝の NE の値が無い・NE には何も送っていない)' };
+  results.push({ name: 'NEへ送る', ...neUpdateResult, warn: neUpdateResult.success && isWarnSummary(neUpdateResult.summary) });
 
   // ─── Company DB の見張り (設計 = AI_reference CompanyDB構想/09。全部の push の後・要約の前) ───
   // 今朝の push の証跡 (DATA_DIR/company-db-evidence/<今日>/。送り手が書く) と Render の完了の印 (stock_capture_days / stock_diff_days / ingest_runs / 売上日次の state) を読み、
@@ -1877,6 +1890,16 @@ async function main() {
     }
   }
 
+  // ─── NE の API の回数 (今月・JST。ne-api-usage.js) ───
+  // NE を呼ぶ段 (NE・NEへ送る) が全部終わった後に 1 回読む。まとめに 1 行 (段の結果 = results には足さない = 見出しの ✅ / ⚠️ と retry は今のまま)。
+  // NE_API_MONTHLY_WARN (既定 700,900,1000) を超えたら ⚠️ の行 + その数ごとに月 1 回だけ別の GChat の知らせ (送れた数を覚える)。読めない・送れないでも止めない
+  let neApiUsageLine = null;
+  try {
+    neApiUsageLine = (await neApiUsageForDailySync({ dataDir: process.env.DATA_DIR || path.join(PROJECT_DIR, 'data'), notify })).line;
+  } catch (e) {
+    console.warn(`[DailySync] NE の API の回数を出せない (${e.message})`);
+  }
+
   // 通知メッセージ作成
   // 期限切れ系（🔴🟡）のみ通知に含め、設定チェック系は同期失敗時のみ表示
   const urgentWarnings = tokenWarnings.filter(w => w.startsWith('🔴') || w.startsWith('🟡'));
@@ -1890,6 +1913,7 @@ async function main() {
     const icon = resultIcon(r);
     msg += `${icon} ${r.name}: ${r.summary}\n`;
   }
+  if (neApiUsageLine) msg += `\n${neApiUsageLine}\n`;
   if (retryableFailed.length > 0) {
     if (retryStateWritten) {
       // 残っている再試行の時刻だけを書く。11:30 を過ぎていれば その日は自動で再試行されない = 手で (翌朝の再試行は別日の state を消す。#1538 Codex R1 High)
@@ -1913,7 +1937,7 @@ async function main() {
     msg += `\n*💾 ディスク容量アラート:*\n`;
     for (const w of diskWarnings) msg += `${w}\n`;
   }
-  // NE の商品コードの書き方 (lz-daily の報告から。上限 10 行 + ほか N 件)。いちばん後ろ = 本文が長い朝に切られても上の大事な知らせは残る
+  // ロジザードに送れなかった商品 / NE の商品コードの書き方 (lz-daily の報告から。上限 10 行 + ほか N 件)。いちばん後ろ = 本文が長い朝に切られても上の大事な知らせは残る
   if (lzCodeNotice.length > 0) msg += `\n*${lzCodeNotice[0]}*\n${lzCodeNotice.slice(1).join('\n')}\n`;
 
   console.log('\n' + msg);  // ローカルログには全文を残す

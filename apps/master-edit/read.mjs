@@ -14,7 +14,7 @@ import { salesOfCodes } from './sales-qty.mjs';
 import { checkDeadline, ListTimeoutError } from './deadline.mjs';
 import { normProductCode } from '../purchase-orders/db.js';
 import { TOKEN_RE } from './search-token.mjs';
-import { readCurrent, setDerivations, editTokenOf, changesSince, fieldOwnership, costAsOfJoin, jstDate, COMPANY_ID, fieldsOf, REG_CSV_FIELDS, issuedCsv, OVERRIDE_SOURCES, logizardLockOf } from '../../lib/master-write.mjs';
+import { setCompOnLoadReady, readCurrent, setDerivations, editTokenOf, changesSince, fieldOwnership, costAsOfJoin, jstDate, COMPANY_ID, fieldsOf, REG_CSV_FIELDS, OVERRIDE_SOURCES, logizardLockOf, regEditAfterIssue, REG_LOCK_AFTER_ISSUE } from '../../lib/master-write.mjs';
 import { deriveSetSalesClassCdb } from '../../lib/master-set-rules.js';
 import { readCutoverPhase, newEntryWritable } from '../../lib/master-cutover.mjs';
 import { latestRun } from '../master-decisions/decide.mjs';
@@ -25,6 +25,8 @@ import { normalizeSort, sortColumnOf } from './list-columns.mjs';
 import { masterProfit } from '../../lib/profit-estimate.js';
 import { readNeSpellings, exportCode } from './ne-spelling.mjs';
 import { makerNamesOf } from '../../lib/master-maker.mjs';
+import { packagesOf } from '../../lib/master-package.mjs';
+import { brandLifeOf, brandLifeTablesExist, LIFE_FILTERS, END_SOON_DAYS } from '../../lib/master-brand-life.mjs';
 
 /** 代表の仕入先に選べる仕入先 = 取引中・「NE に登録した」の申告が済んだ (新しい仕入先) か前からある仕入先 (0053) */
 export async function selectableSuppliers(db) {
@@ -136,6 +138,8 @@ export function normalizeFilters(q = {}) {
     tax: pick(String(q.tax ?? ''), TAX_FILTERS),
     sales: pick(String(q.sales ?? ''), SALES_FILTERS),
     po: q.po === '1' ? '1' : '',
+    // 🆕 0088: 商品の段階 (終売の予定が近い・区分)。lib/master-brand-life.mjs の LIFE_FILTERS
+    life: pick(String(q.life ?? ''), LIFE_FILTERS),
     // 登録日の範囲 (0057)。'YYYY-MM-DD' (input type=date) か 'YYYY/M/D'。読めない日付は捨てる
     reg_from: dateText(q.reg_from), reg_to: dateText(q.reg_to),
     // 長い詳細検索の条件の印 (search-token.mjs・router が中身に戻してから渡す)。形だけ確かめる
@@ -273,6 +277,16 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
         where.push(`(s.sku_kind = 'set' or s.code_norm = any($${inRange}::text[]) or not (s.code_norm = any($${params.length}::text[])))`);
       } else where.push(`(s.sku_kind = 'set' or s.code_norm = any($${inRange}::text[]))`);
     }
+  }
+  // 🆕 0088: 商品の段階 (単品の商品の行だけ)。表が無い・読めない = 何も当てない (区分なし = 単品の全部)
+  if (f.life) {
+    const lifeOn = await brandLifeTablesExist(db);
+    const ex = (cond) => `exists (select 1 from core.product_lifecycle l where l.product_id = s.product_id and ${cond})`;
+    if (f.life === 'stage_none') where.push(lifeOn ? `s.sku_kind = 'single' and not ${ex('l.stage is not null')}` : `s.sku_kind = 'single'`);
+    else if (!lifeOn) where.push('false');
+    else if (f.life === 'end_soon') { params.push(today); where.push(ex(`l.end_planned_on <= $${params.length}::date + ${END_SOON_DAYS}`)); }
+    else if (f.life === 'end_set') where.push(ex('l.end_planned_on is not null'));
+    else { params.push(f.life); where.push(ex(`l.stage = $${params.length}`)); }
   }
   // 登録の状態とカードは別々の絞り込み (両方 = 両方に合う商品。PR #1566 Codex R2 Low)
   const hasReg = await regclass(db, 'ops.master_registrations');
@@ -466,6 +480,22 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
     const names = await makerNamesOf(db, pageRows.filter((r) => r.kind === 'single').map((r) => r.product_id));
     for (const r of pageRows) r.maker = (r.kind === 'single' && r.product_id && names.get(r.product_id)) || null;
   }
+  // 🆕 0087: 梱包した状態の 縦・横・高さ・重さ (単品の商品の行だけ・まとめた値 = 一覧の「大きさ・重さ」の列と CSV の最後の列)。表が無い・読めない = 空
+  {
+    const pk = await packagesOf(db, pageRows.filter((r) => r.kind === 'single').map((r) => r.product_id));
+    for (const r of pageRows) r.pkg = (r.kind === 'single' && r.product_id && pk.get(String(r.product_id))) || null;
+  }
+  // 🆕 0088: ブランド・区分・終売の予定日 (単品の商品の行だけ・一覧の列と CSV の最後の列)。表が無い・読めない = 空
+  {
+    const bl = await brandLifeOf(db, pageRows.filter((r) => r.kind === 'single').map((r) => r.product_id));
+    for (const r of pageRows) {
+      const x = r.kind === 'single' && r.product_id ? bl.get(String(r.product_id)) : null;
+      r.brand = x && x.brand ? x.brand.name : null;
+      r.brand_own = !!(x && x.brand && x.brand.own_brand);
+      r.life_stage = x ? x.stage : null;
+      r.end_planned_on = x ? x.end_planned_on : null;
+    }
+  }
   // JAN (CSV だけ = 画面の一覧には出さない)。商品ごと・今の JAN (終わっていない) を並べる
   if (mode === 'all') {
     const pids = [...new Set(pageRows.map((r) => r.product_id).filter(Boolean))];
@@ -607,7 +637,7 @@ export async function readSkuPage(db, code, { now = new Date(), ownership = null
       cur, costs, suppliers, activeSuppliers, jan, usedIn, usedInCount, amazon, csvRows, today, card, regItems, recent, locks, registered,
       state: cur.handling === 'discontinued' ? 'discontinued' : 'available',
       derived: cur.sku_kind === 'set' ? setDerivations(cur) : null,
-      fields: fieldOwnership(cur.sku_kind, ownership || {}, open && !!ownership && newEntryWritable(phase, ownership)),
+      fields: fieldOwnership(cur.sku_kind, ownership || {}, open && !!ownership && newEntryWritable(phase, ownership), { requestOnLoad: await setCompOnLoadReady(db) }),
       breaches,
       phase,
       token: editTokenOf(cur),
@@ -621,10 +651,12 @@ export async function readSkuPage(db, code, { now = new Date(), ownership = null
 /**
  * 保存しても断られる欄 (画面は入力欄でなく 🔒 の値で見せる)。読むだけ = 保存の確かめ (lib/master-write.mjs) はそのまま。
  *   reg = 新商品の NE 登録の CSV を配った後 (issued / import_declared / partial) = REG_CSV_FIELDS の欄 (409 reg_csv_issued)。
- *         単品の税率はそれを含むセット (今の構成 + 開いている構成の依頼) の CSV にも入る = そのセットの CSV も見る
- *   csv = 既にある商品の NE に取り込む CSV (0040) が出ている列 (409 csv_issued・issuedCsv と同じ条件)
+ *         単品の税率はそれを含むセット (今の構成 + 開いている構成の依頼) の CSV にも入る = そのセットの CSV も見る。
+ *         🆕 0093 (2026-10-19 中原さん): 0093 の後の DB では閉じない (配った後も直せる = ほかの商品と同じ見た目)。0093 の前の DB だけ今までどおり 🔒
+ *   (🆕 10/19・0094: 既にある商品の NE に取り込む CSV (0040) が出ている列は 🔒 にしない = 編集は自由)
  *   (🆕 PR-7: 代表 (親) は保存の欄から外した = この画面では直さない・🔒 も出さない。代表は「色違い・サイズ違い」の欄に読むだけで出す)
- * 戻り値 = { fields: { 欄: { why: 'reg' | 'csv', exports: [番号] } }, regExports: [番号], taxParentCodes: [コード] }
+ *   reg_wait = 🆕 0093 の後もセットの構成 (依頼) だけは、そのセットの NE 登録の CSV の確かめが終わるまで閉じる (REG_LOCK_AFTER_ISSUE)
+ * 戻り値 = { fields: { 欄: { why: 'reg' | 'reg_wait' | 'csv', exports: [番号] } }, regExports: [番号], taxParentCodes: [コード] }
  */
 async function readFieldLocks(db, cur) {
   const fields = {};
@@ -640,8 +672,9 @@ async function readFieldLocks(db, cur) {
     const issued = ['issued', 'import_declared', 'partial'];
     const mine = (await db.query('select distinct export_id::text as id from ops.ne_reg_export_items where sku_id = $1 and state = any($2::text[]) order by 1', [cur.sku_id, issued])).rows.map((r) => r.id);
     regExports.push(...mine);
-    if (mine.length) for (const f of REG_CSV_FIELDS[kind] || []) put(f, 'reg', mine);
-    if (kind === 'single') {
+    const regLock = !(await regEditAfterIssue(db));   // 🆕 0093: 0093 の後の DB = 配った後も閉じない (セットの構成だけ確かめまで閉じる = REG_LOCK_AFTER_ISSUE)
+    if (mine.length) for (const f of (regLock ? REG_CSV_FIELDS[kind] : REG_LOCK_AFTER_ISSUE[kind]) || []) put(f, regLock ? 'reg' : 'reg_wait', mine);
+    if (regLock && kind === 'single') {
       const hasReq = await regclass(db, 'ops.sku_component_requests');
       const parents = (await db.query(`select distinct i.export_id::text as id, k.code from ops.ne_reg_export_items i join core.skus k on k.sku_id = i.sku_id
          where i.state = any($2::text[]) and (i.sku_id in (select c.parent_sku_id from core.sku_components c where c.child_sku_id = $1::bigint)
@@ -653,14 +686,7 @@ async function readFieldLocks(db, cur) {
       }
     }
   }
-  const colToField = new Map(Object.entries(defs).filter(([, d]) => d.csvCol).map(([f, d]) => [d.csvCol, f]));
-  if (colToField.size) {
-    for (const r of await issuedCsv(db, cur.code_norm, [...colToField.keys()])) {
-      const f = colToField.get(r.col);
-      if (f && !fields[f]) put(f, 'csv', [r.export_id]);
-      else if (f && fields[f].why === 'csv') put(f, 'csv', [r.export_id]);
-    }
-  }
+  // 🆕 10/19 (0094): NE に取り込む CSV (0040) が出ている列も保存できる (編集は自由) = 🔒 にしない
   return { fields, regExports, taxParentCodes };
 }
 

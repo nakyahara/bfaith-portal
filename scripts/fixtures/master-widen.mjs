@@ -68,8 +68,10 @@ export async function seedNewEntryLease(db, { actor = 'test', runId = null, kind
   const lease = (await one(db, "select ops.grant_new_entry_lease('single', $1) as r", [run])).r;
   // 🆕 0068: 同じ照合の回の代表 (親) の数え (NE = Company DB の観測 = 0) も残す (products.parent が company の DB で新しい NE 登録の CSV の門が開く)
   await seedParentGate(db, { runId: run });
-  // withSet = セットの CSV の 0053 の道を試験するためだけに、同じ結果の行のセットの許可を直接置く (本番には出す道が無い = grant は single だけ・#1644 Codex R1 Medium 2)
-  if (withSet) {
+  // withSet = セットの CSV の 0053 の道を試験するためだけに、同じ結果の行のセットの許可を直接置く (0099 の前の DB = grant は single だけ・#1644 Codex R1 Medium 2)。
+  //   🆕 0099 の後の DB = grant('single') がセットの許可も出す = 置かない
+  const setWithGrant = (await one(db, "select to_regprocedure('ops.set_entry_on_load()') is not null as ok")).ok === true;
+  if (withSet && !setWithGrant) {
     await db.query('begin');
     try {
       await db.query("select set_config('ops.lease_protocol', '1', true)");

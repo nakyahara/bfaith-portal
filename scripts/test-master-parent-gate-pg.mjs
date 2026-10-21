@@ -147,6 +147,13 @@ try {
     const w = (await rec(E.WW, runId())).rows[0].r;
     assert.deepEqual([w.owner, w.counted, Object.values(w.counts).every((n) => n === 0)], ['load', 4, true]);
     assert.equal((await E.q('select recorded_by from ops.master_parent_gate_results order by result_id desc limit 1'))[0].recorded_by, 'watch_writer');
+    // 🆕 0095: 記録と同じ取引でまとまりの分け方も残す (watch_writer の記録でも・表は関数だけ)。画面のロール = 候補の読み取りの関数だけ (部品・表は 42501)
+    assert.equal((await E.q('select count(*)::int as n from ops.master_parent_gate_scopes s join ops.master_parent_gate_results r using (result_id) where r.compare_run_id = $1', [w.compare_run_id]))[0].n, 1);
+    assert.deepEqual((await E.ME.query('select ops.parent_gate_csv_check(array[1]::bigint[]) as r')).rows[0].r, { enforced: false, all: null, items: [] });
+    for (const sql of ['select ops._parent_gate_items(null)', 'select 1 from ops.master_parent_gate_scope_keys limit 1', "select ops._parent_gate_match(1, '{}'::jsonb)", 'select ops._parent_gate_global_problems()', 'select 1 from ops.master_parent_gate_scopes limit 1']) {
+      assert.equal((await errOf(E.ME, sql))?.code, '42501', `master_edit: ${sql}`);
+    }
+    assert.equal((await errOf(E.WW, "select set_config('ops.parent_gate_protocol', '1', false); insert into ops.master_parent_gate_scopes (result_id, scope) values (1, '{}')"))?.code, '42501');
   });
 
   let AT;

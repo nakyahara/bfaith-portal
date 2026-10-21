@@ -517,7 +517,7 @@ await ta('[3] 単品: 名前・取扱・売価・税率・分類・送料・月�
   assert.deepEqual(await primaryOf('s003'), ['0002']);
   assert.equal((await reqRow(id)).status, 'done');
   assert.deepEqual((await reqRow(id)).result.changed.length, 7);
-  assert.ok(r.ne_steps.some((s) => /翌朝の照合/.test(s)));
+  assert.ok(r.ne_steps.some((s) => /「NEへ送る」の画面で CSV を作って取り込みます/.test(s)));
 });
 
 await ta('[3] 変更の記録: トリガーが actor = human・メール・portal_master_edit・request_id・理由を残す。設定は取引の外に漏れない', async () => {
@@ -760,7 +760,7 @@ await ta('[9] 「今日」は東京の日付 (UTC 14:59:59 と 15:00 の境目�
 
 console.log('\nNE に取り込む CSV');
 
-await ta('[10] CSV が出ている列は変えない (作った・確かめた / 申告して確かめ待ち)。CSV に無い列・void・確かめ済みは変えられる', async () => {
+await ta('[10] 🆕 10/19 (0094): NE に取り込む CSV (0040) が出ている列も保存できる (編集は自由・直した値は「NE へ送る」が次に送る)・CSV の予約は保存で変えない', async () => {
   const mk = async (state) => {
     const extra = state === 'declared' ? ', checked_at, checked_run, declared_at, declared_by' : '';
     const vals = state === 'declared' ? ", now(), 'mc_20300101T000000000Z_abcdef', now(), 'x@test'" : '';
@@ -771,21 +771,18 @@ await ta('[10] CSV が出ている列は変えない (作った・確かめた /
     values ($1, 'to_ne', $2, $3, $2, '{"value":"a"}', 'a', 1, '{}')`, [id, code, col]);
   const made = await mk('made');
   await row(made, 's003', 'name');
-  const monthsBefore = (await skuRow('s003')).months;
-  let e = await rejectsWith(save('s003', { name: '直したい', reorder_months: '3' }), 409, 'csv_issued');
-  assert.match(e.message, new RegExp(`#${made}`));
-  assert.equal((await skuRow('s003')).months, monthsBefore);
-  await save('s003', { reorder_months: '3' });
-  await pg.query("update ops.ne_csv_exports set state = 'void', void_at = now(), void_by = 'x@test', void_reason = 'by_user' where export_id = $1", [made]);
-  await pg.query("update ops.ne_csv_export_rows set reserved = false, released_at = now(), release_reason = 'void' where export_id = $1", [made]);
+  await save('s003', { name: '直したい', reorder_months: '3' });
+  assert.equal((await skuRow('s003')).name, '直したい');
+  assert.equal((await skuRow('s003')).months, 3);
   await save('s003', { name: '単品 3 改 2' });
   const declared = await mk('declared');
   await row(declared, 's003', 'tax_rate');
-  e = await rejectsWith(save('s003', { tax_rate: '10' }), 409, 'csv_issued');
-  assert.deepEqual(e.extra.exports.map((x) => [x.col, x.state]), [['tax_rate', 'declared']]);
-  await pg.query("update ops.ne_csv_export_rows set reserved = false, released_at = now(), release_reason = 'confirmed' where export_id = $1", [declared]);
   await save('s003', { tax_rate: '10' });
   assert.equal((await skuRow('s003')).tax_rate, 0.1);
+  assert.equal((await q("select count(*)::int as n from ops.ne_csv_export_rows where reserved and code_norm = 's003'"))[0].n, 2, 'CSV の予約は保存で変えない');
+  await pg.query("update ops.ne_csv_exports set state = 'void', void_at = now(), void_by = 'x@test', void_reason = 'by_user' where export_id = $1", [made]);
+  await pg.query("update ops.ne_csv_export_rows set reserved = false, released_at = now(), release_reason = 'void' where export_id = $1", [made]);
+  await pg.query("update ops.ne_csv_export_rows set reserved = false, released_at = now(), release_reason = 'confirmed' where export_id = $1", [declared]);
 });
 
 console.log('\nセット: 構成の依頼・NE の観測・上げる・食い違い');
@@ -2177,7 +2174,8 @@ await ta('[18] 一覧の区分の列・コードのコピー・絞った一覧�
   assert.equal(got.disp, `attachment; filename="master-list_20300110-1200.csv"; filename*=UTF-8''master-list_20300110-1200.csv`, 'ファイル名に日時 (日本の 1/10 12:00)');
   let t = table(got);
   assert.deepEqual(t[0], ['商品コード', '区分', '構成品の数', '名前', '状態', '登録の状態', '登録日', '売価', '原価', '原価は構成品から計算', '税率 (%)', '利益 (1 個あたり・参考・手数料 10%・円)', '利益率 (%)', '売上分類', '代表の仕入先コード', '代表の仕入先', 'JAN', '送料コード', '推奨月数',
-    '在庫 (ロジザード 読めない)', 'FBA (JP) 販売可能 (1/10 08:05 時点)', '売れた 7 日 (読めない)', '売れた 30 日 (読めない)', '対応が必要', '商品コードの注意', 'メーカー'], '注文残の列は発注アプリの権限が無い人には無い・読めない参考の値は見出しに「読めない」・🆕 0084 のメーカーは最後');
+    '在庫 (ロジザード 読めない)', 'FBA (JP) 販売可能 (1/10 08:05 時点)', '売れた 7 日 (読めない)', '売れた 30 日 (読めない)', '対応が必要', '商品コードの注意', 'メーカー',
+    '梱包の縦 (cm)', '梱包の横 (cm)', '梱包の高さ (cm)', '梱包の重さ (g)', '大きさ・重さの出どころ', 'ブランド', '自社ブランド', '定番/季節/試し', '終売の予定日'], '注文残の列は発注アプリの権限が無い人には無い・読めない参考の値は見出しに「読めない」');
   assert.deepEqual(t.slice(1).map((x) => x[0]), listOrder((await call('GET', '/?kind=single')).text), 'offset に関係なく絞った全件・一覧と同じ並び');
   const row = (code) => Object.fromEntries(t[0].map((h, i) => [h, t.find((x) => x[0] === code)[i]]));
   {
@@ -2214,9 +2212,11 @@ await ta('[18] 一覧の区分の列・コードのコピー・絞った一覧�
   // 注文残 = 発注アプリの利用権がある人だけ (admin = 全部のアプリ)
   t = table(await raw('/list.csv?kind=single', 'admin'));
   assert.ok(t[0].includes('注文残 (発注アプリ 読めない)') || t[0].includes('注文残 (発注アプリ)'), t[0].join('|'));
-  assert.equal(t[0].indexOf('対応が必要'), t[0].length - 3);
-  assert.equal(t[0].indexOf('商品コードの注意'), t[0].length - 2, '新しい列は後ろ (注文残の列があっても)');
-  assert.equal(t[0].indexOf('メーカー'), t[0].length - 1, '🆕 0084: メーカーは最後 (注文残の列があっても)');
+  assert.equal(t[0].indexOf('対応が必要'), t[0].length - 12);
+  assert.equal(t[0].indexOf('商品コードの注意'), t[0].length - 11, '新しい列は後ろ (注文残の列があっても)');
+  assert.equal(t[0].indexOf('メーカー'), t[0].length - 10, '🆕 0084: メーカーの後ろに 0087 の大きさ・重さの 5 列・0088 のブランドなどの 4 列');
+  assert.equal(t[0].at(-5), '大きさ・重さの出どころ', '🆕 0087: 大きさ・重さの 5 列はブランドなどの 4 列の前');
+  assert.equal(t[0].at(-1), '終売の予定日', '🆕 0088: ブランドなどの 4 列がいちばん後ろ');
   // 詳細検索の印 (?s=) でも出せる・並び (区分の順) も一覧と同じ
   const sr = await call('POST', '/api/search', { body: { codes: 'set001\ns002\ns001', sort: 'kind' } });
   assert.equal(sr.status, 200, sr.text);
@@ -2385,7 +2385,7 @@ await ta('[20] 利益 (1 個あたり・参考・10/6): 一覧の列・並び (�
   assert.equal(await lib.text(), fs.readFileSync(new URL('../lib/profit-estimate.js', import.meta.url), 'utf8'), 'lib のファイルそのもの');
   // つかいかた
   const man = await call('GET', '/manual');
-  assert.match(man.text, /<h2 id="profit">利益 \(1 個あたり・参考\)<\/h2>/); assert.match(man.text, /売価の 10%/); assert.match(man.text, /参考の値です/);
+  assert.match(man.text, /<h3 id="profit">利益 \(1 個あたり・参考\)<\/h3>/); assert.match(man.text, /売価の 10%/); assert.match(man.text, /参考の値です/);
 });
 
 await ta('[19] 大きめの見本 (#1627 Codex R1 M3 / Low): CSV・全部コピーは SQL で上限 + 1 件までしか読まない (中身の段に進まない)・JS で絞る条件のとき・期限は参考の値と販売数の読みにも効く・含むセット 51 件', async () => {
@@ -2583,8 +2583,8 @@ await ta('[21] CSV の商品コード = NE から来た商品なら NE の書き
   await pg.query('alter table ops.master_registrations enable trigger trg_master_registrations_guard');
   await pg.query('commit');
   let t = table(await raw('/list.csv?codes=' + encodeURIComponent('s001\ns002\ns003\ns004\ns005\ns006')));
-  assert.equal(t[0].at(-2), '商品コードの注意', '新しい列は後ろ (🆕 0084 のメーカーの前)');
-  assert.equal(t[0].at(-1), 'メーカー', '🆕 0084: メーカーは最後');
+  assert.equal(t[0].at(-11), '商品コードの注意', '新しい列は後ろ (🆕 0084 のメーカー・🆕 0087 の大きさ・重さの 5 列・🆕 0088 の 4 列の前)');
+  assert.equal(t[0].at(-10), 'メーカー', '🆕 0084: メーカーの後ろに 0087 の 5 列と 0088 の 4 列');
   assert.equal(t[0][0], '商品コード', '前の列の並びは変えない');
   assert.deepEqual(byCode(t), {
     S001: '',   // ok = NE の書き方
@@ -2728,6 +2728,75 @@ await ta('[22] 1 つの商品の画面の「← 前へ」「次へ →」(10/17 
   const all = (await R.listSkus(db, { sort: 'profit' }, { now: NOW, mode: 'codes' })).codes;
   const mid = Math.floor(all.length / 2);
   assert.deepEqual(await R.listNeighbors(db, { sort: 'profit' }, all[mid], { now: NOW }), expect(all, mid));
+});
+
+await ta('[11L] 🆕 0099: 構成の持ち主が load (NE が正) = 依頼を閉じるだけ (core の構成は書かない): 観測 ≠ 依頼 = mismatch・観測 = 依頼でも core がまだ = 次の観測でもう一度・夜間ロードが NE の中身を core に書いた後 = applied (並びは見ない)・依頼が無い = 何もしない (食い違いも開かない)', async () => {
+  const LOAD_COMP = { ...ALL_COMPANY, sku_components: 'load' };
+  const p = (id) => promote(id, { ownership: LOAD_COMP });
+  const SET = 'set001';
+  const openBr = async () => (await q(`select kind from ops.sku_component_breaches where status = 'open' and set_sku_id = (select sku_id from core.skus where code = $1) order by kind`, [SET])).map((b) => b.kind);
+  const reqOf = async () => (await q(`select status, close_reason, applied_observation_id::text as oid from ops.sku_component_requests where set_sku_id = (select sku_id from core.skus where code = $1) order by component_request_id desc limit 1`, [SET]))[0];
+  // 依頼を作る (今の画面の保存 = company。新商品の登録 (セット) と同じ依頼の表)
+  await save(SET, { components: [{ code: 's001', qty: 3 }, { code: 's003', qty: 1 }] }, { reason: 'load の試験' });
+  assert.equal((await reqOf()).status, 'open');
+  const before = await compsOf(SET);
+  await W2.setActiveOwnershipInDb(pg, LOAD_COMP);
+  try {
+    // 観測 ≠ 依頼 = 🆕 0100: NE に入るのを待っている (依頼から 7 日まで = 食い違いにしない・core は変えない)
+    let r = await p((await observe([{ set_code: SET, rows: [{ code: 's001', qty: 1, sort: 1 }] }])).set001);
+    assert.deepEqual([r.promoted, r.reason], [false, 'waiting_ne'], JSON.stringify(r));
+    assert.deepEqual(await openBr(), []);
+    // 観測 = 依頼 (並びは逆) でも core がまだ NE の中身でない (夜間ロードの前) = 何も書かない (次の観測でもう一度)
+    const rev = [{ code: 's003', qty: 1, sort: 1 }, { code: 's001', qty: 3, sort: 2 }];
+    r = await p((await observe([{ set_code: SET, rows: rev }])).set001);
+    assert.deepEqual([r.promoted, r.reason], [false, 'retry'], JSON.stringify(r));
+    assert.deepEqual(await compsOf(SET), before);
+    assert.equal((await reqOf()).status, 'open');
+    // 夜間ロード (持ち主 load) が NE の中身を core に書いた = 依頼を applied で閉じる・食い違いを resolved・core は書かない (並び・source はロードのまま)
+    await pg.query('delete from core.sku_components where parent_sku_id = (select sku_id from core.skus where code = $1)', [SET]);
+    await pg.query(`insert into core.sku_components (company_id, parent_sku_id, child_sku_id, qty, source) select 1, p.sku_id, c.sku_id, x.qty, 'ne'
+      from core.skus p cross join (values ('s003', 1), ('s001', 3)) as x(code, qty) join core.skus c on c.code = x.code where p.code = $1`, [SET]);
+    const loaded = await compsOf(SET);
+    const obsId = (await observe([{ set_code: SET, rows: rev }])).set001;
+    r = await p(obsId);
+    assert.deepEqual([r.promoted, r.reason], [true, 'matched_on_load'], JSON.stringify(r));
+    assert.deepEqual(await compsOf(SET), loaded, 'core の構成は書かない');
+    assert.deepEqual(await reqOf(), { status: 'applied', close_reason: 'matched', oid: obsId });
+    assert.deepEqual(await openBr(), []);
+    // Codex R1 High: NE が依頼と違う中身で取り込んだ (夜間ロードが core を NE の中身にした) = 食い違いを残し、導く値は今の core (NE の中身) で計算し直す
+    await W2.setActiveOwnershipInDb(pg, ALL_COMPANY);
+    await save(SET, { components: [{ code: 's001', qty: 1 }] }, { reason: 'load の試験 2' });
+    await W2.setActiveOwnershipInDb(pg, LOAD_COMP);
+    await pg.query('delete from core.sku_components where parent_sku_id = (select sku_id from core.skus where code = $1)', [SET]);
+    await pg.query(`insert into core.sku_components (company_id, parent_sku_id, child_sku_id, qty, source) select 1, p.sku_id, c.sku_id, 1, 'ne'
+      from core.skus p join core.skus c on c.code = 's002' where p.code = $1`, [SET]);
+    r = await p((await observe([{ set_code: SET, rows: [{ code: 's002', qty: 1, sort: 1 }] }])).set001);
+    assert.deepEqual([r.promoted, r.reason], [false, 'waiting_ne'], JSON.stringify(r));
+    const s2cost = (await costsOf('s002')).at(-1).jpy;
+    assert.ok(r.derived.some((d) => d.col === 'cost' && d.to === s2cost), JSON.stringify(r.derived));
+    assert.equal((await costsOf(SET)).at(-1).jpy, s2cost, '導く値 (原価) は NE の中身 (s002 × 1) で');
+    assert.equal((await reqOf()).status, 'open');
+    assert.deepEqual(await openBr(), []);
+    // 依頼から 7 日より後も NE が違う = 食い違い stale (依頼を 9 日前にしたことにする = 持ち主のロールで同じ中身の依頼に置き換える)
+    await pg.query(`update ops.sku_component_requests set status = 'cancelled', closed_at = now(), closed_by = 'test', close_reason = 'superseded'
+      where status = 'open' and set_sku_id = (select sku_id from core.skus where code = $1)`, [SET]);
+    await pg.query(`insert into ops.sku_component_requests (company_id, set_sku_id, rows, rows_hash, base_rows, reason, requested_by, edit_request_id, created_at)
+      select company_id, set_sku_id, rows, rows_hash, base_rows, reason, requested_by, gen_random_uuid(), created_at - interval '9 days' from ops.sku_component_requests
+       where component_request_id = (select max(component_request_id) from ops.sku_component_requests where set_sku_id = (select sku_id from core.skus where code = $1))`, [SET]);
+    r = await p((await observe([{ set_code: SET, rows: [{ code: 's002', qty: 1, sort: 1 }] }])).set001);
+    assert.deepEqual([r.promoted, r.reason], [false, 'stale'], JSON.stringify(r));
+    assert.deepEqual(await openBr(), ['stale']);
+    await pg.query(`update ops.sku_component_requests set status = 'cancelled', closed_at = now(), closed_by = 'test', close_reason = 'withdrawn'
+      where status = 'open' and set_sku_id = (select sku_id from core.skus where code = $1)`, [SET]);
+    await pg.query(`update ops.sku_component_breaches set status = 'closed', closed_at = now(), closed_by = 'test', close_reason = 'dismissed'
+      where status = 'open' and set_sku_id = (select sku_id from core.skus where code = $1)`, [SET]);
+    const loaded2 = await compsOf(SET);
+    // 依頼が無い = 何もしない (NE が core と違っても食い違いを開かない = NE が正)
+    r = await p((await observe([{ set_code: SET, rows: [{ code: 's003', qty: 9, sort: 1 }] }])).set001);
+    assert.deepEqual([r.promoted, r.reason, r.owner], [false, 'no_open_request', 'load']);
+    assert.deepEqual(await openBr(), []);
+    assert.deepEqual(await compsOf(SET), loaded2);
+  } finally { await W2.setActiveOwnershipInDb(pg, ALL_COMPANY); }
 });
 
 server.close();

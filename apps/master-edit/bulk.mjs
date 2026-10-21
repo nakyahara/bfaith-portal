@@ -8,7 +8,7 @@
  *   3. POST api/bulk/apply    20 件ずつ。1 件ずつ今の 1 件の保存 (lib/master-write.mjs の saveSku) を呼ぶ = 持ち主の門・変更の記録・版 (編集の印) は 1 件の保存と同じ
  * 決まり:
  *   - 1 回 BULK_MAX (200) 件まで (画面も選ぶ時点で数える)。対象外 = 例外の SKU (NE に無い・常に)・登録をやめた・セットの原価 / 税率 / 仕入先 / 売上分類 (構成品から計算)・
- *     取扱を中止した商品 (取扱を戻す以外)。保存できない = 先の日の原価 (含むセットも)・NE に取り込む CSV / NE 登録の CSV が出ている・切替前 (持ち主)
+ *     取扱を中止した商品 (取扱を戻す以外)。保存できない = 先の日の原価 (含むセットも)・NE 登録の CSV が出ている・切替前 (持ち主) (🆕 10/19: NE に取り込む CSV (0040) は止めない)
  *   - 途中で 1 件だめでも、できた分は変えたまま (今の DB は 1 つの取引で 1 つの商品しか書けない = 1 件 = 1 取引)。だめな分は理由と直し方の組 (FIX_GROUPS) で返す
  *   - request_id = 一括の番号 + 商品コード (+ やり直しの回) から決まる = 途中で切れて押し直しても二重に書かない (済んだ分は前の結果が返る)
  *   - 同じセットに入る単品を続けて変えると、前の保存がセットの版を上げて version_conflict になる → その間の変更がこの一括の分だけ
@@ -20,7 +20,7 @@ import crypto from 'node:crypto';
 import { normSku } from '../../lib/sku-norm.js';
 import { canonicalSupplierCode } from '../company-db/load/sources.mjs';
 import {
-  saveSku, readCurrent, editTokenOf, sha256, stable, jstDate, issuedCsv, fieldsOf, fieldOwnership, REG_CSV_FIELDS, OVERRIDE_SOURCES,
+  saveSku, readCurrent, editTokenOf, sha256, stable, jstDate, fieldsOf, fieldOwnership, REG_CSV_FIELDS, OVERRIDE_SOURCES, regEditAfterIssue,
   MasterWriteError, PARSERS, MAX_YEN, intIn, textIn, planSetDerived, setComponentInputs, COMPANY_ID,
 } from '../../lib/master-write.mjs';
 import { newEntryWritable } from '../../lib/master-cutover.mjs';
@@ -220,17 +220,15 @@ async function readFacts(db, codes, today) {
      where s.company_id = $1 and s.code_norm = any(select core.norm_code(x) from unnest($2::text[]) as t(x))`, [COMPANY_ID, codes])).rows;
   const byNorm = new Map(rows.map((r) => [r.code_norm, r]));
   const normOf = new Map((await db.query('select x, core.norm_code(x) as n from unnest($1::text[]) as t(x)', [codes])).rows.map((r) => [r.x, r.n]));
-  const hasRegItems = await regclass(db, 'ops.ne_reg_export_items');
+  // 🆕 0093: 0093 の後の DB = NE 登録の CSV を配った後も直せる (止める理由にしない)。0093 の前の DB だけ今までどおり
+  const hasRegItems = await regclass(db, 'ops.ne_reg_export_items') && !(await regEditAfterIssue(db));
   const out = [];
   for (const code of codes) {
     const hit = byNorm.get(normOf.get(code));
     if (!hit) { out.push({ code, found: false }); continue; }
     const cur = await readCurrent(db, hit.sku_id, today);
-    // NE に取り込む CSV が出ている列 (保存すると 409 csv_issued)
-    const cols = [...new Set(Object.values(fieldsOf(cur.sku_kind)).map((d) => d.csvCol).filter(Boolean))];
-    const csv = {};
-    for (const r of await issuedCsv(db, cur.code_norm, cols)) (csv[r.col] = csv[r.col] || []).includes(r.export_id) || csv[r.col].push(r.export_id);
-    // NE 登録の CSV を配った後 (保存すると 409 reg_csv_issued)。単品の税率は含むセットの CSV にも入る
+    // 🆕 10/19 (0094): NE に取り込む CSV (0040) が出ている列も保存できる (編集は自由) = ここでは見ない
+    // NE 登録の CSV を配った後 (0093 の前の DB だけ = 保存すると 409 reg_csv_issued)。単品の税率は含むセットの CSV にも入る
     let regMine = [];
     let regParents = [];
     if (hasRegItems) {
@@ -246,7 +244,7 @@ async function readFacts(db, codes, today) {
       ? (await db.query(`select k.code, c.valid_from::text as valid_from, c.cost_source from core.sku_costs c join core.skus k on k.sku_id = c.sku_id
            where c.sku_id = any($1::bigint[]) and c.valid_to is null and c.valid_from > $2::date order by k.code_norm`, [cur.parent_set_ids, today])).rows
         .filter((r) => !OVERRIDE_SOURCES.has(r.cost_source)) : [];
-    out.push({ code, found: true, cur, csv, regMine, regParents, parentFuture, token: editTokenOf(cur), self: bulkSelfToken(cur) });
+    out.push({ code, found: true, cur, regMine, regParents, parentFuture, token: editTokenOf(cur), self: bulkSelfToken(cur) });
   }
   return out;
 }
@@ -286,10 +284,6 @@ export function judgeBulk(f, field, value, { editable } = {}) {
   }
   if (field === 'cost' && f.parentFuture && f.parentFuture.length) {
     return { verdict: 'block', reason: 'set_cost_future', why: `含むセット ${f.parentFuture.map((p) => p.code).join('・')} に先の日の原価があります (${f.parentFuture[0].valid_from} から)` };
-  }
-  const csvCol = fieldsOf(c.sku_kind)[saveField]?.csvCol;
-  if (csvCol && f.csv && f.csv[csvCol] && f.csv[csvCol].length) {
-    return { verdict: 'block', reason: 'csv_issued', why: `この商品の${F.label}が入った NE に取り込む CSV (ファイル ${f.csv[csvCol].map((x) => `#${x}`).join('・')}) が出ています` };
   }
   const regFields = REG_CSV_FIELDS[c.sku_kind] || [];
   if (regFields.includes(saveField) && f.regMine && f.regMine.length) {

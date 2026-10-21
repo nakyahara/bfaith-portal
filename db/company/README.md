@@ -2594,7 +2594,8 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
   product-hub のカード (SQLite) は画面が Postgres の取引の前に読む (`liveCdbCardsForSku`): この SKU に結んだ / 同じコードのカードで除外していないものが 1 枚でもある = 409 `card_exists` (人が先に product-hub で除外する = 出品済み・出品中・RMS の実行中を人が確かめる)・読めない = 503 (消さない)。自動の除外はしない (Codex #1688 R1 High 2・3)。
   🚨 受け入れ: カードの取り込みの借り (120 秒) が切れた後もまだ SQLite に書いている、のまれな競りだけは閉じない = 消した後にカードが出たら product-hub で除外 (人の手順)
 - 🆕 Codex #1688 R1 High 1: `ops.transition_sku_registration` (0070 の版から写して 🆕 0071 の行だけ足した) = 下書き・NE 登録待ち → cancelled は 約束 `sku_draft_cancel` / `variation_child_cancel` の中だけ (同じ SKU・人・request_id)。master_ops が直に呼ぶと `draft_cancel_session_required` (42501)。表の持ち主のロールとそのメンバーは求めない
-- ロジザード: ロジザードの商品マスタへ出す CSV (`scripts/company-db/lz-daily.mjs`) は NE の取得の商品だけを回す (`apps/master-decisions/lz-cdb.mjs` の `classifyForLz`) = NE に配る前の下書きは出さない。手でロジザードに登録する道は人の決まり
+- ロジザード: ロジザードの商品マスタへ出す CSV (`scripts/company-db/lz-daily.mjs`) は NE の取得の商品だけを回す (`apps/master-decisions/lz-cdb.mjs` の `classifyForLz`) = NE に配る前の下書きは出さない。手でロジザードに登録する道は人の決まり。
+  🆕 ただし 0081 のロジザード登録の CSV は NE に配る前の下書きも出す = 出した下書きは 0091 から消さない (下の「ロジザード登録の CSV に出した下書きは消さない」)
 - 守りの写し: `ops.master_write_allowed` (0067 の版 + 6 行 = CSV の 2 表・構成の依頼・JAN・JAN を外したときの SKU / 商品の version)・`core.guard_master_edit_jan` (0053 の版 + 約束 `sku_draft_cancel` の UPDATE だけ)・約束の操作の CHECK (0070 の版 + `sku_draft_cancel`)
 - 画面 = 商品の画面の「この下書きを消す」(名簿 MASTER_EDITORS の人 = 下書きを作れる人と同じ・MASTER_EDIT_OPEN の後)。一覧はやめた商品をふだん出さない (札「やめた商品」・商品コードでぴったり探すと出る)
 - 当て方 (🚨 まだ流さない): 0070 の後 → `migrate.mjs --dry-run` (0071 だけ) → 中原さんの OK → 本適用 → **ロールの script を流し直す** (`create-master-edit-roles.mjs` = master_edit に 2 つの関数の実行・`create-watch-roles.mjs` = watcher に確かめ。どちらも引数なし = パスワードは変えない)。流さなくても今の動きは変わらない (画面は確かめを読めない = 何も出さない)
@@ -2765,6 +2766,19 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
   🚨 ロールを流し直した瞬間から、開いたままの古い新商品の画面 (メーカーの欄も「入力なし」も無い) の登録は「画面を開き直してください」(400) になる (ほかの「入力なし」の項目を足したときと同じ)
 - 試験 = `node scripts/test-master-maker.mjs` (名前の形・0084 の形と権限・守り・名簿・登録・まとまり・商品の画面・一覧 / CSV・夜間ロード・ロールの流し直しの前) / `test-master-maker-ui.mjs` (画面の動き・日本語入力の確定の Enter・スマホの幅)
 
+### ブランドの名簿と商品ごとのブランド・商品の段階 (区分・終売の予定日)・初めて売った日 (0088・2026-10-17 中原さん)
+- **なぜ別の表か**: `core.products.brand` (0002) は夜間ロードの属性の解決 (`engine.mjs` の 10. = qoo10 / product_hub の観測) が書く列 = ポータルで入れた値を翌朝に上書きする / 消す道がある。`own_brand` は商品の行の印 (ブランドの印ではない・持ち主の表にも無い)。
+  `release_date` も夜間ロードが書く列 (カタログの発売日) = 「初めて売った日」とは別。→ メーカー (0084) と同じく **Company DB だけの別の表** (夜間ロード・NE / ロジザード / product-hub は触らない・送らない)。mart の `p.brand` / `p.own_brand` はそのまま
+- **表** `core.brands` (名簿・`name_norm` = メーカーと同じ決まり `core.maker_name_norm`・会社の中で一意・`own_brand` = 自社ブランド) / `core.product_brands` (単品の商品の行ごとの今のブランド) /
+  `core.product_lifecycle` (区分 `stage` = staple 定番 / seasonal 季節 / trial 試し・終売の予定日 `end_planned_on`・どちらも無い = 行が無い) /
+  記録 (追記だけ) `ops.product_brand_events`・`ops.brand_requests` (名簿に足す要求の控え)・`ops.brand_flag_events` (自社ブランドの印)・`ops.product_lifecycle_events`。書くのは関数の中だけ (印 `ops.brand_life_protocol`)・TRUNCATE できない
+- **関数** `ops.create_brand(request_id, 人, 名前, 自社か)` / `ops.set_brand_own(request_id, 人, ブランド, 印, 見ていた印, 理由)` / `ops.set_product_brand(…)`・`ops.set_product_lifecycle(…)` (メーカーと同じ門 = 新商品の登録・まとまりの登録・商品の画面の保存の取引の中だけ・見ていた値と違う = version_conflict) /
+  読む `ops.sku_first_sold(sku_ids)` (初めて売った日 = NE の出荷 (受注日・platform `_ignore` の店 = FBA 納品などは数えない) とモールの注文 (出品の構成・セットの構成品 1 段) のいちばん早い日と出どころ) / `ops.sales_records_from()` (記録の始まり)。注文・出荷の表は画面のロールに読ませない
+- **必須でない**: 新商品の登録の「値か入力なし」(`lib/master-register-blanks.mjs`) に数えない = 送らなくても登録できる (送ったときだけ確かめる)
+- 当て方 (🚨 まだ流さない): 番号 = 0088 (0084 メーカー・0085 入出庫の履歴・0086 販売数のグラフ・0087 大きさ・重さの次) → **アプリを先に** → `migrate.mjs --dry-run` (この 1 本だけ・表と関数を足すだけ) → 中原さんの OK → 本適用 → `create-master-edit-roles.mjs` を流し直す。
+  アプリは 0088 の前・ロールの流し直しの前のどちらでも欄を出さない (`brandLifeReady`)・値が来たら 503。「入力なし」に数えないので、流し直しで開いたままの古い画面が 400 になることは無い
+- 試験 = `node scripts/test-master-brand-life.mjs` / `test-master-brand-life-ui.mjs`
+
 ### 要確認 (quarantined) の商品を確認済みにする (0079・Company DB構想 22 の Q-1・中原さんの決定 10/13 夜 Q1〜Q5 = 全部 a)
 - **なぜ**: NE で直接作られた商品 (夜間ロードが見つけた要確認・本番 10/13 = 42 件) を「確認済み」にする道が無かった (関数が not_ready)。確認済み (`ne_confirmed`) になると新しいセットの構成品・NE 登録の CSV の構成品に使える
 - **照合 ② の確かめ待ち** (`ops.v_ne_reg_targets`): 要確認を全部 (単品もセットも・親のある子も・持ち主を問わず・コード 80 字まで) = 毎朝の照合 ② が要確認の NE の観測を残す (miniPC のコードは変えない・新しい定期実行なし)
@@ -2779,3 +2793,272 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - 当て方 (🚨 まだ流さない): 番号をマージの順に付け替え → `migrate.mjs --dry-run` (この 1 本だけ・今のデータは何も変えない) → 中原さんの OK → 本適用 → `create-master-edit-roles.mjs` を流し直す
   (master_edit に 3 つの関数の実行) → `heavy-entry-manifest.mjs --verify` → 次の朝の照合 ② の後に `select ops.quarantine_confirm_list(null)` (watcher) で 42 件の表を見る。画面 (Q-2・Q-3) は別の PR
 - 試験 = `node scripts/test-master-quarantine-confirm.mjs` (PGlite) / `TEST_PG_URL=… node scripts/test-master-quarantine-confirm-pg.mjs` (本物のログイン・並ぶ取引)
+
+### 商品ごとの入出庫履歴と月別のまとめ (0085・AI_reference CompanyDB構想/26・2026-10-17 中原さん Q1〜Q10 = a・Q11・Q12)
+- **なぜ**: NE の商品の画面の「入出庫履歴」と「月別のまとめ」を、マスタの入力の商品の画面 (`/sku/:code`) に出す (参考・読むだけ)
+- **関数** (読むだけ・security definer・`master_edit` に実行だけ・出荷の表と `ops.ingest_runs` の select は渡さない = 送り状番号などは読めない):
+  `ops.sku_stock_anchors` (ロジザードの毎日の在庫 = 錨・取得時刻・SKU の数) / `ops.sku_shipment_totals` (取得時刻の区切りごとの出荷の数) /
+  `ops.sku_movement_shipments` (伝票ごとの出荷の行・新しい順・5,000 行まで) / `ops.sku_shipments_monthly` (月ごとの受注数 = 受注日・売上数 = 出荷確定日)
+- **計算はアプリ** (`apps/master-edit/movements.mjs`): 仕入・発注は発注アプリの SQLite (同じ Render) から・発注アプリの権限がある人だけ。在庫数 = ロジザードの毎日の在庫で合わせ、
+  合わない分は「在庫の調整 (ずれ)」の 1 行 (前後で打ち消し合う組 = 出荷確定の時刻のずれの見込みと書く・消さない)。ロジザードの日次の前は在庫数が空欄
+- 当て方 (🚨 まだ流さない): 番号 = 0085 (0083 = #1734・0084 = #1739 メーカーの次) → アプリ (マージ) → `migrate.mjs --dry-run` (この 1 本だけ・関数を足すだけ・表は変えない) → 中原さんの OK → 本適用 →
+  `create-master-edit-roles.mjs` を流し直す (引数なし)。それまで画面の欄は「画面のロールに出荷を読む関数がまだありません」と出す (画面のほかの所は動く)
+- 試験 = `node scripts/test-master-movements.mjs` (計算・関数の権限・API) / `test-master-movements-ui.mjs` (画面) / 測る道具 `scripts/company-db/movements-measure.mjs` (PR-0・watcher で読むだけ)
+
+### 販売数のグラフ (0086・2026-10-17 中原さん「販売数量のグラフが見れるようになるといいかも」)
+- **なぜ**: マスタの入力の商品の画面 (`/sku/:code`) に、モール別の販売数のグラフ (週 52・月 24・日 90) とロジザードの在庫の線を出す (参考・読むだけ)。0085 (入出庫の履歴) の後に積んだ作業ブランチ = 0085 のマージの後
+- **関数** (読むだけ・security definer・`master_edit` に実行だけ・注文の表の select は渡さない = 注文番号・金額は読めない): `ops.sku_sales_daily(sku_id, from)` = 日 × モールの正味の数 (数量 − 取消) とうちセット経由
+  - 数え方は売上日次 (0021) と `mart.sales_expanded_to_skus` (0042・見張り W6) と同じ規則 (試験で同じ数を確かめる・入れ子 5 / 6 段・循環・出品の境目も)。うちセット経由だけは道ごと (同じ出品に SKU とそれを含むセットがある行は 0042 が全部をセット経由にする)。0042 は売れた行から末端へ下る・ここは 1 つの SKU から「それを含むセット・出品」へ上る (会社の全部の売上を展開しない)
+  - `mart.v_sales_daily` でなく core を直に読む: メルカリ (売上日次を作らない) も入る・出品だけの明細を `ix_order_lines_listing` で引ける・朝の作り直しの前の注文も入る
+  - セットの画面 = そのセットとして売れた数。期間は 2025-01-01 (それより古くできない) 〜 今日 (先の日付の注文は入れない)
+- **画面** (`apps/master-edit/sales-chart.mjs`・`public/me-sales-chart.js`): SQL は 1 回 (販売数 + `ops.sku_stock_anchors`)・期限 8 秒。積み上げの棒 (楽天・Amazon・Yahoo!・その他) と在庫は別のグラフ (軸を 2 つ重ねない)・欠品 (締めた日の在庫 0) の帯・途中の週 / 月は薄い・表で見る・← → で読む。
+  卸・ほかの NE の店は入らない = 上の「売れた数 (7 日・30 日)」(商品管理リスト) と少し違う (画面にそう書く)。注文は 2025-01 から (それより前は空欄)
+- 当て方 (🚨 まだ流さない): 番号 = 0086 (0085 = #1741 入出庫の履歴の次) → アプリ (マージ) → `migrate.mjs --dry-run` (この 1 本だけ・関数を足すだけ) → 中原さんの OK → 本適用 →
+  `create-master-edit-roles.mjs` を流し直す (引数なし)。それまでグラフの欄は「画面のロールに販売数を読む関数がまだありません」と出す (画面のほかの所は動く)
+- 試験 = `node scripts/test-master-sales-chart.mjs` (計算・0042 と同じ数・関数の権限・API) / `test-master-sales-chart-ui.mjs` (画面)
+
+### 梱包した状態の 縦・横・高さ・重さ (0087・2026-10-17 中原さん「FBA 納品のアプリとか、定形外の発送方法で情報をもっていたはずだから集約して」)
+- **なぜ**: 梱包した状態の大きさ・重さは、定形外 (postage.db `pm_skus` の重さ g・厚み mm) と FBA 納品 (fba-box.db の 1 個の重さ = 実測 / Amazon のカタログ) にばらばらにあった。
+  縦・横はどこにも無い (profit-calculator は SP-API のカタログの寸法をその場で読むだけで残さない)。マスタの入力で人が入れられる 1 つの置き場にまとめる
+- **出どころの値** = `core.product_physicals` (0003・scope = package・夜間ロード `engine.mjs` の 11. が毎晩 pm_skus / fbx_weight_refs / fbx_weight_current から足す・ここでは変えない)
+- **人の値** = 🆕 `core.product_packages` (商品ごとに 1 行・縦・横・高さ = mm・重さ = g・軸ごとに空でよい・4 つとも空の行は持たない)・記録 `ops.product_package_events` (追記だけ)。
+  書くのは `ops.set_product_package` だけ (security definer・メーカー 0084 と同じ守り = 単品・やめていない・new_open・門を通った保存 (sku_edit) / 登録 (sku_create) の取引の中・
+  最後の記録の番号が画面の見ていたものと違う = version_conflict)。夜間ロードは触らない (product_physicals に人の行を足さない = 夜間ロードが有効行を規則 v1 で選び直すと消える)
+- **まとめた値** = 🆕 `core.v_product_packages` (軸ごとに 人 → `core.package_source_rank` (実測 1・Amazon のカタログ 2・Yahoo 3・仕入先 4・そのほか 5・定形外の見込み 8) → 新しい観測)。
+  出どころ × 参照ごとの最新の行だけ・先の時刻の行は使わない。FBA 納品・定形外・利益の計算がこれを読むのは次の PR (いまは画面・一覧・CSV だけ)
+- **画面**: 商品の画面の「大きさ・重さ」(人の値の欄 = cm / g・いま使う値・出どころの表・食い違いの印・「この値を入れる」)・新商品の登録 (単品・まとまり = 全部の子に同じ値)。
+  入れなくても登録できる (「値か入力なし」に数えない)。一覧の列「大きさ・重さ」(いつもは出さない)・一覧の CSV の最後の 5 列
+- 当て方 (🚨 まだ流さない): 番号 = 0087 (0084 メーカー・0085 入出庫の履歴・0086 販売数のグラフの次 = 欠番にしない) → アプリ (マージ) と `migrate.mjs --dry-run` (表・関数・ビューを足すだけ) → 中原さんの OK → 本適用 →
+  `create-master-edit-roles.mjs` を流し直す (master_edit に 3 つの select・`core.product_physicals` の select・書く関数の実行)。どちらが先でもよい (0087 の前・流し直しの前は画面が欄を出さない = 見るだけ・値を送ったら 503)
+- 試験 = `node scripts/test-master-package.mjs` (形・守り・まとめた値・商品の画面・登録・まとまり・一覧・CSV・夜間ロード・流し直しの前) / 画面 = `test-master-package-ui.mjs`
+
+### 表示の項目 = 原産国・内容量・メーカー型番・消費期限の目安 (0090・AI_reference CompanyDB構想/27 §3.4 ④ v2・中原さんの決定 10/18 Q1〜Q9 = 全部 a)
+- **なぜ**: 原産国・内容量・メーカー型番・消費期限の目安 (日数) をマスタの入力で入れ、Company DB を正本にする (product-hub は読んで見せるだけ・差の印と「マスタの値を入れる」)。
+- **持ち方**: 人の値 = `core.product_label_facts` (商品ごとに 1 行・項目ごとに空でよい・単品だけ)・記録 `ops.product_label_fact_events` (追記だけ)・**いま使う値 = `core.v_product_label_facts`** (正式な読み口・項目ごとに 人 → 内容量だけ夜間ロードの `core.products.net_content`)。
+  🚨 0003 の観測 + 規則の版 v2 にはしない (夜間ロードは規則 v1 に固定で内容量を毎晩選び直す = 人の観測は次の夜に戻る・v1 に規則は足せない)。夜間ロードのコード・規則・`core.products` の列は変えない (列の注釈だけ)。
+  `core.products.net_content` と mart の内容量 = 夜間ロードの参考の値 (人の値はビューだけ)。`country_of_origin` / `model_number` / `product_compliance.shelf_life_days` は空のまま。
+- **書く** `ops.set_product_label_facts(request_id, 人, SKU, 原産国, 内容量, 単位, 型番, 日数, 見ていた記録, via, 理由)` (master_edit・security definer)。門 = 商品の画面の保存の約束 (`ops.begin_master_write` の sku_edit・同じ request_id・人) / 新商品の登録・まとまりの登録 = この取引でその SKU を登録した sku_create の約束。
+  最後の記録の番号が画面の見ていた番号と違う = `version_conflict`。全部空 = 行を消す (記録は残る)。単位 = ml / g / 枚 / 個・数 = 小数 2 けた・原産国 40 字 (「製」を付けない)・型番 60 字・日数 1〜3650。
+- 当て方 (🚨 まだ流さない): 番号 = 0090 (0087 大きさ・重さ・0088 ブランド・0089 先方品番の知らせ v2 の次) → アプリ (マージ) → `migrate.mjs --dry-run` (この 1 本だけ・表と関数とビューを足す・既にある列は注釈だけ) → 中原さんの OK → 本適用 → `create-master-edit-roles.mjs` を流し直す
+  (流すまで画面は欄を出さない・値が来たら 503)。アプリは先でも後でもよい (0090 の前は `labelReady` = false で欄を出さない・product-hub の箱も出さない)。
+- 試験 = `node scripts/test-master-label.mjs` (PGlite・画面・登録・夜間ロードが人の値を変えない) / `test-master-label-ui.mjs` (画面) / `test-ph-label-compare.mjs`・`test-ph-label-compare-ui.mjs` (product-hub の箱)
+### ロジザード登録の CSV に出した下書きは消さない (0091・2026-10-18 中原さんの決定)
+- **なぜ**: 0071 は「ロジザードへ出す CSV は NE にある商品だけ = NE に配る前の下書きは出さない」が前提だった。0081 のロジザード登録の CSV (`lib/lz-new-export.mjs`) は
+  新商品の登録から来た単品を NE に配る前の下書きのうちから出す = 出した下書きを消すと、ロジザードにだけ商品が残る
+- **関数を作り直す** (どちらも前の版を写して 🆕 0091 の行だけ足した・値は変えない): `ops.sku_draft_cancel_check` (0071 の版) = 品目が issued のロジザード登録の CSV がある = 理由 `lz_issued` (ファイルの番号)・
+  `ops.cancel_variation_child` (0073 の版) = 子の廃止も `lz_issued` で断る。取り消した (voided) ファイルだけなら消せる・廃止できる。`ops.cancel_sku_draft` は確かめを鍵の後に呼ぶだけ = 変えない
+- **競り**: CSV を出す関数 (`ops.lz_new_export_issue`) も消す関数も、同じ SKU の鍵 (`core.sku:<id>`) を行の鍵より先に取り、鍵の後に相手の結果を読む (出す = やめていないか・消す = 出していないか) = 片方だけが通る。
+  CSV を出す関数はほかの鍵 (段階・NE の CSV・NE のコード・まとまり) を取らない = 待ちの輪ができない
+- 画面 = 商品の画面の「この下書きを消す」の帯に理由 (「ロジザード登録の CSV に出しています (ファイル #N)。ロジザードから消すのが先です」)。lib (`lib/master-draft-cancel.mjs`) は 0091 の前の DB でも同じ理由で断る (鍵なしの先回り)
+- 当て方 (🚨 まだ流さない): アプリ (マージ) → `migrate.mjs --dry-run` (この 1 本だけ・関数を作り直すだけ) → 中原さんの OK → 本適用。ロールの script の流し直しは要らない (create or replace = 権限はそのまま)
+- 試験 = `node scripts/test-master-draft-cancel.mjs` ([M4]・[Z]) / `scripts/test-master-draft-cancel-pg.mjs` ([8] 出すと消すの競り・実 PostgreSQL) / `scripts/test-master-variation-pg.mjs` ([7] 出すと子の廃止の競り)
+
+### 販売数のグラフを速くする (0092・2026-10-19・よく売れる SKU でグラフが 8 秒の期限に当たる)
+- **なぜ**: 本番で読むだけの EXPLAIN ANALYZE (いちばん売れる 0726-001931・p_from 2024-10-01・2,068 行) = **11.0 秒** (2 回目も 11 秒 = DB のメモリが小さく読んだ頁が残らない)。2 番目 0726-001389 = 10.3 秒。
+  遅いのは表の頁を 1 行ずつ読むこと = ① 出品だけの明細 (出品 7 つ・31,005 行) を `ix_order_lines_listing` で引いた後の明細の頁 (4.9 秒・読み 24,071 頁) ② 注文 33,646 件を主キーで引いた後の注文の頁 (約 6 秒・読み 26,882 頁)
+- **直し方** = 関数が読む列を全部持つ部分索引 3 本 (Index Only Scan = 表の頁を読まない) + 関数の明細の集まり (src) を materialized にして注文の番号の順に並べる (注文の索引を前から順に 1 回で読む)。
+  関数は 0086 の写しにこの 2 か所だけ (試験が 0086 の本文と比べる) = 数え方は同じ。`create or replace` = 権限はそのまま (`create-master-edit-roles.mjs` の流し直しは要らない)
+  - `ix_order_lines_listing_only_chart` = `order_lines (listing_id) include (company_id, order_id, qty, cancelled_qty) where listing_id is not null and sku_id is null and removed_at is null`
+  - `ix_order_lines_sku_chart` = `order_lines (sku_id) include (company_id, order_id, qty, cancelled_qty) where sku_id is not null and removed_at is null`
+  - `ix_orders_chart` = `orders (order_id) include (company_id, order_date_jst, mall, is_cancelled)`
+  - 注文の 2 表の autovacuum を 2% で動かす (`autovacuum_vacuum_scale_factor` / `autovacuum_vacuum_insert_scale_factor` = 0.02・既定 0.2)。索引だけで読めるのは「全部の行が見える」印 (visibility map) の付いた頁だけ = vacuum が印を付ける。
+    既定のままでは 約 400 万行の表は 数か月に 1 回 = 直近の頁に印が無い (数は同じ・その頁だけ表を読みに行く = 遅くなるだけ)。2% = 目安で 足した行・変わった行が 約 8 万 = 1〜2 週ごと (PG 18 の足した行の閾値は凍っていない頁の割合も掛かる = もっと早いこともある)。印の付いた頁は飛ばす = 1 回は前より軽いはず (負荷は当てた後の実績で見る)。
+    設定は vacuum を流す命令ではない = 当てた後に閾値に届いていなければ人が 1 回 vacuum を流す (下の当て方 5)。INCLUDE の列 (`orders.is_cancelled`・`order_lines.qty` / `cancelled_qty`) が変わる update は HOT にならなくなる (取消のときだけ = 書き込みが少し増えるだけ)
+  - 試さなかった道: 1 日ごとの写し (アプリの中・前日までの数) = 朝の注文の push の前に開くと、その日ずっと前日の注文が入らない・構成を直しても古い・初めて開く画面は速くならない /
+    夜の集計の表 = daily-sync に 1 段足す・公開の前の注文が入らない (0086 が core を直に読む理由と同じ) = 索引で足りるので作らない
+- **測った形** (使い捨ての PG 18・注文 400 万・明細 500 万・本番と同じ比 = いちばん売れる SKU の出品の行 約 3.1 万・SKU の行 約 2.6 千。時間は手元の SSD でほぼキャッシュ = 本番の時間ではない・比べるのは頁の数):
+  | いちばん売れる形 (明細 35,093 行・結果 1,310 行) | 前 (0086) | 後 (0092) |
+  |---|---|---|
+  | SKU の明細 | Bitmap Heap Scan = 表の頁 5,186 読み | Index Only Scan `ix_order_lines_sku_chart` = 46 頁 |
+  | 出品だけの明細 (出品 7 つ・29,989 行) | Index Scan + 表の頁 = 24,837 読み | Index Only Scan `ix_order_lines_listing_only_chart` = 229 頁 |
+  | 注文 35,093 件 | `orders_pkey` + 表の頁 = 読み 49,901 (hit 90k) | Index Only Scan `ix_orders_chart` (heap fetch 0) = 読み 20,074 (= 索引の葉 20,647 頁のほぼ全部) |
+  | 合計の読み (shared read) | **79,924** | **20,302** (−75%) |
+  - 数は前と後で同じ (いちばん売れる形・セット・小さい SKU の 3 つの結果の md5 が一致)。小さい SKU (289 行) = 読み 724 → 74
+  - 注文の索引の葉をほぼ全部読む = 読む量の下限はそこ (索引 約 160 MB / 注文 400 万)。関数の src を注文の番号の順に並べた (0092) = 注文 1 件ずつの探索のまま、葉を前から順に訪ねる (並べないと出品ごとに 7 回の飛び飛びの行き来)。連続の読みになる保証はない (先読みが効くかは本番の disk しだい)
+  - 直近 5% の頁に「全部見える」印が無いと、その分だけ表を読む (heap fetch・試験で読み 20k → 28k) = autovacuum を 2% にした理由
+  - 索引 3 本を作る時間 = 手元で 57〜60 秒 (注文 1.4 GB・明細 0.8 GB・できた索引 = 注文 161 MB・出品だけの明細 138 MB・SKU の明細 92 MB = 合計 約 390 MB)
+- **本番の見込み** (測れない = 仮定つきの試算・保証ではない = 8 秒に収まるかは当てた後の測定で決める): 前 = 読み 51k 頁で 11 秒 (= 平均 1 頁 約 0.2 ms)。後 = 明細は数百頁・注文は ix_orders_chart の葉 約 2 万頁を番号の順に。
+  同じ 0.2 ms / 頁なら 約 4 秒、索引を前から順に訪ねる分の OS の先読みが効けば 1〜2 秒、続けて開いて索引が DB / OS のメモリに残っていれば 1 秒より下 (手元 = 0.2〜0.4 秒)。
+  「全部見える」印の無い頁が多いとその分だけ遅い (heap fetch)。小さい SKU は 数十 ms。当てた後に `sales-chart-measure.mjs --call` で測って、ここに書き足す
+- **作る時間の見込み** = 手元 約 60 秒 (3 本) × 本番の遅い disk = 数分。その間 2 表の書き込みが待つ
+- 🚨 **lock**: ふつうの `create index` (concurrently でない) = 作っている間 `core.orders` / `core.order_lines` への **書き込みが待つ** (読むのは止めない = 画面・グラフ・見張りは動く)。3 本は 1 つの取引 = order_lines は 1 本目から・orders は 3 本目から commit まで。
+  runner がこの取引に `lock_timeout` 10 秒・`statement_timeout` 10 分を入れる。lock_timeout = 0092 が lock を取るのを待つ上限 (書いている取引があれば 10 秒で巻き戻して失敗 = 少し待ってもう一度)。取った後に相手を待たせる長さは縛らない。
+  statement_timeout は **1 文ごと** (取引の全体ではない) = 0092 の中で `set local statement_timeout = '3min'` に縮めた = 書き込みが待つのは索引 3 文の合計で長くて 約 9 分 (目安)。超えたら全部巻き戻す (索引・設定・関数のどれも残らない・invalid の索引も残らない)。
+  作っている間は sort の一時の file と WAL も使う (空きの見方は当て方 2)。
+  concurrent-index の migration (上の D-60 PR 3a-i) にしない理由 = **本番では今は流れない** (容量の読み手が Render の host の対応の回答を待って fail-closed = `RENDER_PG_HOST_MAPPING.confirmed = false`)
+- **当て方** (🚨 まだ流さない・本番 DB の操作 = 中原さんの OK の後):
+  1. 0087〜0091 を各節の手順で先に当てる (runner は番号の順にしか流さない。0092 だけ先にはできない)
+  2. 読むだけで今の大きさと速さを測る (miniPC・watcher・begin read only): `set DOTENV_CONFIG_PATH=C:\Users\bfaith\bfaith-portal\.env&& node -r dotenv/config scripts/company-db/sales-chart-measure.mjs --code 0726-001931 --code 0726-001389 --code phenix9ml`
+     = 2 表の大きさ・全部見える頁 / 凍った頁の割合・最後の vacuum・vacuum の後に足した / 死んだ行・索引の予想の大きさ・関数の本文の explain analyze (診断)。`--call` を付けると画面と同じ「関数の呼び出し」の時間も (持ち主の接続 `COMPANY_DB_URL`・begin read only・本文の EXPLAIN より先 = 頁を温める前に測る)。Render の画面の Disk の空きが **索引の予想の合計 × 3 + 2GB** 以上あることを見る
+  3. **daily-sync (07:00・retry 11:30 まで) と夜間ロード (02:00) の間の昼** (例 13:00〜17:00)・daily-sync の ok を見てから: `node scripts\company-db\migrate.mjs --dry-run` (0092 の 1 本だけ = 索引 3 本・2 表の autovacuum の設定・関数の create or replace)
+  4. 中原さんの OK → `node scripts\company-db\migrate.mjs` (ふつうの migration = migrate-watched でなくてよい)。lock_timeout で失敗したら数分待ってもう一度
+  5. 2 を `--call` つきでもう一度流す = 3 本が valid・計画が `Index Only Scan using ix_…_chart`・heap_fetch が少ない・関数の呼び出しの時間。
+     全部見える頁の割合が低く heap_fetch が多いとき: vacuum の後に足した行・死んだ行が 2% (約 8 万) を超えていれば数分で autovacuum が動く (`last_autovacuum` が新しくなるのを待つ)。
+     超えていなければ (または待っても動かなければ) 中原さんの OK の後に `… sales-chart-measure.mjs --vacuum` (= `vacuum (analyze, truncate false)` を 2 表に・読み書きを止めない・取引の外) → 2 を流し直す
+  6. 商品の画面 (`/apps/master-edit/sku/0726-001931`) でグラフが出るのを見る。測った時間をこの節に書き足す
+- 試験 = `node scripts/test-master-sales-chart.mjs` (「速さ (0092)」= 索引の形・関数と同じ条件と列で Index Only Scan の計画が立つ・関数の本文が同じ形・数は同じ / 測る道具の純粋な関数)
+
+### NE 登録の CSV を配った後も NE に送る欄を直せる (0093・2026-10-19 中原さん「名前修正できるようにしてよ … 毎回修正できないとかが多すぎて使えない」)
+- **なぜ外してよいか**: 翌朝の照合の確かめ (`ops.record_ne_registration_check`・0065 の版) は、NE の観測を品目の行の期待値 (`ops.ne_reg_export_items.expected` = 作ったときに固めた値・trigger で変えられない) と比べる。
+  今の Company DB と比べるのは代表 (親) だけ (`ops.ne_reg_cdb_compare`) で、代表は 0065 の「一度でも配ったら変えない」が別に守る = 配った後に今の値を直しても確かめは壊れない (NE が配った CSV の値なら verified)。
+  確かめの後の NE と Company DB の差は、毎朝の照合 ② の値の差 (持ち主が Company DB の列 = rule・company_owned = NE を Company DB の値に) として出て、今までどおり「マスタの判断 → NE に取り込む CSV」(0040) で送る
+- **関数を作り直す** (どれも前の最後の版を写して 🆕 0093 の行だけ変えた・値は変えない): `ops.ne_reg_supersede_built` (0053 の版 = 配った後の品目があっても作っただけのファイルは使わないにする・`issued` は知らせるだけ)・
+  `ops.edit_sku_jan` (0080 の版)・`ops.deactivate_supplier` (0053 の版) から `reg_csv_issued` の断りを外す・`ops.guard_reg_csv_live` (0053 の版) = 断るのは作っただけ (built) の商品だけ (理由 `reg_csv_built`)。ただし**セットの構成の依頼**は今までどおり確かめが終わるまで断る (確かめは配った構成と NE を比べる = 先に NE の構成を直すと partial のまま止まる・Codex R1 Medium・アプリは `REG_LOCK_AFTER_ISSUE`)。
+  印 `ops.reg_csv_edit_after_issue()` = アプリが `to_regprocedure` で「0093 の後か」を見る (0093 の前の DB = アプリは今までどおり 409 `reg_csv_issued`・画面は 🔒 = アプリを先に出してもよい)
+- **変えない**: NE に取り込む CSV (0040) の `csv_issued` の断り (確かめに期待値の写しが無い = 設計 25 PR-2)・代表 (親) の 0065 の断り・ロジザードの最初の値 (0062)・品目の行と期待値・作る関数の「まだ終わっていないファイルがある」
+- 画面 = 商品の画面は、配った後もほかの商品と同じ見た目 (入力欄・案内のカードなし・セットの構成だけ「確かめが終わると直せます」の 1 行)。単品の税率を変えて、それを依頼だけに入れた新しいセットの CSV を配った後なら、保存の答えに「NE の画面でセットの税率を確かめる」を出す (照合 ② はセットの税率を比べない・Codex R1 High)。一括の変更も止める理由にしない。まだ配っていない (built) ファイルは、直すと今までどおり自動で使わないになる
+- 当て方 (🚨 まだ流さない): 0087〜0092 を各節の手順で先に当てる → アプリ (マージ) → `migrate.mjs --dry-run` (この 1 本だけ・関数を作り直すだけ) → 中原さんの OK → 本適用。ロールの script の流し直しは要らない (create or replace = 権限はそのまま)
+- 試験 = `node scripts/test-master-reg-csv.mjs` ([C5] 配った後に直せる・期待値はそのまま・0093 の前の DB は 409 / [C7] 名前を直したまま verified / [D4] 直接の書き込み / [S3] 付け替え / [H] 画面) /
+  `scripts/test-master-compare-ne.mjs` ([42] 名前を直した新商品 = verified + ② の値の差 = rule・company_owned)
+
+### NE へ送る = 自社で直したけれど今朝の NE と違う欄だけを CSV にする (0094 仮番号・AI_reference CompanyDB構想/25 の PR-2・2026-10-19 中原さんの方針の変更)
+- **なぜ**: 商品の画面で原価・売価などを直しても、NE には翌朝の照合 → マスタの判断 → 列ごとの CSV を通さないと届かなかった (遅い・手間・出ている CSV の列は直せない)。
+  10/19 中原さん「シンプルに自由に編集できて、取り込み時に照合して差分がある部分を CSV で 1 日 1 回アップしたらよくない？あとは都度都度アップできるみたいな機能と 2 種類あればいい」
+  → **編集は自由** (NE に取り込む CSV (0040) が出ている列も保存を止めない・`lib/master-write.mjs` の 6.)・**毎朝、差の CSV を作る** (daily-sync の段「NEへ送る」)・**画面でいつでも作る** (PR-3 の画面「NEへ送る」)・
+  いちばん使う形 = **CSV を作る → 中原さんがダウンロード → NE の画面で手でアップ** (API の回数に入らない)。翌朝 NE と同じになったものは差から消える。
+  NE の API で上げる口もあるが **既定は止めてある** (env で開く・呼ぶ回数を少なく = 1 ファイル 1 回・キューの結果は既定で聞かない = 翌朝の照合で確かめる。NE の API は月 1,000 回まで無料)
+- **差** `ops.ne_upd_units(SKU | null)` (読むだけ) = 単位 (SKU・欄) ごとに、今朝の NE の値 (0083・その種類の取得の始めが今日 (JST)・値と書き方が同じ回) が ok で区分が同じで Company DB の今の値 (D2 の正規化・空白は JS の trim と同じ) と違い、
+  **その欄の今の値を入れたのが人 (変更の記録の source_system = portal_master_edit・原価は今の行の INSERT / cost_jpy・仕入先は is_primary の変更だけを見る)** のもの (夜間ロード・NE の観測の値 = わざと残した差は出さない)。
+  止める理由 (blocked): 段階が new_open でない (not_open)・今朝の取得でない (ne_not_today)・変更の後のマスタの判断 (差を残す・CDB を直す・入力を直す・仕様・却下 = decided / fix_ne の承認の目標が違う = decision_other_value)・
+  新商品の途中 (new_product)・NE から消す依頼の途中 / 配った消す CSV を取り下げて 30 日の中 (deleting)・取扱中止の CSV (0072) を人の取扱の直しより後に作った (handling_csv)・
+  コードの書き方が決まらない (ne_code_unknown / ne_collided / case_unverified / lz_many / lz_old)・CSV に書けない値 (name_is_code ほか = `ne-csv.mjs` の列の表と同じ決まり)。
+  送った後 (今朝の取得の後のその欄の最後の送りが同じ値・同じ書き方で、NE に上げた・受付が分からない・上げている最中・人がダウンロードした) = sending (翌朝の照合で NE と同じになれば一覧から消える)・
+  この 4 日に 2 回 NE に上げて、その後に始まった取得でもまだ違う = stuck (自動では送らない)。
+  コードの書き方 = 設計 25 §2.4 (NE の書き方 / ロジザードの書き方が 1 つ = ロジザードの書き方)。🚨 大文字・小文字の直しは NE の実物の試し (`ops.ne_upd_verified` の code_case が ok) の後だけ (前 = NE の今の書き方で送る)。
+  値の差が無い単品で書き方だけ違う = 原価 → 売価 → 名前の順に NE と同じ欄を 1 つ入れた行 (role spelling)
+- **ファイル** `ops.ne_upd_build(how, 送り手, API で上げるか)` (鍵の下で差を作り直す = DB が今の値から作る・アプリから値・列名・バイト列を受け取らない)。1 行 = 1 SKU・単品とセットは別のファイル・UTF-8・BOM なし・CRLF・1,000 行ずつ。
+  空欄のセル = NE の実物で「空欄 = 変えない」を確かめた欄 (`ops.ne_upd_verified` の入口ごとの最後が ok = 人の取り込み (bulk) と API (api) は別)。確かめていない欄は空欄にしない (欄の組ごとのファイル)。
+  毎朝 (auto) = 同じ今朝の NE の回で 1 回 (2 回目は前の答え・バイト列なし)・100 欄を超える / この 14 日の平均の 5 倍 (20 欄より多い) = held (作らない = まとめに「止めました」)。
+  人が受け取る CSV = `ops.ne_upd_make_download` → `ops.ne_upd_download` (作った JST の日だけ・最初のダウンロードを残す・API で上げるファイルは渡さない)
+- **送り手** `scripts/company-db/ne-update-send.mjs` (miniPC)。`--daily` = daily-sync の段「NEへ送る」(差の CSV を作ってまとめに 1 行) / `--pending` = 画面の「今すぐ NE へ送る」の頼み (API の口を開けたときだけ・数分おきの定期実行 = タスクを足すのは使い始めるとき)。
+  API の口 = `NE_UPDATE_UPLOAD=1` (今すぐ) + `NE_UPDATE_AUTO=1` (毎朝の分も)。単品 `api_v1_master_goods/upload`・セット `api_v1_master_setgoods/upload` (1 ファイル = 1 回)。キューの結果 (`api_v1_system_que/search`) は `NE_UPDATE_QUE_CHECK=1` のときだけ 1 ファイル 1 回。
+  NE がはっきり断った = failed (もう一度送れる) / 通信が切れた・上げる途中で止まった = unknown (受付が分からない = 自動では送り直さない・翌朝の照合を待つ)。上げてよいのは作った送り手が作った時の 1 回だけ (claimed)。
+  NE のアプリの「アクセス情報」に 商品マスタ / セット商品マスタのアップロード (キューを聞くならアップロードキューの検索も) の許可が要る (無い = 006001 / 004001)
+- **守り**: 表へは関数の中でだけ書ける (印 `ops.ne_upd_protocol`・持ち主のロールでも)・行と中身は書き換えない・消さない (状態・結果の列だけ・終わったファイル / 回は戻さない・que_id は変えない)。
+  鍵 = `ops.ne_upd` (排他) → NE のコードの共有 → NE の値の共有 → ロジザードの書き方の共有 (record_ne_values / record_ne_codes / record_lz_codes はこの鍵を取らない = 輪にならない・保存とは鍵を共有しない)。
+  **master_edit (画面) = 一覧・商品の差・今すぐの頼み・受け取り・試しの記録の実行だけ / watch_writer (送り手) = 作る・結果・待ちの一覧・生存・一覧の実行だけ / watcher = 表を読むだけ**
+- 当て方 (🚨 まだ流さない・本番 DB の操作 = 中原さんの OK の後): 番号をマージの順に付け替え → **アプリが先** (マージ → Render と miniPC を同じ build に。0094 の前は送り手が「migration の前」で何もしない・保存は自由になる) →
+  `migrate.mjs --dry-run` (この 1 本だけ・表と関数を足すだけ・今のデータは変えない) → 中原さんの OK → 本適用 → `create-master-edit-roles.mjs` と `create-watch-roles.mjs` を流し直す
+  (0094 の中でもロールがあれば実行権を付ける = 流し直しは決まりの姿にそろえるため) → 翌朝の「NEへ送る」の 1 行 (差 N 欄) を見る → 画面で CSV を作って NE で取り込む →
+  中原さんが NE の実物で空欄を試す (設計 25 §2.9・欄ごとの結果を画面の「試しの結果を残す」で) → (API を使うなら) NE のアクセス情報を確かめる → `.env` に `NE_UPDATE_UPLOAD=1` → 今すぐ送るのタスク → 様子を見て `NE_UPDATE_AUTO=1`
+- 試験 = `node scripts/test-ne-update.mjs` (差・書き方・作る・空欄 (入口ごと)・毎朝の上限・翌朝・stuck・受け取り・送り手 (API は既定で呼ばない・断った / 受付が分からない)・権限) /
+  本物の PG = `test-ne-update-pg.mjs` (record_ne_values・record_ne_codes と待ち合ってもデッドロックしない・同じ朝の自動を 2 回作らない・頼みは 1 つ) /
+  `test-master-edit.mjs` [10]・`test-master-edit-pg.mjs` [5]・`test-master-bulk.mjs` [4] (CSV が出ていても保存できる) / `test-daily-sync-step-order.mjs` [10] (段の場所)
+- 🆕 **0096 = 単品 1 つ・セット 1 つ** (10/20 中原さん「CSVの数が多すぎない？1つにまとめてよ」・10/20 の本番 = 123 欄が 5 つ → 単品 2 つ (102 行 + 3 行)):
+  見出し = コードの列 + その種類で変える欄の全部。変えていない欄 (埋めるセル `ops._ne_upd_filler`) = 確かめた空欄 (`ops.ne_upd_verified` の ok) / **今朝の NE の値** (`ops.master_ne_values` を `ops.ne_upd_cell` で書く = NE は同じ値のまま) /
+  今朝の後にこの画面の CSV で出した値 (送っている途中 = 自社の今の値。前の CSV を朝の値に戻さない)。
+  埋められない = 今朝の NE の値が無い・不明・書けない (空・0・名前 = コード)・**取扱が中止** (NE の 取扱中止 1 / ﾒｰｶｰ取扱中止 2 を今朝の値では見分けられない = 1 を書くと 2 を変える)・
+  今朝の後に別の値を出した・マスタの判断の CSV (0040) / 取扱中止の CSV (0072) がこの 2 日にその欄を書いたかも → **その行だけ 2 つ目の CSV** (見出し = その行たちの変える欄) →
+  そこでも埋められない行 = その商品が変えた欄だけの CSV (0094 と同じ形)。どの欄も落とさない (作った欄の数 = 送る欄の数を DB が確かめる)。理由は `summary.apart`。
+  埋めたセルは `ops.ne_upd_files.fill` (書き換えない) に残し、受け取り (`ops.ne_upd_download`) の前に今の状態でもう一度決めて同じでなければ渡さない
+  (今朝の値が入れ替わった・その後にほかの CSV でその欄を出した)。🚨 残る危うさ: 今朝の取得の後に NE の画面 (やポータルの外の CSV) で同じ欄を直していたら、朝の値に戻す
+  (NE は下流 = 受け入れる・画面に 1 行「NE の画面で今日直した値は、この CSV で朝の値に戻ります」)。
+  当て方: アプリが先 (0096 の前の DB = 今までどおり組ごとのファイル・画面の 1 行は出さない) → `migrate.mjs --dry-run` (この 1 本・列を 1 つ足して関数を作り直すだけ・値は変えない) → 中原さんの OK → 本適用 →
+  `create-master-edit-roles.mjs` を流し直す (0096 の中でも印 `ops.ne_upd_one_file()` の実行権は付ける = 流し直しは決まりの姿にそろえるため)。試験 = `test-ne-update.mjs` [M2]・[B1]・[B6]〜[B8]・[P1] / `test-ne-update-pg.mjs` [K6] / `test-ne-update-ui.mjs` [S3]・[U1]
+
+### 代表 (親) の門を、ずれた色違いのまとまりだけに絞る (0095・2026-10-19 中原さんの決定 = 作る)
+- **なぜ**: 0068 の門は、毎朝の照合 ② の代表のずれが 1 件でもあると新しい NE 登録の CSV (作る・配る) を全部閉じた。10/19、NE で直接足した色違いの子 6 件
+  (diffuserrefill200-2-ra/-st・reeddiffuser-ra/-st・wae10-ra/-st = 要確認・社内は親なし) のずれで、関係の無い新商品の CSV まで止まった。
+  門の目的 (配った後の代表は NE と社内で同じ = ずれたまとまりに CSV が代表を書かない・まとまりを崩さない) は、**そのまとまりに触る CSV だけ止めれば守れる**
+- **止める** (品目の表の trigger `ops.guard_ne_reg_parent_gate` を作り直す・見る所 = 作る (insert built)・配る (built → issued)・持ち主 company のときだけ・作り直し (前の品目が failed) は通す = 0068 と同じ):
+  この商品の鍵 = CSV に書く代表 (品目の期待の値)・社内の代表の名札・自分の名札・自分のコード・セットなら構成品 (期待の値・今の構成・開いている構成の依頼) の代表・名札・コード が、
+  まだ直っていないずれの鍵 = 記録の鍵 (ずれた単品のコード・名札・NE の代表・社内の代表) + 今の社内 (そのずれた単品の名札・代表) に当たる = `parent_gate_group`
+- **全部止める** (今までどおり = `parent_gate_closed`): 記録が無い・今朝の許可の回と違う・今日でない・数えが読めない・まとまりに分けていない記録 (0095 の前)・分けた数が数えと合わない・
+  分けられないずれ (比べられない = 取得で保持・NE ではセット・代表が読めない・行が落ちた / 2 段 / 循環)。分けられるずれ = NE と違う・社内に親が無い・当たる親が 2 つ以上・完全な取得に無い
+- **その場で開く**: 記録の後に社内を NE (記録した観測) に合わせた (「NE の代表を採用する」など) = 社内の親の名札の norm が NE の代表・2 段でない・NE の代表に当たる商品が 1 つ (翌朝の数えと同じ決まり・NE と違う / 社内に親が無いだけ)。NE を直したときは翌朝の照合の後
+- **表** `ops.master_parent_gate_scopes` (追記だけ・照合の回ごとに 1 行・数は生成列) と鍵の表 `ops.master_parent_gate_scope_keys` (ずれ × 鍵・(記録の回, 鍵) の索引 = 品目の行ごとの門はこの商品の鍵で引いた・同じ代表の下にいるずれだけを読む = ずれの数に比例しない・#Codex R2)・名札の norm の索引 `ix_products_display_norm` (同じ名札の別の商品の下にいるずれも引く・直ったかの数え・#Codex R3)。書くのは `ops.record_parent_gate` (0070 の版 + 🆕 0095 の 1 行) の中だけ。`ops.parent_gate_state()` に `scope` (全部止めるか・止めているまとまり) を足した (朝の要約・drift-list)
+- **画面**: `ops.parent_gate_csv_check(SKU の配列)` (master_edit・読むだけ) = 候補ごとに止まるか・理由の 1 行。「色違いのまとまり reeddiffuser が NE とずれているので、この商品は CSV にできません。reeddiffuser-ra などの画面で『NE の代表を採用する』を押すと直ります」(コードは商品の画面へのリンク)・
+  全部止める朝は上に 1 つの知らせ。作る (lib) は鍵の後に同じ判断で先に止める (not_ready)。止めるのは DB の trigger (画面・lib を信じない)
+- **朝の要約**: 絞った朝 = 「この色違いのまとまりの商品だけ NE 登録の CSV を止めた: reeddiffuser・wae10 … (ほかの商品は作れる)」/ 全部止める朝・記録できない朝 = 「全部止めた」
+- 鍵: 門は読むだけ (鍵を足さない)。記録 (照合 ② = 新商品の許可の排他の鍵) と作る / 配る (共有) は今までどおり重ならない
+- 当て方 (🚨 まだ流さない・本番 DB の操作 = 中原さんの OK の後): アプリ (マージ) → `migrate.mjs --dry-run` (この 1 本だけ) → 中原さんの OK → 本適用 → 翌朝の照合から絞る (当てた日の記録は分けていない = ずれがあれば今までどおり全部止める・急ぐなら照合 ② を流し直す)。
+  画面のロールの実行権は migration が付ける (`create-master-edit-roles.mjs` の流し直しは要らない・流し直しても同じ)
+- 試験 = `node scripts/test-master-parent-gate.mjs` ([P19] まとまり A のずれは B・C を止めない / A の子・A を書く行・A の子を入れたセット・ずれた子は止まる / その場で直る / NE と違う・NE に無い / 全部止める形・[P20] 朝の要約・[P21] 写し) /
+  `scripts/test-master-reg-csv.mjs` ([G1] 画面の候補・リンク・作る・DB の trigger・全部止める朝・権限) / `scripts/test-master-parent-gate-pg.mjs` ([R] 実 PostgreSQL のロール)
+
+### NE 登録の CSV をボタン 1 つに・まとまりの子も単品の CSV に (0097 仮番号・2026-10-20 中原さん「まとまりごとでアップしないといけないから面倒。ボタンをワンクリックしたら CSV が作成できるように。画面遷移がおおい」)
+- **なぜ入れてよいか**: 単品の版 (`ne-reg-single-v2`) とまとまりの版 (`ne-reg-variation-v1`) は見出し・行の作り方 (`ops.ne_reg_canonical`) が同じ = 版で行は変わらない。NE の CSV に代表 (親) の行は無く、代表商品コードは子の行の列。
+  NE はまだ知らない代表商品コードの子も CSV で受けた (本番 10/19 のまとまりのファイル #9〜#14 が翌朝 3 者一致) = 行の順の決まりは要らない (アプリはまとまりの子を並べて書く)
+- **関数を作り直す** `ops.ne_reg_build` (0067 の版を写して 🆕 の行だけ): 単品の版の `variation_file_required` を外し、入れたポータルのまとまりごとに `variation_incomplete` (そのまとまりの NE 登録待ちの子を全部) を確かめる。
+  まとまりの版は 0067 のまま。印 `ops.reg_csv_one_file()` = アプリが `to_regprocedure` で見る (前の DB = アプリはまとまりを今までどおりまとまりの版のファイルに分ける = アプリを先に出してよい)
+- **アプリ**: `lib/master-reg-csv.mjs` の `regPlan` (いま作れる商品を単品 1 つ・セット 1 つのファイルに分ける・まとまりは丸ごと・止まる子の居るまとまりは待つ) と `buildRegAll` (ファイルごとに今までの作る → 配るを通す・押し直し = 同じファイル・DB に断られた商品は外して作り直す)・
+  `POST /api/reg-csv/build-all`。画面 = 次の CSV (ボタン 1 つ)・NE で取り込む (「NE に取り込んだ」1 つ = 申告 ok)・直すもの・NE にもうある商品・前のファイルは「これまでの記録」にたたむ
+- **変えない**: 形の版の決まり・行と確かめる値・翌朝の確かめ (3 者一致)・配る・申告・使わない・代表 (親) の門 (0095)・まだ終わっていないファイル・NE にもうあるコード・1 ファイル 1,000 行
+- 当て方 (🚨 まだ流さない・本番 DB の操作 = 中原さんの OK の後): 番号をマージの順に付け替え (同じころの NE 更新の CSV の migration と) → アプリ (マージ) → `migrate.mjs --dry-run` (この 1 本だけ・関数を作り直すだけ) →
+  中原さんの OK → 本適用。ロールの script の流し直しは要らない (create or replace = 権限はそのまま・印は public から外すだけ)
+- 試験 = `node scripts/test-master-variation.mjs` ([N2] 単品の版にまとまりの子・欠ける = variation_incomplete / [S4] 0067 との差) / `scripts/test-master-variation-batch.mjs` ([C1]・[C3] ボタン 1 つ・前の DB の分け方・外す・押し直し) /
+  `scripts/test-master-reg-csv.mjs` ([H1]・[H4] 画面と API・[G1]) / `scripts/test-master-register.mjs` ([G-0064]) / 画面 = `test-master-edit-ui.mjs` [38]・`test-master-variation-ui.mjs` [⑥]・[⑥b]
+
+### NE にあるので登録済みにする (0098・2026-10-20 中原さんの承認)
+- **なぜ**: 新商品の下書きで NE に同じ商品がもうあるもの (NE の画面で先に登録した = CSV にできない already_in_ne / CSV を配った後に名前を直した = 品目の期待値が NE と合わず partial のまま) は、
+  下書き → NE 確認済みの道が無く止まっていた (本番 10/20 = chinaseima・guargum50・calculationwb・bikecover-BK / -SV・nanairos-yo)。下書きの間は「NEへ送る」も new_product で止まる
+- **決まり** (`ops.draft_in_ne_check`・読むだけ・security definer): 今朝の照合 ② の封をした回 (= NE のコードの台帳の回・取得が 36 時間以内) の観測にそのコードがある (present・trusted)・
+  NE のコードの書き方 (大文字・小文字) が社内のコードと完全に同じ・区分 (単品 / セット) が同じ・生きている NE 登録の CSV の品目は一部違う (partial) の 1 つだけ (消さずに superseded・理由 `resolved_by_human`)・
+  代表 (色違い) が NE と同じ (代表の門の「直った」= `ops._parent_gate_resolved` と同じ決まり)・セットは構成品が全部 NE 確認済み以降・構成の依頼なし・中身 (子と数量) が NE と同じ・NE から消す依頼なし。ロジザードの表には触らない
+- **登録済みにする** `ops.confirm_draft_in_ne(request_id, 人, SKU, check_hash)`: 1 件 = 1 取引・同じ request_id = 前の答え・画面の check_hash と違う = stale・約束 (操作 `draft_ne_confirm`) の中で
+  `ops.transition_sku_registration` (0079 の版 + 🆕 0098 のかたまり = 下書き / NE 登録待ち → NE 確認済みは、この約束の中だけ。地図に `draft > ne_confirmed`) → 品目を superseded → 保存の記録 done。
+  履歴 (`ops.master_registration_events`) の根拠 = DB が作った値 (rule `draft_in_ne_v1`・照合の回・観測のハッシュ・品目と `resolved_by_human`・NE と違う欄)
+- **照合 ② の確かめ待ち** `ops.v_ne_reg_targets` に「下書き・NE 登録待ちで NE のコードの台帳にあるもの (生きている品目なし)」を足した = 翌朝から観測が残る (CSV にしていない下書きは、当てた後の最初の照合の後から押せる)
+- **NE へ送る** `ops.ne_upd_units` (0094 の版 + 🆕 0098 の 2 行): この道で登録済みにした商品だけ、登録 (ポータルの INSERT) のまま直していない名前・取扱・税率・売価も「人が入れた値」として NE と違えば出す
+  (ほかの商品 = 照合で確かめた新商品・夜間ロードの商品は今までどおり「その欄を最後に UPDATE したのが人」だけ)
+- **画面**: 商品の画面の箱 (`_draftinne.ejs`)・「NE 登録の CSV」の「NE にもうある商品」「直すもの」の行ごとのボタン「NE にあるので登録済みにする」(名簿 `MASTER_DECISION_APPROVERS` の人だけ押せる)。
+  押した後の 1 行 =「登録済みにしました。NE とちがう所は『NEへ送る』に出ます」。押せないときは DB の理由の文をそのまま出す
+- 当て方 (🚨 本番 DB の操作 = 中原さんの OK の後): アプリ (マージ = 0098 の前の DB では画面に何も出さない) → `migrate.mjs --dry-run` (この 1 本・view と関数と CHECK を作り直すだけ・値は変えない) → 中原さんの OK → 本適用。
+  ロールの script の流し直しは要らない (migration の中で master_edit・watcher に実行権を付ける)
+- 試験 = `node scripts/test-master-draft-in-ne.mjs` ([M] 写し・[C] 確かめ・[F] 登録済みにする・[N] NE へ送る・[T]・[R] ロール・[S] 画面・[U] 画面の JS) / `scripts/test-master-reg-csv.mjs` [C18] / `scripts/test-master-register.mjs` [S3]
+
+### セットの新商品を構成の持ち主 NE のまま登録する (0099 仮番号・2026-10-21 中原さん「セット商品つくれないんだけど。作れるようにして」「近道を作って」)
+- **なぜ**: 新商品の登録 (セット) は、構成の持ち主 `sku_components` が load (NE が正) なので閉じていた (画面「切替前です」)。登録が書くのはセットの SKU と構成の依頼 (`ops.sku_component_requests`) だけで、
+  `core.sku_components` は書かない = 持ち主を切り替えなくても開けてよい (AI_reference CompanyDB構想/24 §経緯 10/21 = 大きな切替 PR-1〜PR-7 は今は作らない)
+- **DB** (前の最後の版を写して 🆕 0099 の行だけ変えた・試験 [G-0099] が差を機械で確かめる):
+  - 許可: `ops.grant_new_entry_lease('single', 回)` が同じ結果の行・同じ期限でセットの許可も出す / `revoke_new_entry_lease('single')` がセットも取り消す (停止の床も両方)。毎朝の段 (new-entry-gate.mjs) は変えない。
+    当てた時点で単品の許可が有効なら同じ結果の行・期限でセットの許可を 1 つ出す (`@@SET_LEASE_BEGIN@@` の do ブロック・もう一度流しても何もしない)
+  - `ops.register_new_sku` (0061 の版): セットも許可を確かめる・登録の結果の「このあと」をセットだけ今の手順に
+  - `ops.guard_master_edit_write` (0051 の版): 登録の約束 (`sku_create`) の中の構成の依頼の INSERT だけ、持ち主 `sku_components` が load でも通す (既にあるセットの依頼・食い違いは今までどおり company のときだけ)
+  - `ops.ne_reg_schema_rule`: セットの NE 登録の CSV = `ne-reg-set-v2` (見出し・中身は v1 と同じ・試し用の 5 行の門なし = 24 の Q2 = a)・v1 は作らない / 配らない版 (本番でセットの CSV はまだ 0 件)
+  - 印 `ops.set_entry_on_load()`
+- **アプリ**: 新商品の登録の持ち主の条件は `NEW_ENTRY_OWNER_KEYS` (= `NEW_ENTRY_KEYS` から依頼だけのキー `sku_components` を除く)・夜間ロードの後の `promoteComponentRequest` は持ち主 load のとき
+  依頼を閉じるだけ (`closeRequestOnLoad`: 観測 = 依頼で core = 観測 = applied・違う = 食い違い mismatch / stale・core がまだ = 次の夜・core = 観測なら導く値を今の core で計算し直す・core の構成は書かない・依頼の無いセットは何もしない)。
+  今の構成が空の新しいセットは、画面の保存の確かめと計算し直しを依頼の構成でする。セットの NE 登録の CSV は「NE に取り込んだ」を押す (翌朝の自動の確かめはセットを比べない = 0063 の `set_not_compared`)
+- 当て方 (🚨 本番 DB の操作 = 中原さんの OK の後): `migrate.mjs --dry-run` (この 1 本・関数の置き換えと許可の行を 1 つ足すだけ・商品と構成の値は変えない) → 中原さんの OK → 本適用 → アプリを配る
+  (アプリが先でも、0099 の前の DB はセットの許可が無い = セットは閉じたまま)。ロールの script の流し直しは要らない (create or replace = 実行権はそのまま・新しい印は誰にも渡さない)。
+  夜間ロードの規則の指紋 (engine.mjs ほか) は変えない = Render と miniPC を同じ朝にそろえる必要はない
+- 戻し方: 非常の止め `MASTER_NEW_ENTRY_STOP=1` (Render の env) で新商品の登録と CSV を止める。持ち主は変えていない = 夜間ロード・古い表・出荷は今のまま
+- 試験 = `scripts/test-master-register.mjs` [R1]・[R9]・[W1]・[W2]・[G-0099] / `scripts/test-master-reg-csv.mjs` [C11]・[V1]・[V6]・[W2] ⑦ (許可と do ブロック)・[H1]・[H3] / `scripts/test-master-edit.mjs` [11L] / `scripts/test-master-edit-ui.mjs` [60]
+
+### 今あるセットの中身を構成の持ち主 NE のまま依頼で変える (0100 仮番号・0099 の次・2026-10-21 中原さん「近道を作って」)
+- **なぜ**: 0099 で新しいセットは依頼の形で登録できるようになった。今あるセットの中身 (構成) の変更も同じ形 (依頼 → NE → 翌朝確かめて閉じる) で、持ち主 load のまま開ける
+- **DB**: `ops.guard_master_edit_write` (0099 の版を写して 🆕 0100 の continue だけ変えた・試験 [G-0100]) = 構成の依頼と食い違いの表 (`ops.sku_component_requests`・`ops.sku_component_breaches`) は持ち主 `sku_components` が load でも通す
+  (表・操作の許可・約束の相手の行・構成品は単品だけ・ほかの持ち主のキーは今までどおり)。印 `ops.set_comp_request_on_load()`
+- **アプリ**: 0100 の後の DB で、セットの導く値のキー (税率・取扱・原価) が company のとき、商品の画面の「構成」は持ち主 load でも依頼として保存できる (`REQUEST_ONLY_KEYS`)。
+  「NEへ送る」に「セットの中身を変える依頼」の板と「セットの中身の CSV を作る」(`lib/master-set-comp-csv.mjs`・`POST /api/ne-update/set-comp-csv`) =
+  足す・数を変えるセットの依頼の全部の行 (`set_syohin_code,syohin_code,suryo`・NE の書き方・UTF-8・CRLF)。外す・入れ替えるは NE の画面で (CSV ではできない)。CSV は DB に記録しない (開いている依頼からその場で作る)。🚨 前に作ったファイルは前の中身 = 依頼を直した・取り下げた・NE で直した後に取り込むと戻る = 画面・つかいかた・保存の後の一言で「作り直す・前のファイルは捨てる」と出す (仕組みでは止めない = 中原さんの「シンプルに」と Codex の「運用の判断として許容」)
+  夜間ロードの後の依頼の閉じ方 (`closeRequestOnLoad`): 依頼から 7 日までは NE が違っても食い違いにしない (waiting_ne = 取り込む前の夜)・7 日より後 = stale
+- 当て方: 0099 の後に `migrate.mjs --dry-run` (関数の置き換えと印だけ・値は変えない) → 中原さんの OK → 本適用 → アプリを配る。ロールの流し直しは要らない。夜間ロードの指紋は変えない
+- NE の実機の試し: `AI_reference/システム設計/CompanyDB構想/_raw/NE_CSV実機の試し_20261021_セットの中身` (数量を変える・足す・書かない内訳が残るか)。結果が出るまでは最初の 1 回を 1 セットで
+- 試験 = `scripts/test-master-reg-csv.mjs` [SC1] (依頼・CSV・外すだけ・取り下げ・0100 の前は 409) [SC2] (画面・API) / `scripts/test-master-edit.mjs` [11L] / `scripts/test-master-register.mjs` [G-0100]
+
+### 夜間ロードがセットの構成を変えたら、セットの導く値を計算し直す (migration なし・2026-10-21 中原さん承認)
+- **なぜ**: 10/5 からセットの税率・取扱・原価 (導く値) の持ち主は company = 構成品から導く (画面の保存・構成の昇格が計算し直す)。でも構成 (`sku_components`) の持ち主は load のまま =
+  NE でセットの中身を変えると、夜間ロードが `core.sku_components` を書き直すのに導く値は前の構成のまま残っていた (本番 10/21: maikoset の原価 1,562 円 ≠ 今の構成品の合計 2,040 円・
+  10/13 の夜間ロードが構成品を入れ替えた)。NE で直接作られた要確認 (quarantined) のセットも、構成は入るのに原価の行が無いまま (33 件)
+- **アプリ** (`lib/master-write.mjs` の `recomputeSetsAfterLoad`・`apps/company-db/load/engine.mjs` の commit の後 = 構成の依頼の昇格の次):
+  対象 = この回の夜間ロードが構成の行を足した・直した・消した親 ∪ 前の 7 日に夜間ロードが構成を変えた親 (変更の記録 `events.master_change_events` の `sku_component`・`company_db_load` =
+  前の晩に計算し直せなかったセットも拾う)。セットごとに 1 取引・鍵は構成の昇格と同じ順 (段階 共有 → 開いているか・導く値の持ち主が company か → マスタの書き込み 共有 (短く待つ) →
+  SKU ごと (セット + 構成品) → CSV → 行 → 読み直す)。計算は画面の保存と同じ `recomputeSet` (`planSetDerived` = `lib/master-set-rules.js`)。
+  人の値は残す: 例外原価 (`manual` / `override_zero`) は上書きしない・セット自身の取扱 (`handling_own`) が無いセットは構成品が止まったときだけ止める・先の日付の原価があるセットは計算しない。
+  変わらないセットは何も書かない (記録なし)。変更の記録 = `system`・actor_id = 夜間ロードの host・`company_db_load`・run_id = 夜間ロードの回・理由「構成の変更に合わせて計算し直し」。
+  計算し直せない (夜間ロードの鍵の最中・先の日付の原価・原価の期間が重なる) = 何も書かずに数えるだけ (次の晩にもう一度・7 日まで)。対象が 300 件より多い = 1 つも計算し直さない (守り)。
+  report の `set_derived` (changed_parents・candidates・changed・same・skipped・retry・reasons・results)。構成の持ち主が company になったら呼ばない (構成の昇格が計算し直す)
+- **NE には何も送らない**: NE のセットの欄は名前・売価だけ (「NEへ送る」0094 の `ck_nuv_kind_col`・照合 ② の `NE_VALUE_COLS.set`) = セットの税率・取扱・原価は「NEへ送る」に出ない。
+  古い表 (m_products) のセットの原価は作り直しが構成品から計算する (`set_calc` は Company DB の値を写さない) = 写しの値は変わらない
+- **前から残るずれの後始末** `scripts/company-db/set-derived-catchup.mjs` (人が 1 回流す道具・migration なし・定期実行ではない): 全部のセット (か `--code`) を今の構成で計算し直す。
+  既定 = dry-run (読み取りの取引・前 → 後・人の値で残すセット・直さないセット・計画のハッシュ) / `--apply --expect-hash <dry-run のハッシュ> --yes` = 1 つの取引 (鍵の後に読み直してハッシュを比べる・
+  書いた答えが計画と違えば巻き戻す)。変更の記録 = 人 (`--actor`)・理由 (`--reason`)・request_id・`set_derived_catchup`。2 回目の dry-run は「直す 0」= もう一度流しても何もしない
+  - 本番 10/21 の dry-run (読むだけ): セット 2,264 件のうち直す 34 件 = maikoset (available) の原価 1,562 → 2,040 円と、要確認のセット 33 件の原価 空 → 構成品の合計。税率・取扱の差は 0。
+    例外原価で残す 6 件 (構成品の合計と違う: agneyemask5-o・bathpowder21・keshiki-tstt・nemune-100gs・proherbem-st-ct・qais-bfaithset)
+- 当て方 (🚨 中原さんの OK の後): migration は無い。🚨 `engine.mjs` は夜間ロードの規則の指紋 (`LOAD_RULE_FILES`) に入る = **朝の照合の後〜次の夜間ロード (02:00) の前に Render と miniPC の両方へ配り** (同じ日のうちに)、
+  両方の build を確かめる (違う build だとその朝の照合 ① が `rule_mismatch`)。配った後の最初の夜間ロードが、前の 7 日に構成が変わったセットを計算し直す。
+  その後 miniPC で後始末の道具の dry-run → 中原さんが表を見て OK → 同じ日に `--apply --expect-hash … --yes` (同じ `--actor` / `--reason` / `--code`)
+- 戻し方: この PR を revert して両方へ配る (配る時刻の条件は上と同じ)。計算し直した値は変更の記録に残る (前の原価の行は昨日で閉じただけ = 消していない)
+- 試験 = `scripts/test-set-derived-load.mjs` (PGlite: [L1]〜[L5] 夜間ロード・[C1]〜[C3] 後始末の道具) / `scripts/test-set-derived-load-pg.mjs` (実 PostgreSQL: 鍵の待ち合わせ [P1]〜[P4])

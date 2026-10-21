@@ -16,12 +16,16 @@
   const h = (x) => String(x ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const seg = (id, field, current, opts, label) => '<div class="seg" role="group" id="' + id + '" aria-labelledby="lab-' + id + '" data-field="' + field + '" data-dirty-field="' + field + '" data-label="' + label + '" data-value="' + current + '">'
     + opts.map(([v, t, small]) => '<button type="button" data-v="' + h(v) + '" aria-pressed="' + (current === v ? 'true' : 'false') + '"' + (current === v ? ' class="on"' : '') + dis + '>' + h(t) + (small ? ' <small>' + h(small) + '</small>' : '') + '</button>').join('') + '</div>';
-  const compRow = (i) => '<tr class="comp-row"><td class="no">' + i + '</td><td><input class="in mono c-code" style="width:150px" autocomplete="off" spellcheck="false" placeholder="商品コード" aria-label="' + i + ' 行目の構成品のコード"' + dis + '> <span class="c-name"></span></td>'
+  // 🆕 2026-10-21 中原さん: 構成品の欄はコードのほか名前・JAN でも探せる (候補の箱 #comp-suggest = public/me-comp-suggest.js)。保存できる画面だけ combobox。
+  //   名前の横に「コピー」(セットの名前に貼って直す)・「名前に使う」(名前が空のとき = 名前 N個セット・lib/set-plan.mjs defaultSetName と同じ形)。押せるのは名前が出てから (public/me-new.js)
+  const cbx = canSave ? ' role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="comp-suggest"' : '';
+  const compRow = (i) => '<tr class="comp-row"><td class="no">' + i + '</td><td><input class="in mono c-code" style="width:150px" autocomplete="off" spellcheck="false" placeholder="コード・名前" aria-label="' + i + ' 行目の構成品のコード"' + cbx + dis + '> <span class="c-name"></span>'
+    + '<span class="c-tools" hidden><button type="button" class="btn sm c-tool" data-act="copy-name"' + dis + '>コピー</button><button type="button" class="btn sm c-tool" data-act="use-name"' + dis + '>名前に使う</button></span></td>'
     + '<td><input class="in c-qty" style="width:70px;text-align:right" inputmode="numeric" autocomplete="off" value="1" aria-label="' + i + ' 行目の数"' + dis + '></td><td class="c-tax"></td><td class="c-sales"></td><td class="c-cost n"></td><td class="c-handling"></td>'
     + '<td class="acts"><button type="button" class="iconbtn" data-act="up" aria-label="' + i + ' 行目を上へ"' + dis + '><svg class="ic s" aria-hidden="true"><use href="#i-up"/></svg></button><button type="button" class="iconbtn" data-act="down" aria-label="' + i + ' 行目を下へ"' + dis + '><svg class="ic s" aria-hidden="true"><use href="#i-down"/></svg></button><button type="button" class="iconbtn del" data-act="del" aria-label="' + i + ' 行目を外す"' + dis + '><svg class="ic s" aria-hidden="true"><use href="#i-trash"/></svg></button></td></tr>';
   // 区切り (上の飛び先の帯と同じ順)。番号は種類で変わる
   const secs = isSet
-    ? [['sec-code', 'コードと名前'], ['sec-comp', '構成'], ['sec-money', 'お金'], ['sec-ship', '発送'], ['sec-card', '出品カード'], ['sec-yahoo', 'Yahoo!']]
+    ? [['sec-comp', '構成'], ['sec-code', 'コードと名前'], ['sec-money', 'お金'], ['sec-ship', '発送'], ['sec-card', '出品カード'], ['sec-yahoo', 'Yahoo!']]
     : [['sec-code', 'コードと名前'], ['sec-money', 'お金'], ['sec-tax', '税・分類・仕入先'], ['sec-order', '発注'], ['sec-ship', '発送'], ['sec-card', '出品カード'], ['sec-yahoo', 'Yahoo!']];
   const no = (id) => secs.findIndex((x) => x[0] === id) + 1;
   // 🆕 2026-10-13 中原さん「入力なし」: 必須でない項目は 値 か 入力なし のどちらか (サーバー = lib/master-register-blanks.mjs と同じ名前 = blankKeys)。
@@ -30,7 +34,14 @@
   const part = (key) => ' data-none-part="' + h(key) + '"';
   const segPart = (key, html) => html.replace(/^<div class="seg"([^>]*)>/, (m0, attrs) => '<div class="seg"' + attrs + part(key) + '>');
   // 画面の JS に渡す値 (JSON = EJS の出力を JS の値の位置に直に置かない)
-  const pageData = page ? { base, kind, canSave, maxComponents: MAX_COMPONENTS, maxRefs: MAX_REFERENCE_URLS, secs, blankKeys, blankLabels } : null;
+  const pageData = page ? { base, kind, canSave, maxComponents: MAX_COMPONENTS, maxRefs: MAX_REFERENCE_URLS, secs, blankKeys, blankLabels, searchMin: locals.COMPONENT_SEARCH_MIN || 2,
+    // 🆕 2026-10-21: 「下書き」の画面の「セットとして登録する」= product-hub のセットの下書きの コード・名前・構成 (画面の JS が欄に入れる)
+    prefill: locals.prefill && locals.prefill.ok ? { code: prefill.code, name: prefill.name, components: prefill.components } : null } : null;
+%>
+<%
+  // 🆕 0088: ブランド・商品の段階の板 (単品だけ・0088 の欄が使えるときだけ)。飛び先の帯は「税・分類・仕入先」の次 (どれも必須でない = 「あと N つ」には数えない)
+  const showBrandLife = !!page && !isSet && !!locals.brandLife;
+  if (showBrandLife) secs.splice(secs.findIndex((x) => x[0] === 'sec-tax') + 1, 0, ['sec-brandlife', 'ブランド・段階']);
 %>
   <%- include('_header', { hasSave: canSave }) %>
   <div class="page" id="new-page">
@@ -46,6 +57,8 @@
     <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div><div class="hint">つながったら画面を開き直してください。</div></div></div><% } %>
     <% if (page && entryClosed) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">切替前です (<%= entryWhy || ('段階: ' + phaseText) %>)</div><div class="hint">新商品はまだ NE・product-hub で登録します。この画面は見るだけです (登録を押しても「切替前」で断られ、何も変わりません)。</div></div></div><% } %>
     <% if (!canEdit) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= gateMessage %></div></div><% } %>
+    <% if (locals.prefill && prefill.ok) { %><div class="callout info" id="prefill-note"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><div class="t">product-hub のセットの下書き #<%= prefill.draft_id %> (<%= prefill.code %>) を、このセットのカードとして引き継いで登録します</div><div class="hint">コード・名前・構成を入れてあります。残りの項目を入れて保存してください。構成を変えると引き継げません。 <a href="<%= prefill.card_url %>" target="_blank" rel="noopener">product-hub で開く ↗</a></div></div></div><% } %>
+    <% if (locals.prefill && !prefill.ok) { %><div class="callout warn" id="prefill-note"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t"><%= prefill.message %></div><% if (prefill.card_url) { %><div class="hint"><a href="<%= prefill.card_url %>" target="_blank" rel="noopener">product-hub で開く ↗</a></div><% } %></div></div><% } %>
     <% if (page && !shippingRates) { %><div class="callout err"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">送料の表が読めないので、発送方法を選べません</div><div class="hint">発送方法は空のまま下書きにして、あとで商品の画面で入れられます。いま選ぶときは、少し待ってから画面を開き直してください。</div></div></div><% } %>
 
     <% if (page) { %>
@@ -62,27 +75,18 @@
         </div>
         <% if (!variationOn) { %><div class="callout lock vgate" id="gate-note"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">「色違い・サイズ違いのまとまり」は、まだ選べません</div><div class="hint">まとまりの正本を自社 DB に切り替えた後に出ます。それまでは単品・セットだけ (今と同じ) です。</div></div></div><% } %>
 
-        <section class="panel" id="sec-code" aria-labelledby="h-code">
-          <div class="panel-h"><span class="stepno" data-step="sec-code" aria-hidden="true"><%= no('sec-code') %></span><h2 id="h-code">コードと名前</h2></div>
-          <div class="f" data-row="code"><label class="lab" for="code">商品コード<span class="req">必須</span></label>
-            <div class="ctl"><input class="in w-m mono" id="code" maxlength="30" autocomplete="off" spellcheck="false" data-dirty-field="code" data-label="商品コード" placeholder="例: abc-honey-300"<%= dis %>>
-              <button type="button" class="btn sm" id="code-check"<%= dis %>>確かめる</button>
-              <span class="fmsg" id="code-msg" role="status" aria-live="polite"></span>
-              <span class="hint" style="flex-basis:100%">英字 (大文字も)・数字・- _ だけ (30 字まで)・打ったとおりの書き方で NE に登録 · 大文字と小文字だけ違うコードは同じと見ます · 使ったことのないコード · 打つとその場で確かめます</span></div></div>
-          <div class="f" data-row="name"><label class="lab" for="f-name">名前<span class="req">必須</span></label>
-            <div class="ctl"><input class="in w-l" id="f-name" maxlength="255" autocomplete="off" data-field="name" data-dirty-field="name" data-label="名前" placeholder="例: 北海道産 小豆 こしあん 500g"<%= dis %>><span class="hint">資材の印 (_白ビ袋 など) は付けない</span></div></div>
-        </section>
-
+        <%# 🆕 2026-10-21 中原さん: セットは ① 構成 → ② コードと名前 (構成品の名前を見て・コピーしてセットの名前を付ける)。単品は今までどおり ① コードと名前 %>
         <% if (isSet) { %>
         <section class="panel" id="sec-comp" aria-labelledby="h-comp">
           <div class="panel-h"><span class="stepno" data-step="sec-comp" aria-hidden="true"><%= no('sec-comp') %></span><h2 id="h-comp">構成</h2><span class="sub">NE に登録して、NE の構成が同じと確かめたら「今の構成」になります</span></div>
           <div class="f wide" data-row="components" style="padding-top:0">
-            <div class="scrollx"><table class="comp" id="comp" data-dirty-field="components" data-label="構成"><caption class="sr">構成 (コードを打つと名前が出ます)</caption>
-              <thead><tr><th scope="col">#</th><th scope="col">構成品 (コードを打つと名前が出ます)</th><th scope="col">数</th><th scope="col">税</th><th scope="col">分類</th><th scope="col" class="n">原価</th><th scope="col">取扱</th><th scope="col"><span class="sr">並べ替え・外す</span></th></tr></thead>
+            <div class="scrollx"><table class="comp" id="comp" data-dirty-field="components" data-label="構成"><caption class="sr">構成 (コードか名前を打つと候補が出ます)</caption>
+              <thead><tr><th scope="col">#</th><th scope="col">構成品 (コード・名前で探せます)</th><th scope="col">数</th><th scope="col">税</th><th scope="col">分類</th><th scope="col" class="n">原価</th><th scope="col">取扱</th><th scope="col"><span class="sr">並べ替え・外す</span></th></tr></thead>
               <tbody id="comp-rows"><%- compRow(1) %><%- compRow(2) %></tbody>
             </table></div>
+            <% if (canSave) { %><div class="csug" id="comp-suggest" role="listbox" aria-label="構成品の候補 (単品)" hidden></div><div class="sr" id="comp-suggest-status" role="status" aria-live="polite"></div><% } %>
             <template id="comp-tpl"><%- compRow(0) %></template>
-            <div style="display:flex;gap:12px;align-items:center;margin:6px 0 14px;flex-wrap:wrap"><button class="btn sm" type="button" id="comp-add"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-plus"/></svg>構成品を足す</button><span class="hint">1〜<%= MAX_COMPONENTS %> 品 · 数は 1〜999 · 同じ品は 1 行 · セットは入れられません · 並びも入れたとおり</span></div>
+            <div style="display:flex;gap:12px;align-items:center;margin:6px 0 14px;flex-wrap:wrap"><button class="btn sm" type="button" id="comp-add"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-plus"/></svg>構成品を足す</button><span class="hint">コード・名前・JAN を <%= locals.COMPONENT_SEARCH_MIN || 2 %> 文字から打つと候補 (単品) が出ます (↑↓ と Enter で選ぶ) · 1〜<%= MAX_COMPONENTS %> 品 · 数は 1〜999 · 同じ品は 1 行 · セットは入れられません · 並びも入れたとおり</span></div>
           </div>
           <div class="tiles" id="set-tiles" aria-live="polite">
             <div class="tile" id="t-tax"><div class="tl2">税率<span class="est">見込み</span></div><div class="tv">—</div><div class="tr">構成品を入れると出ます</div></div>
@@ -106,6 +110,17 @@
           </details>
         </section>
         <% } %>
+
+        <section class="panel" id="sec-code" aria-labelledby="h-code">
+          <div class="panel-h"><span class="stepno" data-step="sec-code" aria-hidden="true"><%= no('sec-code') %></span><h2 id="h-code">コードと名前</h2></div>
+          <div class="f" data-row="code"><label class="lab" for="code">商品コード<span class="req">必須</span></label>
+            <div class="ctl"><input class="in w-m mono" id="code" maxlength="30" autocomplete="off" spellcheck="false" data-dirty-field="code" data-label="商品コード" placeholder="例: abc-honey-300"<%= dis %>>
+              <button type="button" class="btn sm" id="code-check"<%= dis %>>確かめる</button>
+              <span class="fmsg" id="code-msg" role="status" aria-live="polite"></span>
+              <span class="hint" style="flex-basis:100%">英字 (大文字も)・数字・- _ だけ (30 字まで)・打ったとおりの書き方で NE に登録 · 大文字と小文字だけ違うコードは同じと見ます · 使ったことのないコード · 打つとその場で確かめます</span></div></div>
+          <div class="f" data-row="name"><label class="lab" for="f-name">名前<span class="req">必須</span></label>
+            <div class="ctl"><input class="in w-l" id="f-name" maxlength="255" autocomplete="off" data-field="name" data-dirty-field="name" data-label="名前" placeholder="例: 北海道産 小豆 こしあん 500g"<%= dis %>><span class="hint">資材の印 (_白ビ袋 など) は付けない</span></div></div>
+        </section>
 
         <section class="panel" id="sec-money" aria-labelledby="h-money">
           <div class="panel-h"><span class="stepno" data-step="sec-money" aria-hidden="true"><%= no('sec-money') %></span><h2 id="h-money">お金</h2></div>
@@ -137,6 +152,13 @@
               <span class="hint" style="flex-basis:100%">問屋から仕入れるときは、仕入先とは別に作っている会社を · 一覧に無いときは打って「新しいメーカーとして登録」 · 「仕入先と同じ」= 代表の仕入先の名前 · Company DB だけ (NE・ロジザードには送りません)</span></div></div>
           <% } %>
         </section>
+        <%# 🆕 0088 ブランド・商品の段階 (中原さん 2026-10-17)。Company DB だけ・どれも必須でない (空 = なし)。部品 = _brandlife-new.ejs (まとまりと同じ) %>
+        <% if (showBrandLife) { %>
+        <section class="panel" id="sec-brandlife" aria-labelledby="h-brandlife">
+          <div class="panel-h"><span class="stepno" data-step="sec-brandlife" aria-hidden="true"><%= no('sec-brandlife') %></span><h2 id="h-brandlife">ブランド・商品の段階</h2><span class="sub">どれも入れなくてよい · あとで商品の画面でも入れられます</span></div>
+          <%- include('_brandlife-new', { base, bl: brandLife, dis, canCreate: canSave, forAll: false }) %>
+        </section>
+        <% } %>
         <%# 発注の設定 (発注アプリに保存・10/9 中原さん)。下書きの保存と一緒に送る = Company DB の登録が通った後に発注アプリへ (部品 = _order.ejs・public/me-order.js) %>
         <%- include('_order', { os: orderSettings, mode: 'new', dis, stepNo: no('sec-order'), base, code: null }) %>
         <% } %>
@@ -174,6 +196,10 @@
               <span class="fmsg" id="f-lzbc-msg" aria-live="polite"></span>
               <span class="hint">商品に付いているバーコード = FNSKU (X00 で始まる 10 文字) か JAN (8・13 けた) · バーコードが無い商品は「空欄」= ロジザードが番号を付けます · JAN の欄とは別 · ロジザードの新商品の CSV のバーコードに入れる値</span></div></div>
           <% } %>
+          <%# 🆕 0087: 梱包した状態の 縦・横・高さ・重さ (入れなくてよい・0087 の前の DB = 欄を出さない) %>
+          <% if (locals.packageReady) { %><%- include('_package-new', { dis, forAll: false }) %><% } %>
+          <%# 🆕 0090: 表示の項目 (原産国・内容量・メーカー型番・消費期限の目安・入れなくてよい・0090 の前の DB = 欄を出さない) %>
+          <% if (locals.labelNew) { %><%- include('_label-new', { dis, forAll: false, ln: labelNew }) %><% } %>
           <% } %>
         </section>
 
@@ -278,7 +304,8 @@
   <%- include('_footer') %>
   <%# 並び: 入力なし (me-none) → メーカー (me-maker・0084 の欄があるときだけ) → 画面 → 発注の設定 (読み終わったら画面に数え直してもらう = MasterEdit.recount) %>
   <% if (page) { %><script src="<%= base %>/public/me-none.js?v=<%= assetV %>" defer></script><% } %>
-  <% if (page && !isSet && locals.makerReady) { %><script src="<%= base %>/public/me-maker.js?v=<%= assetV %>" defer></script><% } %>
+  <% if (page && !isSet && (locals.makerReady || showBrandLife)) { %><script src="<%= base %>/public/me-maker.js?v=<%= assetV %>" defer></script><% } %>
+  <% if (page && isSet && canSave) { %><script src="<%= base %>/public/me-comp-suggest.js?v=<%= assetV %>" defer></script><% } %>
   <% if (page) { %><script src="<%= base %>/public/me-new.js?v=<%= assetV %>" defer></script><% } %>
   <% if (page && !isSet && orderSettings && orderSettings.data && orderSettings.data.ok) { %><script src="<%= base %>/public/me-order.js?v=<%= assetV %>" defer></script><% } %>
 </body>

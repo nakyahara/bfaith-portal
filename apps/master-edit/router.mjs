@@ -17,9 +17,12 @@
  *   GET  /sku/:code          1 つの商品 (単品 = 画面 B / セット = 画面 C)
  *   GET  /sku/:code/history  変更の記録
  *   GET  /api/lookup?code=   構成品の引き当て
+ *   GET  /api/new/components?q=  🆕 2026-10-21 新商品の登録 (セット) の構成品の欄の候補 (読むだけ・コード / 名前の言葉 / JAN・単品だけ・やめた / 要確認は出さない)
  *   POST /api/sku/:code      保存 { request_id, reason?, seen: { token (編集の印), event_id? }, values: {...} }
  *   GET  /new?kind=single|set|variation 新商品の登録 (画面 D・⑤-2a)。variation = 色違い・サイズ違いのまとまり (CompanyDB構想/20 §④・PR-7)。
  *        「まとまり」の札と画面は、DB の active の products.parent が company のときだけ出す (今は load = 出さない = 「切替の前」の帯)
+ *        🆕 2026-10-21: &from_card=<product-hub のカードの番号> (セットだけ) = セットの下書き (新商品の登録で決めたもの・product-hub で作ってコードを入れたもの)の コード・名前・構成を入れておく
+ *   GET  /drafts             🆕 2026-10-21: 下書き (マスタの入力の下書き = 登録の状態 draft と、まだ登録していない product-hub のセットの下書き)
  *   ── 色違い・サイズ違いのまとまり (PR-7・lib/master-variation.mjs。保存を開く門は新商品の登録と同じ + products.parent が company) ──
  *   GET  /api/variation/groups?q=      今あるまとまりを探す (コード・名前・子の商品コード)
  *   GET  /api/variation/groups/:id     まとまりを 1 つ (軸・選択肢・今ある子と子の値 = 共通の欄に写す)
@@ -31,6 +34,8 @@
  *   POST /api/sku/:code/adopt-parent       NE で直接作られた商品 (quarantined) の代表を NE から 1 回だけ採用 { request_id, reason? }
  *   POST /api/sku/:code/draft-cancel       🆕 0071: 新商品の下書き (NE に一度も配っていない) を消す = 登録をやめた { request_id, reason, confirm: true } (名簿 MASTER_EDITORS の人・
  *                                          lib/master-draft-cancel.mjs)。Postgres の前に product-hub のカード (SQLite) を読み、除外していないカードがあれば 409 card_exists
+ *   POST /api/sku/:code/draft-in-ne        🆕 0098: NE にあるので登録済みにする { request_id, check_hash } (下書き・NE 登録待ちで NE にもう同じ商品がある・名簿 MASTER_DECISION_APPROVERS の人 =
+ *                                          NE 登録の CSV と同じ・lib/master-draft-in-ne.mjs)。答え = DB の関数の答え + message (画面の 1 行)
  *   GET  /api/code-check?code= 新しい商品コードを確かめる (形 + Company DB・NE・使ったことがあるか)
  *   POST /api/new            新商品の登録 { request_id, kind, code, reason?, values: {...}, card: {...} } (lib/master-register.mjs)。
  *                            保存が成功したら、同じ要求の中で product-hub のカードの取り込みを 1 回試す (うまくいかなくても登録は成功のまま)
@@ -44,11 +49,23 @@
  *   POST /api/ne-delete/exports/:id/download  ファイルを受け取る (作った JST の日だけ・中の品目が全部まだ依頼の途中のときだけ・初めてのダウンロードを残す = GET にしない)
  *   POST /api/ne-delete/items/:id/withdraw    依頼を取り下げる { reason, request_id }
  *   POST /api/ne-delete/handling    断られた単品の代わりに取扱中止の CSV を作る { item_ids, reason, request_id, confirm: true }
+ *   ── NE へ送る (🆕 0094・AI_reference CompanyDB構想/25・10/19 中原さん「差分がある部分を 1 日 1 回アップ・都度アップも」・lib/master-ne-update.mjs) ──
+ *   GET  /ne-update                 画面「NEへ送る」= 自社で直したけれど今朝の NE と違う所の一覧とボタン 1 つ (見るのはだれでも)
+ *   POST /api/ne-update/send-now    今すぐ NE へ送る { request_id } (頼みを積む = miniPC の送り手が数分で上げる・名簿 MASTER_EDITORS の人)
+ *   POST /api/ne-update/csv         CSV を作る (NE にアップする用) { request_id } (送り手が止まっているとき・名簿 MASTER_EDITORS の人)
+ *   POST /api/ne-update/files/:id/download  作った CSV を受け取る (作った日だけ・初めてのダウンロードを残す = GET にしない)
+ *   POST /api/ne-update/verified    NE の実物の試しの結果 { kind, col, entry, result, sha256?, note? } (名簿 MASTER_DECISION_APPROVERS の人)
+ *   POST /api/ne-update/set-comp-csv 🆕 0100: セットの中身の CSV (開いている構成の依頼の「足す・数を変える」= lib/master-set-comp-csv.mjs・その場で作って渡す・DB に記録しない・名簿 MASTER_EDITORS の人)
  *   ── 発注の設定 (10/9・発注アプリの po_* に書く・apps/master-edit/order-settings.mjs → apps/purchase-orders/order-settings.js の 1 つの部品) ──
  *   POST /api/new の order_settings = { order_lot?, condition_id?, material_group_id?, capacity_per_unit?, case_group?, case_lot?, new_condition?, new_material? } (単品だけ):
  *        ① の前に形・グループ・代表の仕入先を確かめる (誤り = 400 / 409・何も書かない) → ① Company DB の登録 → 通ったら ② 発注アプリに書く。
  *        ② だけ失敗 = 登録は成功のまま・応答の order_settings = { ok: false, error } (画面は「商品の画面で入れてください」)。同じ request_id のやり直しでも ② をもう一度 (同じ値の上書き)
  *   POST /api/sku/:code/order-settings  商品の画面の「発注の設定を保存」{ request_id, seen: { updated_at }, values: {...} } (Company DB の保存とは別・開いたときの印が違えば 409)
+ *   🆕 ⑤-1 (CompanyDB構想 27 §2.4・apps/purchase-orders/vendor-codes.js の部品): 先方品番・入数 (発注アプリの先方番号対応表に保存・仕入先ごと・単品だけ)
+ *   POST /api/sku/:code/vendor-code         { supplier_code, vendor_code, qty_per_unit, base_updated_at (null = まだ無いつもり / 開いたときの版・必須) }
+ *        直せるのは仕入先一致を通る 1 社 (発注アプリのマスタ管理と同じ決まり)・同じ番号がほかの商品にも = 警告 (止めない)・版が違う = 409
+ *   POST /api/sku/:code/vendor-code/delete  { supplier_code, base_updated_at (開いたときの版・必須) } (仕入先は確かめない = 発注アプリと同じ)
+ *   POST /api/new の order_settings に vendor_code・qty_per_unit (単品・代表の仕入先・知らせ v2 = 0089 の後だけ。前 = 400 で何も書かない)
  *   書ける人 = 名簿 (MASTER_EDITORS) かつ 発注アプリの利用権。Company DB の切替の門は見ない (発注アプリのマスタ管理と同じく、いつでも)
  *   🆕 0075 (CompanyDB構想 21 C1・lib/order-settings-outbox.mjs): 新商品の登録 (単品・まとまり) の発注の設定は ① と同じ Postgres の取引に「発注の設定の知らせ」を積み、
  *        commit の後に発注アプリへ届ける (届かなくても知らせは残る = 画面を開いたとき・人の「もう一度」・夜間ロードの後ろの段で届け直す・24 時間で知らせる)。
@@ -75,6 +92,7 @@
  *   NE 登録の CSV (⑤-2b・0053・lib/master-reg-csv.mjs。作る・配る・申告・使わない・実機の確かめは MASTER_DECISION_APPROVERS の名簿の人だけ = マスタの判断の CSV と同じ):
  *   GET  /reg-csv                   画面
  *   GET  /api/reg-csv/summary       今日の照合の回・形の確かめ・候補と止まる理由・ファイル
+ *   POST /api/reg-csv/build-all     🆕 10/20 ボタン 1 つ = 今すぐ作れる商品を全部作って配る { request_id, exclude?: [...] } → { files, errors }。この後に /file でダウンロード
  *   POST /api/reg-csv/exports       作る { kind: products | sets, codes: [...], request_id }
  *   POST /api/reg-csv/exports/:id/issue     配る (built → issued)。この後に /file でダウンロード
  *   GET  /api/reg-csv/exports/:id/file      byte 列 (配った・申告したファイルだけ)
@@ -92,8 +110,8 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
-import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS, jstDate } from '../../lib/master-write.mjs';
-import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS, parseRegisterRequest, registerPayloadHashOf } from '../../lib/master-register.mjs';
+import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS, jstDate, setCompOnLoadReady } from '../../lib/master-write.mjs';
+import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_OWNER_KEYS, parseRegisterRequest, registerPayloadHashOf } from '../../lib/master-register.mjs';
 import { MAX_SET_PLANS, SET_QTY_MIN, SET_QTY_MAX, SET_NAME_MAX, SET_PLAN_ALERT_DAYS, setCodeShapeProblem } from '../../lib/set-plan.mjs';
 // 🆕 2026-10-13 中原さん: 必須でない項目は「値」か「入力なし」のどちらか (どちらでもない = 登録しない)。入力なしの一覧は登録の理由に残す
 import { prepareRegisterBody, orderBlanksForRequest, BLANK_KEYS, blankLabelsOf, legacyRefsScreen, hasRequestRecord } from '../../lib/master-register-blanks.mjs';
@@ -101,6 +119,7 @@ import { registerVariationBatch, searchVariationGroups, readVariationGroup, chec
   parseVariationRequest, variationPayloadHashOf,
   editVariationLabels, cancelVariationChild, adoptNeParent } from '../../lib/master-variation.mjs';
 import { readDraftCancelCheck, draftCancelView, cancelSkuDraft } from '../../lib/master-draft-cancel.mjs';
+import { readDraftInNeCheck, draftInNeView, confirmDraftInNe, DRAFT_IN_NE_BUTTON } from '../../lib/master-draft-in-ne.mjs';
 import { runCardOutbox, runGroupOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
 import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
@@ -113,13 +132,20 @@ import { listImages, IMAGE_STATE_WORDS } from './list-images.mjs';
 import { readBackorders, readBackorderLines, readWarehouseStock, stockOf, buildableOf } from './extras.mjs';
 import { readFbaDay, readFbaSku } from './fba-stock.mjs';
 import { readSalesRun, readSalesSku } from './sales-qty.mjs';
+// 🆕 商品ごとの入出庫履歴と月別のまとめ (CompanyDB構想 26 の PR-1・PR-2・0085 の読むだけの関数)
+import { readMovementsPage, readMonthly } from './movements.mjs';
+// 🆕 販売数のグラフ (10/17 中原さん・0086 の読むだけの関数)
+import { readSalesChart } from './sales-chart.mjs';
+// 🆕 モールの商品ページへのリンク (10/20 中原さん・Company DB の出品から)
+import { readMallLinks } from './mall-links.mjs';
 import { checkDeadline } from './deadline.mjs';
 import { putSearch, getSearch } from './search-token.mjs';
 import { sessionHasApp } from '../../lib/app-access.js';
 import { writeOrderSettings, writeRegistrationOrderSettings, registrationOrderDone, OrderSettingsError } from '../purchase-orders/order-settings.js';
-import { orderWriteGate, orderScreen, orderInputOf, orderErrorBody, orderBaseOf, orderNoneApplies } from './order-settings.mjs';
+import { orderWriteGate, orderScreen, orderInputOf, orderErrorBody, orderBaseOf, orderNoneApplies, vendorScreen } from './order-settings.mjs';
+import { upsertVendorCode, deleteVendorCode, productForVendorMap, checkRegistrationVendor, parseVendorInput, VendorCodeError } from '../purchase-orders/vendor-codes.js';
 import { orderOutboxReady, runOrderSettingsOutbox, readOrderSettingsForRegistration, deliveryInputOf, orderDeliveryEnabled, orderOutboxStatus, readOrderSettingsOutbox,
-  dismissOrderSettingsEvent, orderPayloadOf, orderPayloadHash, readRegistrationOrderMark, ORDER_STATUS_LABELS, ORDER_OVERDUE_HOURS } from '../../lib/order-settings-outbox.mjs';
+  dismissOrderSettingsEvent, orderPayloadOf, orderPayloadHash, readRegistrationOrderMark, ORDER_STATUS_LABELS, ORDER_OVERDUE_HOURS, orderPayloadV2Ready } from '../../lib/order-settings-outbox.mjs';
 import { ui } from './ui-format.mjs';
 import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/master-cutover.mjs';
 import { readScreenOwnership, readScreenNewEntry, screenOwnerWritable } from '../../lib/master-owner-gate.mjs';
@@ -131,18 +157,26 @@ import { normSku } from '../../lib/sku-norm.js';
 import * as PF from '../../lib/profit-estimate.js';
 import { approverGate } from '../master-decisions/router.mjs';
 import {
-  regSummary, buildRegExport, issueRegExport, regExportFile, declareRegExport, supersedeRegExport, recordRegVerified,
+  regSummary, buildRegExport, buildRegAll, issueRegExport, regExportFile, declareRegExport, supersedeRegExport, recordRegVerified,
   REG_ITEM_STATES, REG_RESULTS,
 } from '../../lib/master-reg-csv.mjs';
 import { readGoneCheck, cancelSkuGoneFromNe, goneView } from '../../lib/master-gone.mjs';
 import { checkNeDelete, buildNeDelete, downloadNeDelete, withdrawNeDelete, buildHandling, readNeDelOverview, neDelAvailable, hideBackorder, hideBackorderText, NE_DEL_STATUS_WORDS, NE_DEL_KIND_WORDS, NE_DEL_MAX } from '../../lib/master-ne-delete.mjs';
 import { readNeDeleteStock } from './ne-delete-stock.mjs';
+import { readSetCompRequests, buildSetCompCsv } from '../../lib/master-set-comp-csv.mjs';
+import { readNeUpdate, readSkuNeDiff, requestNeSendNow, makeNeUpdateCsv, downloadNeUpdateFile, recordNeUpdateVerified, VERIFY_TARGETS, COL_WORDS as NE_UPD_COL_WORDS, FILLER_WORDS } from '../../lib/master-ne-update.mjs';
 // AMC 商品ラベルのバーコード印字 (Company DB構想 21 A1・発注アプリの po_barcode_labels に書く)
 import { amcLabelScreen, amcInputOf, saveAmcLabel, amcErrorBody, AmcLabelError, AMC_STATUSES, AMC_STATUS_WORDS, AMC_STATUS_HINTS } from './amc-label.mjs';
 import { lzBarcodeView, lzBarcodeIn, lzBarcodeReady, setLzBarcodeInTx, lzHolderInDb, lzValueShape, lzCopyNote, LZ_COPY_STATE_WORDS, LZ_KIND_WORDS, LZ_BARCODE_VIA } from '../../lib/logizard-barcode.mjs';
+import { readPackageView, packageReady } from '../../lib/master-package.mjs';
 import { readLzMirror, lzCopyCheck, lzMirrorOwners } from '../../lib/lz-mirror.mjs';
 // 🆕 0084 (メーカー・中原さん 2026-10-17): 名簿・名簿に足す・欄を出すか (0084 があってロールの流し直しの後)
 import { makerReady, readMakers, createMaker, MAKER_NAME_MAX } from '../../lib/master-maker.mjs';
+// 🆕 0088 (ブランド・商品の段階・中原さん 2026-10-17): 名簿・名簿に足す・自社ブランドの印・欄を出すか・初めて売った日
+import { brandLifeReady, brandLifeTablesExist, readBrands, createBrand, setBrandOwn, firstSoldOf, salesRecordsFrom, firstSoldView, endBadge, daysUntil,
+  BRAND_NAME_MAX, LIFE_STAGES, LIFE_FILTERS, END_SOON_DAYS } from '../../lib/master-brand-life.mjs';
+// 🆕 0090 表示の項目 (原産国・内容量・メーカー型番・消費期限の目安・Company DB構想 27 ④-1)
+import { readLabelView, labelReady, defaultPhLabelLookup, COUNTRY_SUGGEST, NET_UOMS } from '../../lib/master-label.mjs';
 import { lzListStale, lzNewCandidates, issueLzNewExport, lzNewExports, lzNewExportFile, voidLzNewExport, LZ_HOLD_WORDS, LZ_LIST_FRESH_HOURS } from '../../lib/lz-new-export.mjs';
 // 🆕 2026-10-17「ロジザードに取り込む」ボタン (miniPC が取りに来て ① 取込 → ② 書き出し。帳面 = Render の SQLite・apps/lz-bc-import)
 import * as BC from '../lz-bc-import/store.js';
@@ -429,6 +463,26 @@ function orderEventsView(evs, kids) {
 /** product-hub の下書きカードに同じ管理番号があるか (まとまりのコード = 楽天の商品管理番号・Render の SQLite)。試験は差し替える */
 let phDraftLookup = defaultPhDraftExists;
 export function __setPhDraftLookup(fn) { phDraftLookup = fn || defaultPhDraftExists; }
+/** 🆕 0090: product-hub の今の値 (商品の画面の「表示の項目」の参考・読むだけ・Render の SQLite)。試験は差し替える */
+let phLabelLookup = defaultPhLabelLookup;
+export function __setPhLabelLookup(fn) { phLabelLookup = fn || defaultPhLabelLookup; }
+/**
+ * 🆕 0090: 商品の画面の「表示の項目」= readLabelView (人の値・記録の番号・いま使う値) + ready (書けるか) + ph (product-hub の今の値・読めない = { error })。
+ *   Company DB が読めない = null (節を出さない・画面は止めない)
+ */
+async function readLabelBlock(db, cur) {
+  try {
+    const v = await readLabelView(db, cur.product_id);
+    // 欄に出す人の値と番号は、編集の印 (page.token) を作った読み (readCurrent の cur.label) と同じ物を使う (別の読みの値を欄に出さない)
+    if (cur.label) Object.assign(v, { human: cur.label.human, event_id: cur.label.event_id });
+    let ph = null;
+    try { ph = await phLabelLookup(cur.code); } catch (e) { ph = { error: String((e && e.message) || e).slice(0, 120) }; }
+    return { ...v, ready: await labelReady(db), ph, suggest: COUNTRY_SUGGEST, uoms: NET_UOMS };
+  } catch (e) {
+    console.error(`[master-edit] 表示の項目を読めない: ${e && e.message}`);
+    return null;
+  }
+}
 /** 衝突を解く (既存のカードに結ぶ)。本番 = cdb-card-intake.js の linkCdbCardToExisting。試験は差し替える */
 let cardLinker = null;
 export function __setCardLinker(fn) { cardLinker = fn || null; }
@@ -464,8 +518,14 @@ async function setPlans() {
   if (setPlanStore) return setPlanStore;
   const m = await import('../product-hub/services/cdb-set-plan.js');
   return { write: (x) => m.writeSetPlan(x), mark: (rid, x) => m.markSetPlan(rid, x), held: (code, o) => m.setCodeHeld(code, o), stale: (codes, o) => m.staleWaitingPlansFor(codes, o || {}),
-    touch: (rid) => m.touchWaitingPlan(rid), dropForSku: (sid, o) => m.dropPlansForSku(sid, o || {}) };
+    touch: (rid) => m.touchWaitingPlan(rid), dropForSku: (sid, o) => m.dropPlansForSku(sid, o || {}),
+    // 🆕 2026-10-21: セットの登録が引き継げる「作るセットの下書き」か (読むだけ)・まだ登録していない作るセットの下書き (「下書き」の画面)
+    planned: (code, o) => m.plannedSetCardCheck(code, o || {}), plannedById: (id) => m.plannedSetCardOf(id), openCards: (o) => m.openPlannedSetCards(o || {}),
+    // 🆕 Codex R1 Medium: 引き継ぐカードの予約 (登録の前)・答え (登録の後)
+    reserveTake: (x) => m.reserveSetCardTakeover(x), markTake: (rid, x) => m.markSetCardTakeover(rid, x) };
 }
+/** product-hub のカードを開く URL (同じポータル) */
+const phCardUrl = (id) => `/apps/product-hub/detail/${Number(id)}`;
 /**
  * 🆕 Codex R4 Medium 1: 予約の時間を過ぎた waiting の作るセット (このコードを持つもの) を、Company DB の保存の記録で決める。
  *   登録が通っていた (done) = registered (予約のまま・SKU の番号) / 記録が無い・失敗 = dropped (予約を外す)。読めない = throw (呼び手は 503)
@@ -505,20 +565,45 @@ async function resolveStaleSetPlans(db, codes, { actor = null, parentCode = null
   }
 }
 /**
- * このコードがほかの登録の作るセットに決まっているか (予約・セットの下書き)。決まっている = { status 409, reason, message } / 読めない = 503 / 無い = null
- *   新商品の登録 (単品の入口と登録の取引の中 = codeReserved)・まとまりの子 (入口) が使う
+ * このコードがほかの登録の作るセットに決まっているか (予約・セットの下書き)。決まっている = { status 409, reason, message, card_url?, draft_id? } / 読めない = 503 / 無い = null
+ *   新商品の登録 (単品の入口と登録の取引の中 = codeReserved)・まとまりの子 (入口) が使う。
+ *   🆕 2026-10-21: take = セットの登録 ({ components, cardCreate })。そのコードのカードがセットの下書き (新商品の登録で決めたもの・product-hub で作ってコードを入れたもの)で、構成も同じ = 通す (null・
+ *     登録の後のカードの取り込みがそのカードを引き継ぐ = cdb-card-intake.js)。引き継げない = 断る (どのカードか・なぜか・何をするか・カードを開く URL)
  */
-async function setCodeReservedFor(code, requestId, db = null) {
+async function setCodeReservedFor(code, requestId, db = null, take = null) {
   let held;
+  let card = null;
   try {
     if (db) await resolveStaleSetPlans(db, [code]);
-    held = (await setPlans()).held(code, { requestId });
+    const st = await setPlans();
+    held = st.held(code, { requestId });
+    if (take && held && held.reason === 'ph_draft' && held.is_set && typeof st.planned === 'function') card = st.planned(code, { components: take.components });
   } catch (e) {
     console.error(`[master-edit] 作るセットの予約を読めない: ${e && e.message}`);
     return { status: 503, reason: 'ph_unreadable', message: 'product-hub の作るセットの予約を読めないので、このコードを使えるか確かめられません (少し待ってからもう一度)' };
   }
-  if (held && (held.reason === 'ph_set_plan' || (held.reason === 'ph_draft' && held.is_set))) return { status: 409, reason: 'set_code_reserved', message: `${held.message}。別のコードにしてください` };
+  if (!held) return null;
+  if (held.reason === 'ph_set_plan') {
+    return { status: 409, reason: 'set_code_reserved', message: `${held.message}。単品のカードと一緒にセットの下書きができてから登録すると、その下書きを引き継ぎます (急ぐときは別のコードに)` };
+  }
+  if (held.reason === 'ph_draft' && held.is_set) {
+    const link = { card_url: phCardUrl(held.draft_id), draft_id: held.draft_id };
+    if (take && card && card.takeable && card.draft_id === held.draft_id) {
+      if (take.cardCreate === false) return { status: 409, reason: 'set_card_needed', ...link, message: `${held.message}。このセットのカードとして引き継ぐので、「出品カードを作る」を外さずに登録してください` };
+      // 登録の取引の中の 2 回目 (take.inTx): 予約したカードと違う・入口では無かったカードを初めて見つけた (予約が無い) = 断る (予約したカードにしか結ばない・Codex R2 Medium 1)
+      if (take.inTx && take.reservedId !== card.draft_id) return { status: 409, reason: 'set_card_changed', ...link, message: `${held.message}。引き継ぐカードがちょうど変わりました。画面を開き直してください` };
+      take.draftId = card.draft_id;
+      return null;   // 引き継ぐ (登録の前に予約 → 登録の後のカードの取り込みが、このカードを Company DB のセットに結ぶ)
+    }
+    const why = take && card && card.why ? ` (${card.why})` : '';
+    const todo = take && card && /構成.*ちがいます/.test(card.why || '') ? '構成をカードと同じにするか、別のコードにしてください' : '別のコードにするか、product-hub でカードを確かめてください';
+    return { status: 409, reason: 'set_code_reserved', ...link, message: `${held.message}${why}。${todo}` };
+  }
   return null;
+}
+/** 🆕 2026-10-21: 引き継ぐカードの予約の答えを残す (登録の後)。失敗しても投げない (カードの取り込みは知らせの request_id で予約を引く = 状態は見ない) */
+async function markTakeSafe(requestId, x) {
+  try { const st = await setPlans(); if (typeof st.markTake === 'function') st.markTake(requestId, x); } catch (e) { console.error(`[master-edit] 引き継ぐカードの予約の答えを残せなかった (${requestId}): ${e && e.message}`); }
 }
 /** 作るセットの答えを残す (登録の後)。失敗しても投げない (取り込みは知らせの request_id で表を引く = 状態は見ない) */
 async function markSetPlanSafe(requestId, x) {
@@ -591,9 +676,24 @@ async function connect(kind = 'read', { deadline = null } = {}) {
       client = got;
     }
     if (client.on) client.on('error', (e) => console.error(`[master-edit] 接続のエラー: ${e.message}`));   // 切れた接続でプロセスを落とさない
-    await client.query(`set statement_timeout = '20s'`);
-    await client.query(`set lock_timeout = '10s'`);
-    await client.query(`set idle_in_transaction_session_timeout = '60s'`);
+    const init = async () => {
+      await client.query(`set statement_timeout = '20s'`);
+      await client.query(`set lock_timeout = '10s'`);
+      await client.query(`set idle_in_transaction_session_timeout = '60s'`);
+    };
+    if (deadline == null) await init();
+    else {
+      // 🆕 期限のある読み (販売数のグラフ・CSV): 接続の初めの設定も残りの時間で打ち切る (遅い = 接続を閉じて timeout。販売数のグラフ Codex R2 Medium)
+      const left2 = deadline - Date.now();
+      let timer;
+      const running = left2 > 0 ? init() : null;
+      if (running) running.catch(() => {});   // 打ち切った後に失敗しても落とさない (打ち切る前の失敗は下の race から catch へ)
+      const done = !!running && await Promise.race([running.then(() => true), new Promise((ok) => { timer = setTimeout(() => ok(false), left2); })]).finally(() => clearTimeout(timer));
+      if (!done) {
+        Promise.resolve().then(() => client.end()).catch(() => {});   // 閉じるのは待たない (閉じるのが遅くても期限で返す・Codex R3 Medium)
+        return { error: TIMEOUT_WORDS, reason: 'timeout' };
+      }
+    }
     return { client };
   } catch (e) {
     console.error(`[master-edit] Company DB につながらない: ${e && e.message}`);
@@ -699,13 +799,14 @@ async function listExtras(db, poOk, deadline = null) {
  */
 const STATEMENT_MAX_MS = 20e3;
 const isStatementTimeout = (e) => !!e && e.code === '57014';
-function deadlineDb(db, deadline) {
+/** maxMs = 1 つの文の上限 (ふつう 20 秒。販売数のグラフの「もう一度読む」だけ 30 秒 = SALES_CHART_LIMITS.longMs) */
+function deadlineDb(db, deadline, { maxMs = STATEMENT_MAX_MS } = {}) {
   let last = null;
   return {
     async query(t, p) {
       const left = Math.floor(deadline - Date.now());
       if (left <= 0) throw new ListTimeoutError();
-      const ms = Math.min(STATEMENT_MAX_MS, left);
+      const ms = Math.min(maxMs, left);
       if (ms !== last) { await db.query(`set statement_timeout = '${ms}ms'`); last = ms; }
       try { return await db.query(t, p); } catch (e) { if (isStatementTimeout(e)) throw new ListTimeoutError(); throw e; }
     },
@@ -733,7 +834,9 @@ router.get('/', (req, res) => {
     // まとめて変える (PR2): 書ける人 (名簿) で、保存を開いていて、Company DB を読めたときだけ左のチェックを出す
     const bulk = { on: !!db && locals.canEdit && !locals.closed, max: BULK_MAX, chunk: BULK_CHUNK, costReasons: COST_REASONS, groups: FIX_GROUPS, multiMax: MULTI_MAX };
     res.render(view('index.ejs'), { ...locals, ui2: true, nav: 'list', listPage: true, dbError, data, counts, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, extras, searchExpired, fmt, exportMax: EXPORT_LIMITS.max,
-      listView, LIST_COLUMNS, SORT_WORDS, DEFAULT_VIEW, bulk, imgOf, IMAGE_STATE_WORDS });
+      listView, LIST_COLUMNS, SORT_WORDS, DEFAULT_VIEW, bulk, imgOf, IMAGE_STATE_WORDS,
+      // 🆕 0088: ブランド・商品の段階の列と絞り込み (ready = 表を読める = 札と絞り込みを出す)
+      brandLifeList: { ready: db ? await brandLifeTablesExist(db).catch(() => false) : false, today: jstDate(new Date(clock())), stages: LIFE_STAGES, filters: LIFE_FILTERS, soonDays: END_SOON_DAYS, endBadge } });
   });
 });
 /**
@@ -757,7 +860,7 @@ router.post('/api/search', (req, res) => {
   const f = normalizeFilters(b);
   const cond = Object.fromEntries(ADV_KEYS.filter((k) => f[k]).map((k) => [k, f[k]]));
   if (Buffer.byteLength(JSON.stringify(cond)) > SEARCH_COND_MAX_BYTES) return tooLarge(`検索の条件が大きすぎます (全部で ${SEARCH_COND_MAX_BYTES / 1024}KB まで。複数の欄を分けて検索してください)`);
-  const rest = Object.fromEntries(['q', 'kind', 'state', 'missing', 'reg', 'card', 'diff', 'sort', 'dir'].filter((k) => f[k]).map((k) => [k, f[k]]));
+  const rest = Object.fromEntries(['q', 'kind', 'state', 'missing', 'reg', 'card', 'diff', 'sort', 'dir', 'life'].filter((k) => f[k]).map((k) => [k, f[k]]));
   const qs = new URLSearchParams({ ...rest, ...(Object.keys(cond).length ? { s: putSearch(cond, clock()) } : {}) }).toString();
   res.json({ ok: true, url: `${req.baseUrl}/${qs ? `?${qs}` : ''}` });
 });
@@ -885,13 +988,13 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
   // 新規開始の門 (2 層目・広げる道 PR-2): DB の開放の許可 (lease)・非常の止め。見せ方だけ (登録は lib が取引の中で読み直す)
   const lease = await readScreenNewEntry(db, kind);
   res.render(view('new.ejs'), {
-    ...locals, nav: 'new', dbError, kind, page, fmt, KINDS_NEW, MAX_COMPONENTS, MAX_REFERENCE_URLS,
+    ...locals, nav: 'new', dbError, kind, page, fmt, KINDS_NEW, MAX_COMPONENTS, MAX_REFERENCE_URLS, COMPONENT_SEARCH_MIN,
     // 登録を開いているか = 段階 new_open・持ち主表 (DB の active) のハッシュが段階の記録と同じ・MASTER_EDIT_OPEN・この種類で書く列の持ち主が全部 company・
     //   開放の許可 (lease)・書き込み用の接続 (画面だけのロール)・backfill 済み (lib/master-register.mjs と同じ)
-    entryClosed: !screenOwnerWritable(page ? page.phase : null, owner) || !isOpen() || NEW_ENTRY_KEYS[kind].some((k) => own[k] !== 'company') || !lease.open
+    entryClosed: !screenOwnerWritable(page ? page.phase : null, owner) || !isOpen() || NEW_ENTRY_OWNER_KEYS[kind].some((k) => own[k] !== 'company') || !lease.open
       || !writeConfigured() || !(page && page.backfillDone),
     entryWhy: locals.closedWhy
-      || (NEW_ENTRY_KEYS[kind].some((k) => own[k] !== 'company') ? `${KINDS_NEW[kind]}で書く項目の持ち主がまだ NE・/register` : '')
+      || (NEW_ENTRY_OWNER_KEYS[kind].some((k) => own[k] !== 'company') ? `${KINDS_NEW[kind]}で書く項目の持ち主がまだ NE・/register` : '')
       || (!lease.open ? lease.why : '')
       || (!(page && page.backfillDone) ? '切替の手順の「既存の商品の登録の状態 (backfill)」がまだ' : ''),
     shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null,
@@ -900,6 +1003,7 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
     setPlanLimits: { max: MAX_SET_PLANS, qtyMin: SET_QTY_MIN, qtyMax: SET_QTY_MAX, nameMax: SET_NAME_MAX, alertDays: SET_PLAN_ALERT_DAYS },
     // 発注の設定 (発注アプリ・単品だけ。発注アプリはセットを扱わない)
     orderSettings: kind === 'single' ? orderScreen(req, editorGate(req), null) : null,
+    vendorNew: kind === 'single',   // 🆕 ⑤-2: 新商品の登録 (単品) の先方品番・入数の欄 (views/_order.ejs)
     orderNoneApplies,   // 発注の設定の「入力なし」を出すか (API と同じ関数・views/_order.ejs)
     variationOn: variationOn(owner),
     // 「入力なし」にできる項目 (lib/master-register-blanks.mjs = サーバーと同じ名前)
@@ -908,8 +1012,92 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
     lzBarcodeReady: db ? await lzBarcodeReady(db).catch(() => false) : false,
     // 🆕 0084: メーカーの欄 (単品だけ・0084 があってロールの流し直しの後)。名簿は画面で探す (search-fold.mjs と同じかなの同一視)
     ...(await makerLocals(db, kind === 'single')),
+    packageReady: db && kind === 'single' ? await packageReady(db).catch(() => false) : false,   // 🆕 0087 (梱包の大きさ・重さの欄を出すか・入れなくてよい)
+    // 🆕 0088: ブランド・商品の段階 (単品だけ・必須でない)
+    ...(await brandLifeLocals(db, kind === 'single')),
+    // 🆕 0090: 表示の項目の欄を出すか (0090 がある DB・単品だけ・入れなくてよい)
+    labelNew: db && kind === 'single' && await labelReady(db).catch(() => false) ? { suggest: COUNTRY_SUGGEST, uoms: NET_UOMS } : null,
+    // 🆕 2026-10-21: ?from_card= (「下書き」の画面の「セットとして登録する」) = product-hub のセットの下書きの コード・名前・構成を入れておく (セットだけ)
+    prefill: kind === 'set' && req.query.from_card != null ? await setPrefillOf(req.query.from_card) : null,
   });
 }));
+/**
+ * 🆕 2026-10-21: product-hub のセットの下書き (新商品の登録で決めたセット) → セットの登録の画面に入れておく値 (読むだけ)。
+ *   { ok: true, draft_id, code, name, components, card_url } / 引き継げない・読めない = { ok: false, message, card_url? }
+ */
+async function setPrefillOf(raw) {
+  const id = Number(raw);
+  if (!Number.isSafeInteger(id) || id <= 0) return { ok: false, message: 'カードの番号が違います' };
+  let c;
+  try {
+    const st = await setPlans();
+    c = typeof st.plannedById === 'function' ? st.plannedById(id) : null;
+  } catch (e) {
+    return { ok: false, message: `product-hub のカードを読めません (${String((e && e.message) || e).slice(0, 120)})` };
+  }
+  if (!c || c.draft_id !== id) return { ok: false, message: `product-hub のカード #${id} は、まだ登録していないセットの下書きではありません (番号が違うか、同じコードのカードがほかにもあります)`, card_url: phCardUrl(id) };
+  if (!c.takeable) return { ok: false, message: `product-hub のカード #${id} は、まだ登録していないセットの下書きではありません (${c.why})`, card_url: phCardUrl(id) };
+  return { ok: true, draft_id: id, code: c.code, name: c.name, components: (c.members || []).map((m) => ({ code: m.code, qty: m.qty })), card_url: phCardUrl(id) };
+}
+
+/**
+ * 🆕 2026-10-21: 「下書き」の画面 = まだ終わっていない登録の 2 か所をまとめて見る (読むだけ)。
+ *   ① マスタの入力 (Company DB) の下書き = 登録の状態が draft (NE にまだ登録していない)
+ *   ② product-hub のセットの下書き = 新商品の登録 (単品) で「セット商品を作る = 作る」にして作ったカードで、まだマスタの入力にセットとして登録していないもの
+ *      (Company DB に同じコードがある = 登録はした・カードを結ぶのを待っている)
+ */
+const DRAFT_LIST_MAX = 300;
+router.get('/drafts', (req, res) => withPgPage(req, res, async (db, dbError) => {
+  let cdb = null; let ph = null;
+  if (db) {
+    try {
+      const ready = (await db.query("select to_regclass('ops.master_registrations') is not null as ok")).rows[0].ok === true;
+      if (!ready) cdb = { ready: false, total: 0, rows: [] };
+      else {
+        const total = (await db.query(`select count(*)::int as n from ops.master_registrations r join core.skus k on k.sku_id = r.sku_id where r.state = 'draft' and k.company_id = $1`, [1])).rows[0].n;
+        const rows = (await db.query(`select k.code, k.name, k.sku_kind as kind, r.created_at::text as created_at, r.created_by
+            from ops.master_registrations r join core.skus k on k.sku_id = r.sku_id
+           where r.state = 'draft' and k.company_id = $1 order by r.created_at desc, k.code limit $2`, [1, DRAFT_LIST_MAX])).rows;
+        cdb = { ready: true, total, rows };
+      }
+    } catch (e) { cdb = { error: String((e && e.message) || e).slice(0, 200) }; }
+  }
+  try {
+    const st = await setPlans();
+    const rows = typeof st.openCards === 'function' ? st.openCards({ limit: DRAFT_LIST_MAX }) : [];
+    // Company DB に同じコードがあるか (登録はした = カードを結ぶのを待っている)
+    let inCdb = new Map();
+    if (db && rows.length) {
+      try {
+        const found = (await db.query(`select t.x as input, k.code from unnest($2::text[]) as t(x) join core.skus k on k.company_id = $1 and k.code_norm = core.norm_code(t.x)`, [1, rows.map((r) => r.code)])).rows;
+        inCdb = new Map(found.map((f) => [f.input, f.code]));
+      } catch { inCdb = null; }
+    }
+    ph = { rows: rows.map((r) => ({ ...r, card_url: phCardUrl(r.draft_id), cdb_code: inCdb ? inCdb.get(r.code) ?? null : undefined })) };
+  } catch (e) { ph = { error: String((e && e.message) || e).slice(0, 200) }; }
+  res.render(view('drafts.ejs'), { ...pageLocals(req), ui2: true, nav: 'drafts', dbError, cdb, ph, DRAFT_LIST_MAX, KINDS: KINDS_NEW });
+}));
+/**
+ * 🆕 0088: ブランド・商品の段階の欄に渡す値 { brandLife: { brands, max, stages, first? } | null }。出さない・読めない (0088 の前・ロールの流し直しの前) = null = 欄なし。
+ *   cur (商品の画面) = 初めて売った日 (ops.sku_first_sold・読めない = 「読めませんでした」) と終売の予定日までの日数
+ */
+async function brandLifeLocals(db, want = true, cur = null) {
+  const ready = want && db ? await brandLifeReady(db).catch(() => false) : false;
+  if (!ready) return { brandLife: null };
+  const out = { brands: await readBrands(db).catch(() => []), max: BRAND_NAME_MAX, stages: LIFE_STAGES, soonDays: END_SOON_DAYS, first: null, end: null };
+  if (cur) {
+    try {
+      const fs = (await firstSoldOf(db, [cur.sku_id])).get(String(cur.sku_id)) || null;
+      out.first = firstSoldView(fs, await salesRecordsFrom(db));
+    } catch (e) {
+      console.error(`[master-edit] 初めて売った日を読めなかった: ${e && e.message}`);
+      out.first = { date: null, text: '読めませんでした', source: '', note: '少し待ってから画面を開き直してください', beforeRecords: false, error: true };
+    }
+    const end = cur.lifecycle && cur.lifecycle.end_planned_on;
+    if (end) { const today = jstDate(new Date(clock())); out.end = { days: daysUntil(end, today), badge: endBadge(end, today) }; }
+  }
+  return { brandLife: out };
+}
 /** 🆕 0084: メーカーの欄に渡す値 { makerReady, makers: [{ id, name }], makerMax }。出さない・読めない = 欄なし */
 async function makerLocals(db, want = true) {
   const ready = want && db ? await makerReady(db).catch(() => false) : false;
@@ -938,6 +1126,10 @@ async function renderVariationNew(req, res, { db, dbError, page, shipping, local
     blankKeys: BLANK_KEYS.variation, blankLabels: blankLabelsOf('variation'),
     lzBarcodeReady: db ? await lzBarcodeReady(db).catch(() => false) : false,   // 🆕 0080 (子ごとのロジザードのバーコードの欄を出すか)
     ...(await makerLocals(db, !gated)),   // 🆕 0084: メーカー (全部の子に同じ値)
+    packageReady: db ? await packageReady(db).catch(() => false) : false,   // 🆕 0087 (梱包の大きさ・重さの欄を出すか・全部の子に同じ値・入れなくてよい)
+    ...(await brandLifeLocals(db, !gated)),   // 🆕 0088: ブランド・商品の段階 (全部の子に同じ値・必須でない)
+    // 🆕 0090: 表示の項目の欄 (全部の子に同じ値・型番は聞かない・入れなくてよい・0090 の前の DB = 出さない)
+    labelNew: db && await labelReady(db).catch(() => false) ? { suggest: COUNTRY_SUGGEST, uoms: NET_UOMS } : null,
   });
 }
 // ─── 色違い・サイズ違いのまとまり (PR-7) ───
@@ -1042,10 +1234,10 @@ async function prevRequestHash(db, rid0, kind) {
 function requestHashOf(kind, raw, c, actor) {
   try {
     if (kind === 'single') {
-      return registerPayloadHashOf(parseRegisterRequest({ actor, requestId: raw.request_id, kind: raw.kind, code: raw.code, reason: c.body.reason ?? null, values: raw.values, card: raw.card, logizardBarcode: raw.logizard_barcode }));
+      return registerPayloadHashOf(parseRegisterRequest({ actor, requestId: raw.request_id, kind: raw.kind, code: raw.code, reason: c.body.reason ?? null, values: raw.values, card: raw.card, logizardBarcode: raw.logizard_barcode, package: raw.package, label: raw.label }));   // 🆕 0087: 大きさ・重さもハッシュに (登録と同じ)
     }
     return variationPayloadHashOf(parseVariationRequest({ actor, requestId: raw.request_id, reason: c.body.reason ?? null, group: raw.group, axes: raw.axes ?? null, options: raw.options,
-      children: raw.children, values: raw.values, card: raw.card, childReasons: c.childReasons }));
+      children: raw.children, values: raw.values, card: raw.card, childReasons: c.childReasons, package: raw.package, label: raw.label }));   // 🆕 0087
   } catch { return null; }
 }
 function orderBlanksFirstTime(db, req, gate, kind, b) {
@@ -1078,6 +1270,8 @@ router.post('/api/new/variation', (req, res) => {
   let orderInput = null;
   let orderBase = null;
   try { order = orderInputOf(b.order_settings); } catch (e) { if (e instanceof OrderSettingsError) return res.status(e.status).json(orderErrorBody(e)); throw e; }
+  // 🆕 ⑤-2: 先方品番は子ごとに違う = まとまりの登録では受けない (登録の後に子の商品の画面で)
+  if (order && order.vendor) return res.status(400).json({ ok: false, error: '発注の設定: 先方品番・入数は、まとまりの登録では入れられません (登録の後に子の商品の画面で入れてください)', reason: 'invalid_input', field: 'order_settings.vendor_code' });
   if (order) {
     const og = orderWriteGate(req, gate);
     if (!og.ok) return res.status(403).json({ ok: false, error: og.message, reason: og.reason, field: 'order_settings' });
@@ -1126,6 +1320,8 @@ router.post('/api/new/variation', (req, res) => {
       childReasons: mk.childReasons,    // 🆕 子ごとの入力なしの理由 (原価・JAN はその子に無いときだけ・#1706 Codex R1 M1・🆕 メーカーは全部の子)
       reasonNote: po.note,              // 🆕 発注の設定の入力なし (DB に書く理由にだけ・ハッシュに入らない・#1706 Codex R2 M)
       lzCopy: lg.copy,                  // 🆕 #1719 R1 High 2: ロジザードの写しと照らした結果 (値の行に残す・ハッシュに入らない)
+      package: b.package,               // 🆕 0087: 梱包の 縦・横・高さ (cm)・重さ (g) = 全部の子に同じ値 (入れなくてよい)
+      label: b.label,                   // 🆕 0090: 表示の項目 (原産国・内容量・消費期限の目安) = 全部の子に同じ値 (型番は聞かない・入れなくてよい)
     }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, phDraftExists: phDraftLookup, orderOutbox: outbox, requireLz: true, codeReserved });
     let orderResult = null;
     const regId = String(r.request_id || rid).trim().toLowerCase();
@@ -1180,8 +1376,27 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
   const nedel = usable ? await readNeDelOverview(db, page.cur.sku_id) : null;
   const nedelLive = nedel ? nedel.items.filter((i) => i.action === 'delete' && i.state === 'live') : [];
   const gone = goneChk ? { ...goneView(goneChk), canApprove: approverGate(req).ok, fromRequest: nedelLive.length > 0, kind: page.cur.sku_kind } : null;
+  // 🆕 ⑤-1 (CompanyDB構想 27 §2.4 の 3・8): 先方品番・入数 = 発注アプリの対応表 (正本) を直接読む (発注アプリの権限がある人だけ・単品だけ)。
+  //   「仕入先」欄の先方品番も正本の値に差し替える (権限が無い人 = 今までどおり Company DB の写し)
+  const vendorSettings = page && page.cur.sku_kind === 'single' ? await vendorScreen(req, editorGate(req), page.cur.code, { primarySupplier: page.cur.primary_supplier || null }) : null;
+  if (vendorSettings && vendorSettings.data && vendorSettings.data.ok) {
+    const bySup = new Map(vendorSettings.data.rows.map((r) => [r.supplier_code, r.vendor_code]));
+    const normSup = (c) => { const t = String(c ?? '').trim(); return /^\d+$/.test(t) ? String(parseInt(t, 10)) : t; };
+    page.suppliers = page.suppliers.map((s) => ({ ...s, vendor_code: bySup.get(normSup(s.code)) ?? null }));
+  }
   res.render(view('sku.ejs'), {
+    vendorSettings,
+    // 🆕 0093: NE とちがう所の数 (ふつうの言葉の 1 行と「NEへ送る」へのリンクだけ)。0093 の前・読めない = null (出さない)
+    neDiff: page ? await readSkuNeDiff(db, page.cur.sku_id) : null,
+    // 🆕 10/20 中原さん「商品マスタからそれぞれのモールに飛ぶリンク」: この商品だけでできた出品の商品ページ (mall-links.mjs)。読めない = 出さない (画面は止めない)
+    mallLinks: page ? await readMallLinks(db, page.cur.sku_id) : null,
+    // 🆕 0090: 表示の項目 (単品の商品の行だけ・人の値 + いま使う値 + product-hub の今の値 (参考・読むだけ))。読めない = 出さない (画面は止めない)
+    label: page && page.cur.sku_kind === 'single' && page.cur.product_id ? await readLabelBlock(db, page.cur) : null,
     gone,
+    // 🆕 0087: 梱包した状態の 縦・横・高さ・重さ (単品の商品の行だけ・人の値 + 出どころ (定形外・FBA 納品) + まとめた値)。読めない = 出さない (画面は止めない)
+    pkg: page && page.cur.sku_kind === 'single' && page.cur.product_id
+      ? await (async () => ({ ...(await readPackageView(db, page.cur.product_id)), ready: await packageReady(db) }))().catch((e) => { console.error(`[master-edit] 大きさ・重さを読めない: ${e && e.message}`); return null; })
+      : null,
     // 🆕 0072: NE から消す (箱 = 依頼の途中の様子・「NE から消す」の画面へ)。0072 の前・読めない = null (出さない)
     nedel: nedel ? { live: nedelLive, canApprove: approverGate(req).ok, STATUS_WORDS: NE_DEL_STATUS_WORDS } : null,
     // AMC 商品ラベルのバーコード印字 (Company DB構想 21 A1・発注アプリに保存・単品で AMC × 自社商品だけ欄を出す)
@@ -1198,8 +1413,13 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
     // 🆕 0071: 下書きだけ「この下書きを消す」の確かめを読む (DB の ops.sku_draft_cancel_check・読めない = 出さない)。押せるのは名簿 MASTER_EDITORS の人
     deldraft: page && page.cur.registration && page.cur.registration.state === 'draft'
       ? draftCancelView(await readDraftCancelCheck(db, page.cur.sku_id), await liveCardsSafe({ skuId: page.cur.sku_id, code: page.cur.code })) : null,
+    // 🆕 0098: 下書き・NE 登録待ちで NE にもう同じ商品がある = 「NE にあるので登録済みにする」(DB の ops.draft_in_ne_check・読めない = 出さない)。押せるのは名簿 MASTER_DECISION_APPROVERS の人
+    dine: page && page.cur.registration && ['draft', 'ne_pending'].includes(page.cur.registration.state)
+      ? { ...draftInNeView(await readDraftInNeCheck(db, page.cur.sku_id)), canApprove: approverGate(req).ok, button: DRAFT_IN_NE_BUTTON } : null,
     // 🆕 0084: メーカー (単品だけ・代表の仕入先のすぐ下・保存は「保存する」と一緒 = saveSku)
     ...(await makerLocals(db, !!page && page.cur.sku_kind === 'single')),
+    // 🆕 0088: ブランド・商品の段階 (単品だけ・別の板・保存は「保存する」と一緒 = saveSku)・初めて売った日 (読むだけ)
+    ...(await brandLifeLocals(db, !!page && page.cur.sku_kind === 'single', page ? page.cur : null)),
   });
 }));
 router.get('/sku/:code/history', (req, res) => withPgPage(req, res, async (db, dbError) => {
@@ -1208,6 +1428,93 @@ router.get('/sku/:code/history', (req, res) => withPgPage(req, res, async (db, d
   res.render(view('history.ejs'), { ...pageLocals(req), nav: 'list', dbError, h, code: req.params.code });
 }));
 
+/**
+ * 🆕 入出庫の履歴 (CompanyDB構想 26 PR-1): 単品だけ・新しい順に出荷 200 行ずつ (?before= 前のページの切れ目)。
+ *   仕入の行は発注アプリの権限がある人だけ (無い人は「在庫の調整」に入る)。最初のページだけ、いまのロジザードの写しで合わせる
+ */
+async function movementSku(db, code) {
+  return (await db.query('select sku_id::text as sku_id, code, code_norm, sku_kind from core.skus where company_id = 1 and code_norm = core.norm_code($1)', [String(code ?? '')])).rows[0] || null;
+}
+const MOVEMENT_SINGLE_ONLY = Object.freeze({ ok: false, reason: 'not_single', error: '入出庫の履歴は単品だけです (セットには在庫がありません。構成品の画面で見ます)' });
+router.get('/api/sku/:code/movements', (req, res) => withPgApi(res, async (db) => {
+  const sku = await movementSku(db, req.params.code);
+  if (!sku) return res.status(404).json({ ok: false, error: `${req.params.code} は Company DB にありません` });
+  if (sku.sku_kind !== 'single') return res.status(400).json(MOVEMENT_SINGLE_ONLY);
+  const before = typeof req.query.before === 'string' && req.query.before ? req.query.before.slice(0, 100) : null;
+  const st = before ? null : await readWarehouseStock({ now: clock() });
+  const live = st && st.ok ? { asOf: st.asOf, stale: st.stale, qty: stockOf(st, sku.code_norm) } : null;
+  const out = await readMovementsPage(db, sku, { before, poAccess: canSeeBackorders(req), live });
+  res.status(out.ok ? 200 : out.reason === 'bad_cursor' ? 400 : 503).json(out);
+}));
+/** 🆕 月別のまとめ (CompanyDB構想 26 PR-2): 直近 13 か月。仕入・発注の数と金額は発注アプリの権限がある人だけ */
+router.get('/api/sku/:code/monthly', (req, res) => withPgApi(res, async (db) => {
+  const sku = await movementSku(db, req.params.code);
+  if (!sku) return res.status(404).json({ ok: false, error: `${req.params.code} は Company DB にありません` });
+  if (sku.sku_kind !== 'single') return res.status(400).json(MOVEMENT_SINGLE_ONLY);
+  const out = await readMonthly(db, sku, { poAccess: canSeeBackorders(req), now: new Date(clock()) });
+  res.status(out.ok ? 200 : 503).json(out);
+}));
+/**
+ * 🆕 販売数のグラフ (10/17 中原さん): 日 × モールの正味の販売数 (0086 の読むだけの関数) と、単品はロジザードの毎日の在庫。SQL は 1 回 (商品を引くのと合わせて 2 回)。
+ *   期限 = ルートに入ってから 8 秒 (接続の待ちも入れる・1 つの文は残りの時間まで)。過ぎた・関数が無い = 503 と言葉 (画面のほかの所は動く)。セットも出す (そのセットとして売れた数)
+ * 🆕 10/19 中原さん「表示できなかったものはボタンを押したら表示されるように」: 画面を開いたときは今のまま 8 秒。時間切れ (reason = timeout) の後に
+ *   画面の「もう一度読む」を押す = ?wait=long = 期限 30 秒 (longMs・1 つの文の statement_timeout も残りの時間まで = 期限で DB が文を止める = 接続を握ったままにしない)。
+ *   wait はこの値だけ (ほかの値・2 つ付いた = ふつうの 8 秒)。長い読みは 1 つのプロセスで同時に longMax 本まで (画面のロール master_edit の接続の上限は 5 本 =
+ *   create-master-edit-roles.mjs の CONN_LIMIT。接続は 1 回の要求ごとに開いて閉じる = 貸し借りの溜めは無い) = 越えた = 503 busy (DB に触らない)
+ */
+/** answerGraceMs = 長い読みが期限 + これを過ぎても DB から何も返らない (道が黙って止まった) = 画面には時間切れと答える (読み込み中のままにしない) */
+export const SALES_CHART_LIMITS = { timeMs: 8e3, longMs: 30e3, longMax: 1, answerGraceMs: 5e3 };
+const SALES_CHART_TIMEOUT = Object.freeze({ ok: false, reason: 'timeout', error: '販売数の読み出しに時間がかかりすぎました。少し待ってからもう一度読んでください' });
+let salesChartLongNow = 0;   // いま走っている長い読み (?wait=long) の数
+router.get('/api/sku/:code/sales-chart', async (req, res) => {
+  const long = req.query.wait === 'long';
+  if (long && salesChartLongNow >= SALES_CHART_LIMITS.longMax) return res.status(503).json({ ok: false, reason: 'busy', error: 'ほかの画面で販売数を長く待って読んでいます。少し待ってからもう一度押してください' });
+  const ms = long ? SALES_CHART_LIMITS.longMs : SALES_CHART_LIMITS.timeMs;
+  const deadline = Date.now() + ms;
+  // 先に答えた (下の時間切れ) 後に来た答え (withPgApi の誤りの答えも) は捨てる = 2 度送って落ちない
+  const out1 = { get headersSent() { return res.headersSent; }, status: (code) => ({ json: (body) => { if (!res.headersSent) res.status(code).json(body); } }) };
+  let timer = null;
+  if (long) {
+    salesChartLongNow++;
+    // 期限 + answerGraceMs で答えだけ先に返す。枠 (同時 1 本) は接続を閉じ終わる (下の finally) まで返さない = 止まった接続が残っている間に次の長い読みを重ねない
+    //   (Codex R2 High: 枠を先に返すと、止まった接続が積み上がって画面のロールの接続の上限 5 本を使い切りうる)
+    timer = setTimeout(() => {
+      if (res.headersSent) return;
+      console.error(`[master-edit] 販売数のグラフ (長く待つ読み) が期限を過ぎても終わらない: ${req.params.code}`);
+      res.status(503).json(SALES_CHART_TIMEOUT);
+    }, ms + SALES_CHART_LIMITS.answerGraceMs);
+    if (timer.unref) timer.unref();
+  }
+  try {
+    await withPgApi(out1, async (db0) => {
+      const db = deadlineDb(db0, deadline, { maxMs: Math.max(STATEMENT_MAX_MS, ms) });
+      let sku;
+      try { sku = await movementSku(db, req.params.code); } catch (e) { if (e instanceof ListTimeoutError) return out1.status(503).json(SALES_CHART_TIMEOUT); throw e; }
+      if (!sku) return out1.status(404).json({ ok: false, error: `${req.params.code} は Company DB にありません` });
+      const out = await readSalesChart(db, sku, { now: clock() });
+      out1.status(out.ok ? 200 : 503).json(out);
+    }, 'read', { deadline });
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (long) salesChartLongNow--;
+  }
+});
+
+/**
+ * 🆕 2026-10-21 新商品の登録 (セット) の構成品の欄の候補 (読むだけ)。?q= → { ok, items, more, short, stock }。
+ *   探し方は Amazon SKU の構成の候補と同じ (amazon-read.mjs searchMapComponents)。出す物 = セットの構成品にできる単品だけ (forSet = 保存の確かめと同じ決まり)
+ */
+router.get('/api/new/components', (req, res) => {
+  const q = typeof req.query.q === 'string' ? req.query.q : '';
+  if (q.length > COMPONENT_SEARCH_Q_MAX) return res.status(400).json({ ok: false, error: `長すぎます (${COMPONENT_SEARCH_Q_MAX} 文字まで)` });
+  if (/[\x00-\x1f\x7f]/.test(q)) return res.status(400).json({ ok: false, error: '使えない文字があります' });
+  return withPgApi(res, async (db) => {
+    const st = await readWarehouseStock({ now: clock() });
+    const out = await searchMapComponents(db, q, { stock: st && st.ok ? st : null, forSet: true });
+    res.set('Cache-Control', 'no-store');
+    res.json({ ok: true, ...out, stock: st && st.ok ? { as_of: st.asOf, stale: !!st.stale } : null });
+  });
+});
 router.get('/api/lookup', (req, res) => withPgApi(res, async (db) => {
   const code = String(req.query.code || '').trim();
   if (!code || code.length > 60) return res.status(400).json({ ok: false, error: 'コードを入れてください' });
@@ -1226,6 +1533,28 @@ router.post('/api/makers', (req, res) => {
   const b = req.body || {};
   return withPgApi(res, async (db) => {
     res.json(await createMaker(db, { requestId: b.request_id, actor: String(req.session.email).trim().toLowerCase(), name: b.name }));
+  }, 'write');
+});
+
+/**
+ * 🆕 0088: ブランドを名簿に足す (「＋ 新しいブランドとして登録」「＋ 自社ブランドとして登録」)。名簿の人だけ・Origin・JSON (上の守り)。
+ *   同じと見る名前 (メーカーと同じ決まり) が既にある = 足さずにそれを返す (existed・印も名簿のまま)。同じ request_id の押し直し = 前の答え
+ */
+router.post('/api/brands', (req, res) => {
+  const gate = editorGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
+  const b = req.body || {};
+  return withPgApi(res, async (db) => {
+    res.json(await createBrand(db, { requestId: b.request_id, actor: String(req.session.email).trim().toLowerCase(), name: b.name, own: b.own == null ? false : b.own }));
+  }, 'write');
+});
+/** 🆕 0088: ブランドの「自社ブランド」の印を変える (名簿の行 = そのブランドの全部の商品に効く)。名簿の人だけ。seen_own = 画面が見ていた印 (違う = 409) */
+router.post('/api/brands/own', (req, res) => {
+  const gate = editorGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
+  const b = req.body || {};
+  return withPgApi(res, async (db) => {
+    res.json(await setBrandOwn(db, { requestId: b.request_id, actor: String(req.session.email).trim().toLowerCase(), brandId: b.brand_id, own: b.own, seenOwn: b.seen_own }));
   }, 'write');
 });
 
@@ -1291,6 +1620,18 @@ router.post('/api/new', (req, res) => {
     const sb = mk.body;
     const po = await orderBlanksFirstTime(db, req, gate, String(b.kind ?? ''), sb);
     if (!po.ok) return res.status(po.status).json(po.json);
+    // 🆕 ⑤-2 (CompanyDB構想 27 §2.4 の 4・5): 先方品番つき = 知らせ v2。DB が v2 を受けない (0075 の前・0089 の前) = 何も書かずに断る
+    //   (Company DB の登録だけ通って先方品番が消える、を作らない)。押し直し (記録がある) = lib が前の答えを返す = 確かめない
+    if (orderBase && orderBase.vendor && !po.replay && !(outbox && (await orderPayloadV2Ready(db)))) {
+      return res.status(400).json({ ok: false, reason: 'vendor_not_ready', field: 'order_settings.vendor_code',
+        error: '発注の設定: 先方品番・入数は、まだ新商品の登録では入れられません (Company DB の更新の前)。先方品番を空にして登録し、登録の後に商品の画面で入れてください。何も保存していません' });
+    }
+    // 🆕 ⑤-2: 先方品番 = 代表の仕入先が発注アプリにある・この商品コードの行がまだ無い (書かない確かめ・届けるときにもう一度)。
+    //   押し直し (この request_id の記録がある = 登録は済み・届け待ちのこともある) = 確かめない (lib が前の答えを返す・届けたあとに人が対応表を直していても 409 にしない)
+    if (orderBase && orderBase.vendor && !po.replay && !registrationOrderDone(b.request_id)) {
+      try { checkRegistrationVendor({ supplierCode: orderInput.supplierCode, code: b.code }); }
+      catch (e) { if (e instanceof VendorCodeError) return res.status(e.status).json({ ok: false, error: `発注の設定: ${e.message}`, reason: e.reason, field: `order_settings.${e.field || 'vendor_code'}` }); throw e; }
+    }
     // 🆕 0080: 単品 = ロジザードのバーコード (値か空欄) が要る・ロジザードの写しでほかの商品の値 = 409 (何も書かない)
     let lzCopy = null;
     //   🆕 #1719 Codex R4 High: 同じ request_id の記録がある (押し直し) = 今の写しで確かめない (lib が前の答えを返す)
@@ -1306,16 +1647,37 @@ router.post('/api/new', (req, res) => {
     //   作るセットは登録の要求のハッシュ (lib と同じ = 保存の記録の request_payload_hash) で結ぶ = 取り込みは通った登録の作るセットだけを付ける (Codex R1 High 2)
     let parsed = null;
     try {
-      parsed = parseRegisterRequest({ actor, requestId: b.request_id, kind: b.kind, code: b.code, reason: sb.reason ?? null, values: b.values, card: b.card, logizardBarcode: b.logizard_barcode });   // 🆕 0084: 理由はメーカーを数え直した後 (sb) = 登録の lib と同じ要求のハッシュ
+      parsed = parseRegisterRequest({ actor, requestId: b.request_id, kind: b.kind, code: b.code, reason: sb.reason ?? null, values: b.values, card: b.card, logizardBarcode: b.logizard_barcode, package: b.package,   // 🆕 0084: 理由はメーカーを数え直した後 (sb) = 登録の lib と同じ要求のハッシュ
+        label: b.label });   // 🆕 0090: 表示の項目も要求のハッシュに入る (作るセットを結ぶハッシュを lib と同じにする)
     } catch (e) { if (!(e instanceof MasterWriteError)) throw e; /* 形の誤りは登録の lib が同じ文で断る */ }
     const hasPlan = !!(parsed && parsed.card.sets && parsed.card.sets.length);
     // ほかの登録が作るセットに決めたコード (カードの取り込み待ち) は、ふつうの商品コードにもさせない (Codex R1 Medium 1)。押し直しは前の答え (確かめない)
     //   (Codex R2: セットの下書きのコードも・読めない = 登録しない・登録の取引でコードの鍵を取った後にもう一度 = codeReserved)
-    const codeReserved = (code) => setCodeReservedFor(code, rid, db);
+    //   🆕 2026-10-21: セットの登録 = 同じコードの「作るセットの下書き」(構成も同じ) は引き継ぐ (断らない)。取引の中でもう一度見るときも同じ (codeReserved)
+    const take = parsed && parsed.kind === 'set' ? { components: parsed.values.components || [], cardCreate: parsed.card.create !== false } : null;
+    const codeReserved = (code) => setCodeReservedFor(code, rid, db, take);
     if (parsed && !po.replay) {
       const held = await codeReserved(parsed.code);
-      if (held) return res.status(held.status).json({ ok: false, reason: held.reason, field: 'code', error: `${held.message}。何も保存していません` });
+      if (held) {
+        return res.status(held.status).json({ ok: false, reason: held.reason, field: 'code', error: `${held.message}。何も保存していません`,
+          ...(held.card_url ? { card_url: held.card_url, draft_id: held.draft_id } : {}) });
+      }
     }
+    // 🆕 2026-10-21 (Codex R1 Medium): 引き継ぐカードを登録の前に予約する (product-hub の表・書けない = 登録しない)。
+    //   カードの取り込みは予約したカードにだけ結ぶ (登録の後にコードを変えられても、新しいカードを作らずに衝突)。登録の取引の中の 2 回目の確かめも同じカードか見る
+    let reservedTake = false;
+    if (take && take.draftId != null && !po.replay) {
+      try {
+        (await setPlans()).reserveTake({ requestId: rid, draftId: take.draftId, code: parsed.code, components: take.components, actor });
+        take.reservedId = take.draftId;
+        reservedTake = true;
+      } catch (e) {
+        if (e && e.status) return res.status(e.status).json({ ok: false, error: e.message, reason: e.reason, field: 'code', ...(e.draft_id ? { card_url: phCardUrl(e.draft_id), draft_id: e.draft_id } : {}) });
+        console.error(`[master-edit] 引き継ぐカードを予約できない: ${e && e.stack || e}`);
+        return res.status(503).json({ ok: false, reason: 'ph_unwritable', field: 'code', error: '引き継ぐ product-hub のカードを予約できないので、登録していません (少し待ってからもう一度)' });
+      }
+    }
+    if (take) take.inTx = true;   // ここから先の確かめ (登録の取引の中) は、予約したカードのときだけ引き継ぐ
     if (hasPlan) {
       try {
         await resolveStaleSetPlans(db, parsed.card.sets.map((sp) => sp.code), { actor, parentCode: parsed.code, requestId: rid });   // 予約の時間を過ぎた waiting・同じ人の押し直しを Company DB の記録で決めてから (Codex R4 / R6)
@@ -1334,11 +1696,14 @@ router.post('/api/new', (req, res) => {
         order: outbox ? orderBase : null, reasonNote: po.note,
         logizardBarcode: b.logizard_barcode,   // 🆕 0080 (CompanyDB構想 23 v4): ロジザードに送るバーコードの値か空欄 (単品だけ・要るかは上の lzRegisterGate)
         lzCopy,                                // 🆕 #1719 R1 High 2: ロジザードの写しと照らした結果
+        package: b.package,                    // 🆕 0087: 梱包の 縦・横・高さ (cm)・重さ (g) (入れなくてよい・単品だけ)
+        label: b.label,                        // 🆕 0090: 表示の項目 (原産国・内容量・型番・消費期限の目安) (入れなくてよい・単品だけ)
       }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, orderOutbox: outbox, requireLz: true, codeReserved });
     } catch (e) {
       // 登録が断られた (決まった誤り = MasterWriteError) = 作るセットの下書きは作らない (押し直しで通れば registered に戻す)。
       //   成否が分からない誤り (接続が切れた・commit の後など) = waiting のまま (予約を外さない)。時間を過ぎたら Company DB の保存の記録で決める (Codex R5 Medium 1)
       if (hasPlan && e instanceof MasterWriteError) await markSetPlanSafe(rid, { state: 'dropped', note: String((e && e.message) || e).slice(0, 300) });
+      if (reservedTake && e instanceof MasterWriteError) await markTakeSafe(rid, { state: 'dropped', note: String((e && e.message) || e).slice(0, 300) });
       // 🆕 Codex R6 Medium 1: 成否が分からない = 画面は同じ番号 (request_id) のまま押し直す (同じ登録は 2 回入らない・前の答えが返る)
       if (hasPlan && !(e instanceof MasterWriteError) && !(e && ['55P03', '40P01', '40001'].includes(e.code))) {
         console.error(`[master-edit] 作るセットつきの登録の成否が分からない (${rid}): ${e && e.stack || e}`);
@@ -1347,6 +1712,7 @@ router.post('/api/new', (req, res) => {
       throw e;
     }
     if (hasPlan) await markSetPlanSafe(rid, { state: 'registered', skuId: r.sku_id });
+    if (reservedTake) await markTakeSafe(rid, { state: 'registered', skuId: r.sku_id });
     let orderResult = null;
     const after = orderInput && outbox ? await ordersAfterRegistration(db, String(b.request_id).trim().toLowerCase(), !!r.replayed, orderBase) : { mode: orderInput ? 'legacy' : 'none' };
     if (after.mode === 'mismatch') orderResult = { ok: false, status: 'mismatch', reason: 'request_id_reused', pending: false, error: ORDER_MISMATCH_WORDS };
@@ -1370,7 +1736,11 @@ router.post('/api/new', (req, res) => {
     let card = r.card || null;
     if (card && card.status !== 'done') {
       const t = await tryCard(db, { eventId: card.event_id });
-      if (t) card = { ...card, status: t.status, draft_id: t.result?.draft_id ?? null, error: t.error ?? null, set_drafts: t.result?.set_drafts ?? null, set_skipped: t.result?.set_skipped ?? null };
+      if (t) {
+        card = { ...card, status: t.status, draft_id: t.result?.draft_id ?? null, error: t.error ?? null, set_drafts: t.result?.set_drafts ?? null, set_skipped: t.result?.set_skipped ?? null,
+          // 🆕 2026-10-21: 作るセットの下書きを引き継いだ (新しいカードは作っていない)・カードに入っていたので変えなかった欄
+          ...(t.result?.taken_over ? { taken_over: true, not_applied: t.result.not_applied || [] } : {}) };
+      }
     }
     res.json({ ...r, card, card_label: card ? CARD_STATUS_LABELS[card.status] || card.status : null, ...(orderInput ? { order_settings: orderResult } : {}),
       ...(await lzSavedUncheckedOf(db, b.request_id)) });   // #1719 R3 High: 押し直しでも DB に残した結果から
@@ -1402,6 +1772,18 @@ router.post('/api/sku/:code/adopt-parent', (req, res) => variationWrite(req, res
  *      (作っただけの CSV・構成の依頼・JAN・まだカードになっていない知らせ) は DB の関数が鍵の後に (lib/master-draft-cancel.mjs)。
  *   🚨 取り込みの借り (120 秒) が切れた後もまだ SQLite に書いている、のまれな競りだけは閉じない (受け入れ = 消した後にカードが出たら product-hub で除外)
  */
+/**
+ * 🆕 0098: NE にあるので登録済みにする { request_id, check_hash }。名簿 MASTER_DECISION_APPROVERS の人 (NE 登録の CSV を作る・配る・使わないと同じ)・この画面だけのロールで・
+ *   MASTER_EDIT_OPEN の後だけ。決めるのは DB の関数 (鍵の後の確かめ・約束・記録)。答え = { ok, ..., message: '登録済みにしました。NE とちがう所は『NEへ送る』に出ます' }
+ */
+router.post('/api/sku/:code/draft-in-ne', (req, res) => {
+  const gate = approverGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_approver' });
+  const b = req.body || {};
+  const actor = String(req.session.email).trim().toLowerCase();
+  return withPgApi(res, async (db) => res.json(await confirmDraftInNe(db, { actor, code: req.params.code, checkHash: b.check_hash, requestId: b.request_id }, { open: isOpen() })), 'write');
+});
+
 router.post('/api/sku/:code/draft-cancel', (req, res) => {
   const gate = editorGate(req);
   if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
@@ -1436,7 +1818,7 @@ router.post('/api/sku/:code/order-settings', (req, res) => {
   if (!og.ok) return res.status(403).json({ ok: false, error: og.message, reason: og.reason });
   const b = req.body || {};
   let order;
-  try { order = orderInputOf(b.values == null ? {} : b.values, { allowEmpty: true }); }
+  try { order = orderInputOf(b.values == null ? {} : b.values, { allowEmpty: true, allowVendor: false }); }
   catch (e) { if (e instanceof OrderSettingsError) return res.status(e.status).json(orderErrorBody(e)); throw e; }
   return withPgApi(res, async (db) => {
     const sku = (await db.query(`select s.code, s.sku_kind, (select sp.code from core.supplier_skus x join core.suppliers sp on sp.supplier_id = x.supplier_id
@@ -1454,6 +1836,59 @@ router.post('/api/sku/:code/order-settings', (req, res) => {
       if (e instanceof OrderSettingsError) return res.status(e.status).json(orderErrorBody(e));
       throw e;
     }
+  });
+});
+
+// ─── 🆕 ⑤-1: 先方品番・入数 (CompanyDB構想 27 §2.4・発注アプリの先方番号対応表 = 正本に直接書く・apps/purchase-orders/vendor-codes.js) ───
+/** 先に読んだ印 (base_updated_at): 必須。null = まだ無いつもり (保存だけ)・文字 = 開いたときの版 */
+function vendorBaseOf(b, { allowNull }) {
+  if (!b || !Object.prototype.hasOwnProperty.call(b, 'base_updated_at')) return { ok: false };
+  const v = b.base_updated_at;
+  if (v === null) return allowNull ? { ok: true, value: null } : { ok: false };
+  if (typeof v === 'string' && v.trim() !== '' && v.length <= 64) return { ok: true, value: v };
+  return { ok: false };
+}
+const VENDOR_SEEN_REQUIRED = { ok: false, reason: 'seen_required', error: '画面を開いたときの値 (base_updated_at) がありません。画面を開き直してから保存してください (ほかの人の変更を上書きしないため)' };
+/** 単品の商品 (Company DB)。無い・セット = 応答して null */
+async function vendorSkuOf(db, res, code) {
+  const sku = (await db.query('select s.code, s.sku_kind from core.skus s where s.company_id = 1 and s.code_norm = core.norm_code($1)', [String(code || '')])).rows[0];
+  if (!sku) { res.status(404).json({ ok: false, error: `商品コード ${code} は Company DB にありません` }); return null; }
+  if (sku.sku_kind !== 'single') { res.status(400).json({ ok: false, error: '先方品番は単品だけです (発注アプリはセットを扱わず、構成品で発注します)', reason: 'vendor_code_set' }); return null; }
+  return sku;
+}
+const requestIdOf = (b) => (typeof b.request_id === 'string' ? b.request_id.slice(0, 200) : null);
+router.post('/api/sku/:code/vendor-code', (req, res) => {
+  const og = orderWriteGate(req, editorGate(req));
+  if (!og.ok) return res.status(403).json({ ok: false, error: og.message, reason: og.reason });
+  const b = req.body || {};
+  const base = vendorBaseOf(b, { allowNull: true });
+  if (!base.ok) return res.status(428).json(VENDOR_SEEN_REQUIRED);
+  let v;
+  try { v = parseVendorInput({ vendor_code: b.vendor_code ?? null, qty_per_unit: b.qty_per_unit ?? null }); }
+  catch (e) { if (e instanceof VendorCodeError) return res.status(e.status).json({ ok: false, error: e.message, reason: e.reason, field: e.field }); throw e; }
+  if (!v) return res.status(400).json({ ok: false, error: '先方品番を入れてください (消すときは「消す」)', reason: 'invalid_input', field: 'vendor_code' });
+  return withPgApi(res, async (db) => {
+    const sku = await vendorSkuOf(db, res, req.params.code);
+    if (!sku) return;
+    // 仕入先一致 = 発注アプリのマスタ管理と同じ決まり (商品管理リスト → 無ければ新商品の代表の仕入先)。取引の前に読む (3 秒まで)
+    const prod = await productForVendorMap(sku.code, null, '商品管理リストに載ってから (NE 登録の翌朝) か、新商品の登録で作った商品だけです');
+    const out = upsertVendorCode({ supplierCode: b.supplier_code, productCode: sku.code, vendorCode: v.vendorCode, qtyPerUnit: v.qtyPerUnit,
+      baseUpdatedAt: base.value, prod, actor: String(req.session.email).trim().toLowerCase(), via: 'master-edit:sku', requestId: requestIdOf(b) });
+    const row = out.row ? { supplier_code: out.row.supplier_code, vendor_code: out.row.vendor_code, qty_per_unit: out.row.qty_per_unit ?? null, updated_at: out.row.updated_at } : null;
+    res.status(out.status).json({ ...out.body, row });
+  });
+});
+router.post('/api/sku/:code/vendor-code/delete', (req, res) => {
+  const og = orderWriteGate(req, editorGate(req));
+  if (!og.ok) return res.status(403).json({ ok: false, error: og.message, reason: og.reason });
+  const b = req.body || {};
+  const base = vendorBaseOf(b, { allowNull: false });
+  if (!base.ok) return res.status(428).json(VENDOR_SEEN_REQUIRED);
+  return withPgApi(res, async (db) => {
+    const sku = await vendorSkuOf(db, res, req.params.code);
+    if (!sku) return;
+    const out = deleteVendorCode({ supplierCode: b.supplier_code, productCode: sku.code, base: base.value, actor: String(req.session.email).trim().toLowerCase(), via: 'master-edit:sku', requestId: requestIdOf(b) });
+    res.status(out.status).json(out.body);
   });
 });
 
@@ -2001,6 +2436,8 @@ function regWrite(req, res, fn) {
   return withPgApi(res, async (db) => res.json({ ok: true, ...(await fn(db, actor, req.body || {}, opts)) }), 'write');
 }
 router.post('/api/reg-csv/exports', (req, res) => regWrite(req, res, (db, actor, b, o) => buildRegExport(db, { actor, kind: b.kind, codes: b.codes, requestId: b.request_id, variation: b.variation === true }, o)));
+// 🆕 10/20 (中原さん「ボタンをワンクリックしたら CSV が作成できるように」): 今すぐ作れる商品を全部 = 単品 1 つ・セット 1 つのファイルを作って配る (ファイルごとに上の作る・配ると同じ道)
+router.post('/api/reg-csv/build-all', (req, res) => regWrite(req, res, (db, actor, b, o) => buildRegAll(db, { actor, requestId: b.request_id, exclude: b.exclude ?? null }, { ...o, maxRows: variationMaxFileRows() })));
 router.post('/api/reg-csv/exports/:id/issue', (req, res) => regWrite(req, res, (db, actor, b, o) => issueRegExport(db, { actor, exportId: req.params.id, requestId: b.request_id }, o)));
 router.post('/api/reg-csv/exports/:id/declare', (req, res) => regWrite(req, res, (db, actor, b, o) => declareRegExport(db, {
   actor, exportId: req.params.id, sha256: b.sha256, result: b.result, neMessage: b.ne_message ?? null, importedAt: b.imported_at ?? null, note: b.note ?? null, requestId: b.request_id,
@@ -2126,6 +2563,53 @@ router.post('/api/ne-delete/items/:id/withdraw', (req, res) => neDelApi(req, res
   { actor, itemId: req.params.id, reason: b.reason, requestId: b.request_id }, { open: isOpen() }))));
 router.post('/api/ne-delete/handling', (req, res) => neDelApi(req, res, async (db, actor, b) => res.json(await buildHandling(db,
   { actor, itemIds: b.item_ids, reason: b.reason, requestId: b.request_id, confirm: b.confirm === true }, { open: isOpen() }))));
+
+// ─── NE へ送る (🆕 0094・lib/master-ne-update.mjs) ───
+router.get('/ne-update', (req, res) => withPgPage(req, res, async (db, dbError) => {
+  const phase = await readPhaseView(db);
+  const view0 = db ? await readNeUpdate(db) : null;
+  // 🆕 0100: セットの中身 (構成の依頼) = 足す・数を変える = CSV / 外す・入れ替える = NE の画面で。0100 の前の DB は出さない (読めないときも画面は出す)
+  let setComp = null;
+  if (db && await setCompOnLoadReady(db)) {
+    try { setComp = await readSetCompRequests(db, { nowMs: clock() }); } catch (e) { console.error(`[master-edit] セットの中身の依頼を読めない: ${e && e.message}`); setComp = { ready: false, items: [], csvSets: 0, error: true }; }
+  }
+  const gate = editorGate(req);
+  const approver = approverGate(req);
+  res.render(view('ne-update.ejs'), {
+    ...pageLocals(req, phase), nav: 'neupd', dbError, nu: view0, setComp, canSend: gate.ok && !!view0 && view0.ready, sendMessage: gate.message || '',
+    canVerify: approver.ok, VERIFY_TARGETS, COL_WORDS: NE_UPD_COL_WORDS, FILLER_WORDS,
+  });
+}));
+/** NE へ送るの書き込み = 名簿 (MASTER_EDITORS) の人だけ (設計 25 Q2 a)・この画面だけのロールで */
+function neUpdApi(req, res, fn, gateOf = editorGate) {
+  const gate = gateOf(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
+  const actor = String(req.session.email).trim().toLowerCase();
+  return withPgApi(res, async (db) => { res.set('Cache-Control', 'no-store'); return fn(db, actor, req.body || {}); }, 'write');
+}
+router.post('/api/ne-update/send-now', (req, res) => neUpdApi(req, res, async (db, actor, b) => res.json({ ok: true, ...(await requestNeSendNow(db, { actor, requestId: b.request_id })) })));
+router.post('/api/ne-update/csv', (req, res) => neUpdApi(req, res, async (db, actor, b) => res.json({ ok: true, ...(await makeNeUpdateCsv(db, { actor, requestId: b.request_id })) })));
+router.post('/api/ne-update/files/:id/download', (req, res) => neUpdApi(req, res, async (db, actor) => {
+  const f = await downloadNeUpdateFile(db, { actor, fileId: req.params.id });
+  res.set('Content-Type', 'text/csv; charset=utf-8');
+  res.set('Content-Disposition', `attachment; filename="${f.file_name}"`);
+  res.set('X-Content-SHA256', f.sha256);
+  res.set('X-NE-Older', String(f.older || 0));   // 🆕 0096: 前に受け取った CSV がこの直しを古い値で書いている数 (画面の一言)
+  res.send(f.bytes);
+}));
+// 🆕 0100: セットの中身の CSV (その場で作る・DB に記録しない = 開いている依頼からいつでも作り直せる。前に作ったファイルは前の中身 = 取り込むと戻る = 画面で「捨てる」と出す)
+router.post('/api/ne-update/set-comp-csv', (req, res) => neUpdApi(req, res, async (db) => {
+  if (!(await setCompOnLoadReady(db))) return res.status(409).json({ ok: false, error: 'まだ使えません (Company DB に 0100 が入っていません)', reason: 'db_not_ready' });
+  const f = await buildSetCompCsv(db, { now: new Date(clock()) });
+  if (!f) return res.status(409).json({ ok: false, error: 'いま CSV にできるセットの中身の依頼はありません', reason: 'nothing_ready' });
+  res.set('Content-Type', 'text/csv; charset=utf-8');
+  res.set('Content-Disposition', `attachment; filename="${f.file_name}"`);
+  res.set('X-Content-SHA256', f.sha256);
+  res.set('X-Set-Count', String(f.sets.length));
+  res.send(f.bytes);
+}));
+router.post('/api/ne-update/verified', (req, res) => neUpdApi(req, res, async (db, actor, b) => res.json({ ok: true, ...(await recordNeUpdateVerified(db,
+  { actor, kind: b.kind, col: b.col, entry: b.entry || 'bulk', result: b.result, sha256: b.sha256 ?? null, note: b.note ?? null })) }), approverGate));
 
 router.post('/api/sku/:code', (req, res) => {
   const gate = editorGate(req);

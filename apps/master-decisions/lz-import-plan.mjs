@@ -5,6 +5,9 @@
  *   - 取込は miniPC の 00:20 の定時の回だけ。始めてよい時刻 = JST 00:15〜00:55 (v2 §1)
  *   - 対象 = **前の日 (JST) の lz-daily の正式な証跡 1 つだけ** (daily-sync の回 = sync_run_id あり)。それより前の日は探さない (R0-7)
  *   - 取り込む前に、CSV の全部の商品 ID が直前の書き出しにあり・削除されていないこと (1 つでも欠ける = その夜は取り込まない。L-7 = 無い ID の行はエラー = 一部だけの取込になる)
+ *   - 🆕 lzd-v4 (2026-10-21): 合格に「外した行」(その行だけの問題で CSV に出さなかった商品) が入りうる。lz-daily の合否をうのみにせず、
+ *     証跡の外した行を決まり (lz-cdb.mjs の EXCLUDABLE_REASONS・上限) で照らし直し、CSV にその商品 (大文字小文字ちがいのロジザードの ID も) が無いことを確かめる。
+ *     直前の書き出しで CSV の商品 ID に大文字小文字だけ違う別の ID がある = 取り込まない (別の商品を書き換えるおそれ)
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -12,6 +15,7 @@ import crypto from 'node:crypto';
 import iconv from 'iconv-lite';
 import { readEvidence } from '../company-db/push/evidence.mjs';
 import { parseCsvBytes } from './lz-compare.mjs';
+import { EXCLUDABLE_REASONS, EXCLUDED_NO_NE_CODE, excludeLimit, isActiveLz } from './lz-cdb.mjs';
 
 export const WINDOW = Object.freeze({ fromMin: 15, toMin: 55 });   // JST 00:15〜00:55
 const sha256 = (b) => crypto.createHash('sha256').update(b).digest('hex');
@@ -60,7 +64,41 @@ export function pickTarget({ dataDir, now, requirePass = true, asOf = targetAsOf
   if (sha256(csvBuf) !== ev.csv.sha256) return no('csv_sha256_mismatch');
   const rows = Math.max(0, parseCsvBytes(csvBuf).records.length - 1);
   if (rows !== ev.csv.rows || rows < 1) return no('csv_rows_mismatch');
+  // 🆕 合格の証跡の外した行を照らし直す (lzd-v4。v3 以前の合格 = 不正 0)
+  if (ev.verdict === 'pass') {
+    const x = checkExcluded(ev, csvBuf);
+    if (!x.ok) return no(x.reason, { evidence: ev, ...(x.hit ? { hit: x.hit } : {}) });
+  }
   return { ok: true, reason: null, asOf, evidence: ev, csvPath, csvBuf };
+}
+
+/**
+ * 🆕 合格の証跡の「外した行」を照らし直す (lzd-v4・純粋)。lz-daily の合否をうのみにしない:
+ *   - lzd-v4: 不正の数 = 外した行の数 = 証跡の rows の数・外した行は全部 外してよい理由・上限の内 (上限はこちらの決まりで計算し直す = 証跡の limit は使わない)・
+ *     CSV の商品 ID が外した行のコード (NE の書き方・元のコード・大文字小文字ちがいのロジザードの ID) と大文字小文字を無視して 1 つも重ならない
+ *   - それより前の版 (v3 = 外した行が無い時代): 不正が 1 件でもある合格 = おかしい = 取り込まない
+ * @returns {{ ok: boolean, reason?: string, count?: number, hit?: string[] }}
+ */
+export function checkExcluded(ev, csvBuf) {
+  const c = (ev && ev.counts) || {};
+  const invalid = Number.isSafeInteger(c.invalid) ? c.invalid : null;
+  if (!ev || ev.version !== 'lzd-v4') return invalid === null || invalid === 0 ? { ok: true, count: 0 } : { ok: false, reason: 'invalid_without_excluded' };
+  const x = ev.excluded;
+  if (!x || typeof x !== 'object' || !Array.isArray(x.rows) || !Number.isSafeInteger(x.count) || x.count !== x.rows.length || invalid !== x.count || c.excluded !== x.count) return { ok: false, reason: 'excluded_bad' };
+  if (x.rows.some((r) => !r || typeof r !== 'object' || !EXCLUDABLE_REASONS.includes(r.reason))) return { ok: false, reason: 'excluded_reason' };
+  // 商品を特定できない外した行 = 「CSV に無い」と言えない = 取り込まない (Codex R1 Medium)。
+  //   元のコード (code_norm) は必ず・NE の書き方 (ne_code) は書き方が 1 つに決まらない理由のときだけ無くてよい・大文字小文字ちがいはロジザードの ID も必ず
+  const str = (v) => typeof v === 'string' && v.trim() !== '';
+  if (x.rows.some((r) => !str(r.code_norm)
+    || (r.ne_code != null && !str(r.ne_code)) || (r.ne_code == null && !EXCLUDED_NO_NE_CODE.includes(r.reason))
+    || (r.lz_ids != null && (!Array.isArray(r.lz_ids) || !r.lz_ids.every(str)))
+    || (r.reason === 'lz_case_collision' && !(Array.isArray(r.lz_ids) && r.lz_ids.length >= 1)))) return { ok: false, reason: 'excluded_unidentified' };
+  if (!Number.isSafeInteger(c.targets) || x.count > excludeLimit(c.targets)) return { ok: false, reason: 'excluded_over_cap' };
+  const bad = new Set();
+  for (const r of x.rows) for (const v of [r.ne_code, r.code_norm, ...(Array.isArray(r.lz_ids) ? r.lz_ids : [])]) if (typeof v === 'string' && v) bad.add(v.toLowerCase());
+  const hit = csvIds(csvBuf).filter((id) => bad.has(id.toLowerCase()));
+  if (hit.length) return { ok: false, reason: 'excluded_in_csv', hit: hit.slice(0, 20) };
+  return { ok: true, count: x.count };
 }
 
 /** CSV の商品 ID (1 列目・Shift_JIS) */
@@ -69,15 +107,19 @@ export function csvIds(csvBuf) {
 }
 
 /**
- * 取り込む前の確かめ: CSV の全部の商品 ID が、直前の書き出し (readLzShohinMaster の結果) にあり・削除されていない
- * @returns {{ ok: boolean, rows: number, missing: string[], deleted: string[] }}
+ * 取り込む前の確かめ: CSV の全部の商品 ID が、直前の書き出し (readLzShohinMaster の結果) にあり・削除されていない・
+ * 🆕 大文字小文字だけ違う有効な別の ID が直前の書き出しに無い (case_variants。無効の ID は数えない。朝の後にロジザードに別の書き方の商品ができた = 別の商品を書き換えるおそれ = 押さない)
+ * @returns {{ ok: boolean, rows: number, missing: string[], deleted: string[], case_variants: string[] }}
  */
 export function precheck({ csvBuf, lz }) {
-  const ids = csvIds(csvBuf), missing = [], deleted = [];
+  const ids = csvIds(csvBuf), missing = [], deleted = [], caseVariants = [];
   for (const id of ids) {
     const r = lz.byId.get(id);
     if (!r) missing.push(id);
     else if (r.deleted !== '0') deleted.push(id);
+    // 無効 (削除フラグ が 0 でない) の別の書き方は数えない (lz-cdb.mjs の classifyForLz と同じ。無効の ID は CSV に入らない = 値は書き込まない・取込の後の確かめで前と同じかを見る)
+    const g = lz.lowerGroups ? lz.lowerGroups.get(id.toLowerCase()) : null;
+    if (g && g.some((v) => v !== id && isActiveLz(lz, v))) caseVariants.push(id);
   }
-  return { ok: ids.length > 0 && !missing.length && !deleted.length, rows: ids.length, missing, deleted };
+  return { ok: ids.length > 0 && !missing.length && !deleted.length && !caseVariants.length, rows: ids.length, missing, deleted, case_variants: caseVariants };
 }

@@ -1,6 +1,7 @@
 /*
  * me-regcsv.js — NE 登録の CSV の画面の動き (第 2 段 10/5)
- *   - 作る: 選んだ数をボタンに出す (0 件なら押せない)。作れる商品を全部選ぶ
+ *   - 🆕 10/20 作る: ボタン 1 つ (POST /api/reg-csv/build-all) = いま作れる商品を全部 (単品 1 つ・セット 1 つのファイル) 作って配る → その場でダウンロード。「一部を外して作る」の印を外したものは作らない
+ *   - 🆕 10/20「NE に取り込んだ」= ボタン 1 つの申告 (配ったファイルの sha256 をそのまま送る・DB が記録と同じかを確かめる)。失敗のときは「一部失敗した」「全部だめだった」
  *   - 配る: 押すとファイルをダウンロードして画面を読み直す
  *   - 申告: CSV のファイルを落とす (押して選ぶ) と、その場で sha256 を出して配ったファイルと照合する (64 文字を写さない)。結果は大きな 3 択
  *   - 使わない・実機で確かめた
@@ -22,7 +23,7 @@
     var h = Array.prototype.map.call(b, function (x) { return x.toString(16).padStart(2, '0'); }).join('');
     return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20);
   }
-  var buildIds = { products: uuid(), sets: uuid() };   // 作る 1 回に 1 つ (押し直しても 2 つ作らない)
+  var buildAllId = uuid();   // 作る 1 回に 1 つ (押し直しても 2 つ作らない = 同じ番号はサーバーが前のファイルを返す)
   function post(path, body) {
     return fetch(base + path, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body || {}) })
       .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok && j.ok !== false, status: r.status, j: j }; }); });
@@ -50,23 +51,18 @@
   root.addEventListener('input', update);
   root.addEventListener('change', update);
 
-  /* ---------- 作る: 選んだ数 ---------- */
-  function picks(kind) { return $$('input.pick[data-kind]:checked', root).filter(function (x) { return !kind || x.getAttribute('data-kind') === kind; }); }
-  function pickState() {
-    ['products', 'sets'].forEach(function (k) {
-      var n = picks(k).length, s = $('[data-n="' + k + '"]', root); if (s) s.textContent = String(n);
-      var b = $('button[data-act="build"][data-kind="' + k + '"]', root); if (b && !b.hasAttribute('data-locked')) b.disabled = n === 0;
-    });
-    var all = $('#pick-all'), can = $$('input.pick[data-kind]:not(:disabled)', root);
-    if (all) { all.checked = can.length > 0 && can.every(function (x) { return x.checked; }); all.indeterminate = !all.checked && can.some(function (x) { return x.checked; }); }
+  /* ---------- 一部を外して作る: 外す商品 (印を外したもの・まとまりは丸ごと) ---------- */
+  function excluded() {
+    var out = [];
+    $$('#pick-some input.pick:not(:checked)', root).forEach(function (x) { try { out = out.concat(JSON.parse(x.getAttribute('data-codes') || '[]')); } catch (e) { out.push(x.value); } });
+    return out;
   }
-  // 名簿でない・閉じている = サーバーが disabled で描いた = 触らない (選んでも押せないまま)
-  $$('button[data-act="build"]', root).forEach(function (b) { if (b.disabled) b.setAttribute('data-locked', '1'); });
   root.addEventListener('change', function (e) {
-    if (e.target.id === 'pick-all') { $$('input.pick[data-kind]:not(:disabled)', root).forEach(function (x) { x.checked = e.target.checked; }); }
-    if (e.target.classList && e.target.classList.contains('pick')) pickState();
+    if (!(e.target.classList && e.target.classList.contains('pick'))) return;
+    var n = $$('#pick-some input.pick:not(:checked)', root).length, h = $('#next-hint');
+    if (h) h.textContent = n ? '印を外した ' + n + ' つは作りません' : '押すと CSV ができて、そのままダウンロードされます';
+    buildAllId = uuid();   // 中身が変わった = 新しい番号
   });
-  pickState();
 
   /* ---------- 申告: ファイルを落とすと sha256 を照合 ---------- */
   function hex(buf) { return Array.prototype.map.call(new Uint8Array(buf), function (x) { return x.toString(16).padStart(2, '0'); }).join(''); }
@@ -149,32 +145,44 @@
     b.disabled = true;
     var fail = function (t) { say(dmsg, t, false); b.disabled = false; };
     var p;
-    if (act === 'build') {
-      var kind = b.getAttribute('data-kind');
-      var codes = picks(kind).map(function (x) { return x.value; });
-      var bm = $('#build-msg');
-      if (!codes.length) { say(bm, '作る商品に印を付けてください', false); b.disabled = false; return; }
+    if (act === 'build-all') {
+      // 🆕 10/20: いま作れる商品を全部 = 作る → 配る (サーバー) → ここでダウンロード → 画面を読み直す (同じ画面)
+      var bm = $('#build-msg'), out = $('#build-result');
       say(bm, 'CSV を作っています…', true);
-      p = post('/api/reg-csv/exports', { kind: kind, codes: codes, request_id: buildIds[kind] }).then(function (r) {
-        if (!r.ok) { say(bm, errText(r.j, r.status), false); buildIds[kind] = uuid(); b.disabled = false; return; }
-        finish('ファイル #' + (r.j.export && r.j.export.export_id || '') + ' を作りました (' + codes.length + ' 件)。次は「配る (ダウンロード)」');
+      p = post('/api/reg-csv/build-all', { request_id: buildAllId, exclude: excluded() }).then(function (r) {
+        var j = r.j || {};
+        var files = Array.isArray(j.files) ? j.files : [];
+        var errs = Array.isArray(j.errors) ? j.errors : [];
+        if (!r.ok || !files.length) { say(bm, errText(j, r.status) || errs.map(function (x) { return x.message; }).join('\n'), false); buildAllId = uuid(); b.disabled = false; return; }
+        var got = files.filter(function (f) { return f.state === 'issued' || f.state === 'declared'; });
+        var label = function (f) { return (f.kind === 'sets' ? 'セット ' : '単品 ') + f.item_count + ' 件'; };
+        say(bm, 'CSV ができました: ' + files.map(label).join('・') + (got.length ? ' (ダウンロードしています)' : '') + (errs.length ? '\n作れなかったもの: ' + errs.map(function (x) { return x.message; }).join(' / ') : ''), !errs.length);
+        if (out) {
+          out.innerHTML = '';
+          got.forEach(function (f) {
+            var a = document.createElement('a'); a.className = 'btn sm'; a.href = base + '/api/reg-csv/exports/' + f.export_id + '/file'; a.setAttribute('download', '');
+            a.textContent = label(f) + ' の CSV をもう一度ダウンロード'; a.style.marginRight = '8px'; out.appendChild(a);
+          });
+        }
+        got.forEach(function (f, i) { setTimeout(function () { download(f.export_id); }, i * 700); });
+        if (errs.length) { buildAllId = uuid(); b.disabled = false; return; }
+        setTimeout(function () { finish('CSV ができました (' + files.map(label).join('・') + ')。NE の「商品一括登録」で取り込んで、「NE に取り込んだ」を押してください' + (files.some(function (f) { return f.kind === 'sets'; }) ? ' (セットの CSV は必ず押してください。単品は押さなくても翌朝自動で確かめます)' : ' (押さなくても翌朝自動で確かめます)')); }, 1200 + got.length * 700);
       });
-    } else if (act === 'build-variation') {
-      // 🆕 PR-7: まとまりの NE 登録待ちの子で 1 ファイル (ne-reg-variation-v1・未処理の回が重なると 1 つにまとまる)。ボタンごとに作る番号 1 つ (押し直しても 2 つ作らない)
-      var vcodes = []; try { vcodes = JSON.parse(b.getAttribute('data-codes') || '[]'); } catch (e) { vcodes = []; }
-      var vmsg = $('[data-msg]', b.closest('.vgroup')) || $('#build-msg');
-      if (!b.getAttribute('data-rid')) b.setAttribute('data-rid', uuid());
-      say(vmsg, 'CSV を作っています…', true);
-      p = post('/api/reg-csv/exports', { kind: 'products', variation: true, codes: vcodes, request_id: b.getAttribute('data-rid') }).then(function (r) {
-        if (!r.ok) { say(vmsg, errText(r.j, r.status), false); b.setAttribute('data-rid', uuid()); b.disabled = false; return; }
-        finish('ファイル #' + (r.j.export && r.j.export.export_id || '') + ' を作りました (まとまり・' + vcodes.length + ' 件)。次は「配る (ダウンロード)」');
-      });
+    } else if (act === 'declare-quick') {
+      // 🆕 10/20: ボタン 1 つの申告 = 配ったファイルの sha256 (この画面が持っている記録の値) をそのまま送る。DB が記録と同じかを確かめる
+      var qres = b.getAttribute('data-result');
+      if (qres === 'rejected_all' && !window.confirm('NE で全部だめだった (1 件も入らなかった) と知らせます。よろしいですか？')) { b.disabled = false; return; }
+      var qm = $('input[name="quick_message"]', card);
+      say(cardMsg, '知らせています…', true);
+      p = post('/api/reg-csv/exports/' + id + '/declare', { sha256: card.getAttribute('data-sha'), result: qres, ne_message: qm ? qm.value : '' })
+        .then(function (r) { if (!r.ok) { say(cardMsg, errText(r.j, r.status), false); b.disabled = false; return; }
+          finish(qres === 'ok' ? '「NE に取り込んだ」を記録しました。翌朝の照合で NE と同じか確かめます' : qres === 'partial' ? '「一部失敗した」を記録しました。翌朝、入らなかった商品が「次の CSV」に戻ります' : '「全部だめだった」を記録しました。商品は「次の CSV」に戻ります'); });
     } else if (act === 'issue') {
       say(cardMsg, '配っています…', true);
       p = post('/api/reg-csv/exports/' + id + '/issue', {}).then(function (r) {
         if (!r.ok || r.j.refused) { say(cardMsg, r.j.refused ? '使わないにした商品があるので配れません (ファイルを閉じました)。作り直してください' : errText(r.j, r.status), false); b.disabled = false; return; }
         download(id);
-        setTimeout(function () { finish('ファイル #' + id + ' を配りました (ダウンロード)。NE の「商品一括登録」で取り込んでください。翌朝の照合で自動で確かめます (申告はしなくて大丈夫です)'); }, 1200);
+        setTimeout(function () { finish('ファイル #' + id + ' を配りました (ダウンロード)。NE の「商品一括登録」で取り込んでください。' + (card.getAttribute('data-kind') === 'sets' ? 'セットは取り込んだら「NE に取り込んだ」を押してください (押すと翌朝の照合で確かめます)' : '翌朝の照合で自動で確かめます (申告はしなくて大丈夫です)')); }, 1200);
       });
     } else if (act === 'declare') {
       var res = $('input[type=radio]:checked', drawer);

@@ -8,7 +8,7 @@ Amazon は対象外 (価格改定ツールが別にあるため、ここでは�
 
 処理は 2 段階に分かれている。
 
-1. **記録 (M1)** — NEコードを貼る → 各モールの現在価格を API で取ってくる → 新しい価格を入れる
+1. **記録 (M1)** — NEコード (または代表商品コード = バリエーションへ広げる。`resolve.js` expandParentCodes) を貼る → 各モールの現在価格を API で取ってくる → 新しい価格を入れる
    → ガード (下記) を通った行だけ「実行できる行」として履歴に残す
 2. **実行 (M2)** — 履歴を選んで実行する → miniPC 経由で楽天へ送る → 送った後に**もう一度取り直して確認**する
 3. **復旧 (M2-4)** — 実行した履歴から「元の価格に戻す」履歴を1手で作る。★戻す先の価格は**その履歴の記録から取る** (画面から価格を受け取らない)。作るだけでは何も送らず、送信は 2 と同じ関所を全部通る
@@ -65,6 +65,7 @@ LINEギフトに kill switch はない。**書き込む口がそもそも無い*
 node apps/price-update/test-pricing.mjs
 node apps/price-update/test-record-guard.mjs
 node apps/price-update/test-resolve.mjs
+node apps/price-update/test-parent-expand.mjs
 node apps/price-update/test-linegift-read.mjs
 node apps/price-update/test-views.mjs
 node apps/price-update/test-execute.mjs

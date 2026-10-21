@@ -765,6 +765,8 @@ export async function runInitialLoad(db, plan, opts = {}) {
     const compRet = await insertMany(db, 'core.sku_components', ['company_id', 'parent_sku_id', 'child_sku_id', 'qty', 'source', 'created_by_type', 'created_by_id'], compRows,
       { onConflict: "on conflict (parent_sku_id, child_sku_id) do update set qty = excluded.qty, source = excluded.source where core.sku_components.source <> 'manual' and (core.sku_components.qty, core.sku_components.source) is distinct from (excluded.qty, excluded.source)", returning: 'parent_sku_id' });
     compSec.applied = compRet.length;
+    // 🆕 構成を足した・直した・消した親 (commit の後にセットの導く値を計算し直す = lib/master-write.mjs の recomputeSetsAfterLoad)
+    const compChangedParents = new Set(compRet.map((r) => String(r.parent_sku_id)));
     compSec.same += compRows.length - compRet.length;   // 値が同じ行は UPDATE しない (変更の記録・親の version を無駄に増やさない)
     // 完全に読めた親 = plan に構成が 1 行以上あり、skip が無い。それ以外 (空・読めない・未解決) は触らない
     const pruneParents = compParents.filter((p) => !parentsWithSkip.has(p));
@@ -774,6 +776,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
       const del = stale.filter((r) => r.source !== 'manual');
       for (const r of stale.filter((r) => r.source === 'manual')) { report.conflicts.push({ kind: 'set_component_manual_kept', parent_sku_id: Number(r.parent_sku_id), child_sku_id: Number(r.child_sku_id) }); manualKeptOnPrune.push([Number(r.parent_sku_id), Number(r.child_sku_id), Number(r.qty)]); }
       if (del.length) await db.query(`delete from core.sku_components where (parent_sku_id, child_sku_id) in (select unnest($1::bigint[]), unnest($2::bigint[]))`, [del.map((r) => r.parent_sku_id), del.map((r) => r.child_sku_id)]);
+      for (const r of del) compChangedParents.add(String(r.parent_sku_id));
       compSec.notes.push(`stale removed: ${del.length}`);
     }
     if (compSec.skipped.length) report.unresolved.set_components = compSec.skipped;
@@ -810,6 +813,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
     //   🚨 並び (sort) は材料の行の順 (NE の API の順が rowid で運ばれたもの = NE の取得に並びの列は無い)
     report.set_observations = await recordSetObservations(db, plan, { runId, kindHeld });
     if (report.set_observations.note) compSec.notes.push(report.set_observations.note);
+    report.set_derived = { changed_parents: compChangedParents.size };   // 🆕 commit の後に計算し直す (下の recomputeSetsAfterLoad)
 
     // ── 5. sku_costs (有効行と違うときだけ付け替え) ──
     // 持ち主が Company DB なら原価の行を作らない・閉じない (予定 0 件)
@@ -888,12 +892,14 @@ export async function runInitialLoad(db, plan, opts = {}) {
     }
     const ssSec = section(report, 'supplier_skus', (plan.supplierSkus || []).length);
     const ssRows = []; const ssKeys = new Set();
+    const vmSync = [];   // 🆕 ⑤-3: 発注アプリの対応表に行がある (仕入先, SKU) = 先方品番・入数をそのまま合わせる
     for (const x of (plan.supplierSkus || [])) {
       const sup = supIds.get(normSku(x.supplierCode)); const sid = skuIdOf(x.skuCode);
       if (!sup) { ssSec.skipped.push({ supplier: x.supplierCode, sku: x.skuCode, reason: '仕入先が無い' }); continue; }
       if (!sid) { ssSec.skipped.push({ supplier: x.supplierCode, sku: x.skuCode, reason: 'SKU が無い (または正規化衝突で落とした)' }); continue; }
       const k = `${sup}|${sid}`; if (ssKeys.has(k)) { ssSec.skipped.push({ supplier: x.supplierCode, sku: x.skuCode, reason: '重複' }); continue; } ssKeys.add(k);
       ssRows.push({ company_id: COMPANY_ID, supplier_id: sup, sku_id: sid, vendor_code: x.vendorCode ?? null, stock_units_per_order_unit: x.stockUnitsPerOrderUnit ?? null, min_order_qty: x.minOrderQty ?? null, order_multiple: x.orderMultiple ?? null, unit_cost_jpy: x.unitCostJpy ?? null, created_by_type: 'system', created_by_id: runId });
+      if (x.fromVendorMap) vmSync.push([sup, sid, x.vendorCode ?? null, x.stockUnitsPerOrderUnit ?? null]);
     }
     const ssRet = await insertMany(db, 'core.supplier_skus', ['company_id', 'supplier_id', 'sku_id', 'vendor_code', 'stock_units_per_order_unit', 'min_order_qty', 'order_multiple', 'unit_cost_jpy', 'created_by_type', 'created_by_id'], ssRows,
       { onConflict: 'on conflict (supplier_id, sku_id) do update set vendor_code = coalesce(excluded.vendor_code, core.supplier_skus.vendor_code), stock_units_per_order_unit = coalesce(excluded.stock_units_per_order_unit, core.supplier_skus.stock_units_per_order_unit), min_order_qty = coalesce(excluded.min_order_qty, core.supplier_skus.min_order_qty), order_multiple = coalesce(excluded.order_multiple, core.supplier_skus.order_multiple), unit_cost_jpy = coalesce(excluded.unit_cost_jpy, core.supplier_skus.unit_cost_jpy)'
@@ -903,6 +909,48 @@ export async function runInitialLoad(db, plan, opts = {}) {
     ssSec.applied = ssRet.length;
     ssSec.same = ssRows.length - ssRet.length;   // 値が同じ行は UPDATE しない
     if (ssSec.skipped.length) report.unresolved.supplier_skus = ssSec.skipped.slice(0, 200);
+    // 🆕 ⑤-3 (CompanyDB構想 27 §2.4 の 7・11): 先方品番・入数の写しを発注アプリ (正本) と同じにする (上の upsert は coalesce = 消した・空にしたが届かない)。
+    //   ① 対応表に行がある組 = 先方品番・入数をそのまま (違う行だけ)。② 対応表に行が無い組で、写しに先方品番か入数がある = 2 つを空に戻す (行は消さない)。
+    //   ② の「無い」は対応表の生の行の (仕入先, 商品) を正規化した組で比べる (SKU・仕入先の解決に頼らない)。
+    //   守り: 対応表の表が無い・0 行 = ② をしない。② の数が上限 (opts.vendorClearMax・既定 30) を超える = ② をせずに報告 (人が dry-run で数を見てから上げて流す)
+    const vm = plan.vendorMap || null;
+    const vmNote = { synced: 0, cleared: 0, clear_candidates: 0, clear_skipped: null, qpu_non_integer: vm ? vm.nonInteger.length : 0 };
+    if (vm && vm.read) {
+      for (let i = 0; i < vmSync.length; i += CHUNK) {
+        const chunk = vmSync.slice(i, i + CHUNK); const params = [];
+        const vals = chunk.map(([sup, sid, vc, q]) => { const p = params.length; params.push(sup, sid, vc, q); return `($${p + 1}::bigint, $${p + 2}::bigint, $${p + 3}::text, $${p + 4}::integer)`; }).join(', ');
+        const r = await db.query(`update core.supplier_skus x set vendor_code = v.vc, stock_units_per_order_unit = v.q
+          from (values ${vals}) as v(sup, sid, vc, q)
+          where x.supplier_id = v.sup and x.sku_id = v.sid and (x.vendor_code, x.stock_units_per_order_unit) is distinct from (v.vc, v.q)`, params);
+        vmNote.synced += r.rowCount ?? 0;
+      }
+      const scs = vm.pairs.map((p) => p[0]); const kcs = vm.pairs.map((p) => p[1]);
+      const gone = `from core.supplier_skus x join core.skus k on k.sku_id = x.sku_id join core.suppliers s on s.supplier_id = x.supplier_id
+          where x.company_id = $1 and (x.vendor_code is not null or x.stock_units_per_order_unit is not null)
+            and not exists (select 1 from unnest($2::text[], $3::text[]) as v(sc, kc) where v.sc = s.code_norm and v.kc = k.code_norm)`;
+      vmNote.clear_candidates = Number((await db.query(`select count(*)::int as n ${gone}`, [COMPANY_ID, scs, kcs])).rows[0].n);
+      const clearMax = Number.isInteger(opts.vendorClearMax) && opts.vendorClearMax >= 0 ? opts.vendorClearMax : 30;
+      if (!vmNote.clear_candidates) { /* 空に戻す行なし */ }
+      else if (!vm.rows) vmNote.clear_skipped = 'empty_map';
+      else if (vmNote.clear_candidates > clearMax) vmNote.clear_skipped = 'too_many';
+      else {
+        const r = await db.query(`update core.supplier_skus y set vendor_code = null, stock_units_per_order_unit = null
+          where (y.supplier_id, y.sku_id) in (select x.supplier_id, x.sku_id ${gone})`, [COMPANY_ID, scs, kcs]);
+        vmNote.cleared = r.rowCount ?? 0;
+      }
+      ssSec.notes.push(`先方品番・入数 (発注アプリと同じに): 合わせた ${vmNote.synced} / 空に戻した ${vmNote.cleared}`
+        + (vmNote.clear_skipped ? ` / 空に戻す候補 ${vmNote.clear_candidates} は見送り (${vmNote.clear_skipped === 'empty_map' ? '対応表が 0 行' : `上限 ${clearMax} 超・確かめてから --vendor-clear-max で流す`})` : '')
+        + (vmNote.qpu_non_integer ? ` / 整数でない入数 ${vmNote.qpu_non_integer} 件は写しが空 (発注アプリを見る)` : ''));
+      if (vmNote.clear_skipped || vmNote.qpu_non_integer) {
+        report.unresolved.vendor_codes = [
+          ...(vmNote.clear_skipped ? [{ reason: vmNote.clear_skipped === 'empty_map' ? '対応表が 0 行 (空に戻さない)' : `空に戻す候補が上限 ${clearMax} 超 (空に戻さない)`, candidates: vmNote.clear_candidates }] : []),
+          ...vm.nonInteger.slice(0, 50).map((x) => ({ reason: '整数でない入数 (写しは空)', ...x })),
+        ];
+      }
+    } else {
+      ssSec.notes.push('先方品番・入数: 発注アプリの対応表が無い (写しは触らない)');
+    }
+    ssSec.vendor_codes = vmNote;
     // 0027 (②c-2): 代表の仕入先 = NE の商品の仕入先コード。コードが空の商品は plan に来ない = 触らない (保留)。
     //   ① 変わる SKU の旧い代表を外す → ② 新しい代表を付ける (別の文なので部分 unique に引っかからない)。値が同じ行は UPDATE しない
     if (!has0027) { ssSec.notes.push('代表の仕入先: 0027 が未適用 (見送り)'); decisions.primary_suppliers = { applied: false, reason_code: 'no_0027' }; }
@@ -1456,6 +1504,21 @@ export async function runInitialLoad(db, plan, opts = {}) {
       const tp = Date.now();
       report.set_observations.promotions = await promoteObservedSets(db, report.set_observations.candidates, { ownership, now, log });
       report.set_observations.promotions.ms = Date.now() - tp;
+    }
+    // 🆕 commit の後: 構成が変わったセット (この回 + 前の 7 日に夜間ロードが構成を変えたセット) の導く値 (税率・取扱・原価) を、画面の保存と同じ規則で計算し直す
+    //   (lib/master-write.mjs の recomputeSetsAfterLoad・セットごとに 1 取引・人の値 (例外原価・セット自身の取扱) は残す・失敗してもロードは成功のまま = 次の晩にもう一度)。
+    //   構成の持ち主が company (夜間ロードが構成を書かない) なら呼ばない = 構成の昇格 (promoteComponentRequest) が計算し直す
+    if (!dryRun && loadOwns('sku_components')) {
+      const td = Date.now();
+      try {
+        const { recomputeSetsAfterLoad } = await import('../../../lib/master-write.mjs');   // 読み込みの輪を避けて使うときに読む (promoteObservedSets と同じ)
+        report.set_derived = { ...report.set_derived, ...await recomputeSetsAfterLoad(db, { changedSetIds: [...compChangedParents], ownership, now, runId, host: opts.host, log }) };
+        if (report.set_derived.changed) log(`set_derived: ${report.set_derived.changed} 件のセットの導く値を計算し直した (対象 ${report.set_derived.candidates})`);
+      } catch (e) {
+        report.set_derived = { ...report.set_derived, errors: 1, error: String(e && e.message).slice(0, 200) };
+        log(`セットの導く値の計算し直しに失敗: ${e && e.message}`);
+      }
+      report.set_derived.ms = Date.now() - td;
     }
     return report;
   } catch (e) {

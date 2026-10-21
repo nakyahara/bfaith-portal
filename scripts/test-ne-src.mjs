@@ -54,18 +54,20 @@ let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
 const quietly = async (fn) => { const l = console.log, w = console.warn; console.log = () => {}; console.warn = () => {}; try { return await fn(); } finally { console.log = l; console.warn = w; } };
 
-const ne = { goods: [], setgoods: [] };
+const ne = { goods: [], setgoods: [], base: [], rows: [], calls: [] };
 const realFetch = globalThis.fetch;
 globalThis.fetch = async (url, opts) => {
   const u = String(url);
   if (!u.startsWith('https://api.next-engine.org')) return realFetch(url, opts);
   const q = new URLSearchParams(opts.body);
   const offset = Number(q.get('offset')), limit = Number(q.get('limit'));
-  const list = u.endsWith('/api_v1_master_goods/search') ? ne.goods : ne.setgoods;
+  const ep = u.slice('https://api.next-engine.org'.length);
+  ne.calls.push({ ep, offset, limit });
+  const list = ep === '/api_v1_master_goods/search' ? ne.goods : ep === '/api_v1_receiveorder_base/search' ? ne.base : ep === '/api_v1_receiveorder_row/search' ? ne.rows : ne.setgoods;
   if (u.endsWith('/api_v1_master_setgoods/search')) ne.setFields = q.get('fields');
   return { ok: true, status: 200, json: async () => ({ result: 'success', data: list.slice(offset, offset + limit) }) };
 };
-const { fetchProducts, fetchSetProducts } = await quietly(() => import('../apps/warehouse/ne-api.js'));
+const { fetchProducts, fetchSetProducts, fetchOrders, NE_SEARCH_LIMIT: L } = await quietly(() => import('../apps/warehouse/ne-api.js'));   // L = 1 回の取得数 (今は 10000)
 const { getDB, neSrc } = await import('../apps/warehouse/db.js');
 const db = () => getDB();
 const meta = (k) => db().prepare('SELECT value FROM sync_meta WHERE key = ?').get(k)?.value ?? null;
@@ -112,10 +114,10 @@ await ta('[2] 古い形の DB は列が足され、前からの行・その回�
 await ta('[3] 商品の取込の整合 (取った行・コードが空・同じコードが 2 度) を完了の印と一緒に残す。対象のコードは全件', async () => {
   await new Promise((r) => setTimeout(r, 1100));   // 前の取込と別の秒にする (同じ秒だと前の回の行が今回の時刻に残り、取得の件数 (PR-9 ne-fetch-counts) が合わず印を付けない)
   // 2 ページ目に G0〜G59 がもう一度 (60 件 = 前の上限 50 を超える)・コードが空が 1 行
-  ne.goods = [...Array.from({ length: 1000 }, (_, i) => ({ goods_id: `G${i}` })), ...Array.from({ length: 60 }, (_, i) => ({ goods_id: `G${i}` })), { goods_id: '' }, { goods_id: 'X9' }];
+  ne.goods = [...Array.from({ length: L }, (_, i) => ({ goods_id: `G${i}` })), ...Array.from({ length: 60 }, (_, i) => ({ goods_id: `G${i}` })), { goods_id: '' }, { goods_id: 'X9' }];
   await quietly(fetchProducts);
   const it = JSON.parse(meta('ne_api_products_integrity'));
-  assert.deepEqual([it.fetched_rows, it.written_rows, it.dropped_no_code, it.distinct_codes, it.dup_code_count], [1062, 1061, 1, 1001, 60]);
+  assert.deepEqual([it.fetched_rows, it.written_rows, it.dropped_no_code, it.distinct_codes, it.dup_code_count], [L + 62, L + 61, 1, L + 1, 60]);
   assert.equal(it.dup_codes.length, 60);
   assert.equal(it.dup_codes[59], 'g59');
   assert.ok(meta('ne_api_products_complete_at'));
@@ -236,7 +238,7 @@ await ta('[8] NE のコードの元の書き方 (③b-1b): 保存の前に集め
   const spRows = (ts, kind) => Object.fromEntries(db().prepare('SELECT code_norm, spellings FROM raw_ne_code_spellings WHERE synced_at = ? AND kind = ?').all(ts, kind).map((r) => [r.code_norm, JSON.parse(r.spellings)]));
   const markOf = (side, ts) => db().prepare('SELECT version, rows FROM ne_code_spelling_marks WHERE side = ? AND synced_at = ?').get(side, ts);
   // 1 ページ目に ABC-1・2 ページ目に abc-1 (保存は小文字で上書き = 片方しか残らない)
-  ne.goods = [...Array.from({ length: 1000 }, (_, i) => ({ goods_id: i === 5 ? 'ABC-1' : `g${i}`, goods_representation_id: i < 3 ? 'GRP-X' : '' })),
+  ne.goods = [...Array.from({ length: L }, (_, i) => ({ goods_id: i === 5 ? 'ABC-1' : `g${i}`, goods_representation_id: i < 3 ? 'GRP-X' : '' })),
     { goods_id: 'abc-1', goods_representation_id: 'grp-x' }, { goods_id: 'Up-2' }];
   // 前の試験の取得と別の世代 (秒) にする: 同じ秒に入ると 2 つの回が 1 つの世代にまとまり、下の「新しい 3 つを残す」で
   //   2020 年の古い印が 3 つの中に残って落ちる (npm run test:company-db を続けて流したときだけ時々落ちた・2026-09-30)
@@ -391,6 +393,26 @@ await ta('[10] snapshot は印・通し番号・行を 1 つの読み取りの�
   // 書き換えの後の次の snapshot = 印が無い → セットの 登録日 は全部空
   const after = await regOf();
   assert.deepEqual([after.sr1, after.sr5, after.sr10, after['g-reg']], [null, null, null, '2024-03-15 10:00:00']);
+});
+
+await ta('[11] 1 回の取得数 = 10000 (NE の limit の省略時の値)。受注 (受注日) のベース・明細も offset を L ずつ進め、L より少ないページで止める (ちょうど L 行 = 次の 0 行で止まる)・行は全部入る / 商品・セットも同じ数で頼む', async () => {
+  assert.equal(L, 10000);
+  ne.calls = [];
+  ne.base = Array.from({ length: L + 5 }, (_, i) => ({ receive_order_id: String(900000 + i), receive_order_date: '2026-10-18 10:00:00', receive_order_cancel_type_id: '0' }));
+  ne.rows = Array.from({ length: L }, (_, i) => ({ receive_order_row_receive_order_id: String(900000 + (i % (L + 5))), receive_order_row_no: '1', receive_order_row_goods_id: `og${i % 7}`, receive_order_row_quantity: '1', receive_order_row_cancel_flag: '0' }));
+  const r = await quietly(() => fetchOrders(7));
+  const calls = (ep) => ne.calls.filter((c) => c.ep === ep).map((c) => [c.offset, c.limit]);
+  assert.deepEqual(calls('/api_v1_receiveorder_base/search'), [[0, L], [L, L]]);   // L + 5 行 = 2 回 (2 回目が 5 行で止まる)
+  assert.deepEqual(calls('/api_v1_receiveorder_row/search'), [[0, L], [L, L]]);    // ちょうど L 行 = 2 回目が 0 行で止まる
+  assert.deepEqual([r.total, r.inserted], [L, L]);
+  assert.equal(db().prepare("SELECT COUNT(*) AS n FROM raw_ne_order_base WHERE 伝票番号 >= '900000'").get().n, L + 5);
+  assert.equal(db().prepare("SELECT COUNT(*) AS n FROM raw_ne_orders WHERE 伝票番号 >= '900000'").get().n, L);
+  // 商品・セットの取得も同じ 1 回の取得数で頼む
+  ne.calls = [];
+  ne.goods = [{ goods_id: 'L1' }]; ne.setgoods = [{ set_goods_id: 'LS1', set_goods_name: 'x', set_goods_selling_price: '1', set_goods_detail_goods_id: 'L1', set_goods_detail_quantity: '1' }];
+  await new Promise((res) => setTimeout(res, 1100));
+  await quietly(fetchProducts); await quietly(fetchSetProducts);
+  assert.deepEqual(ne.calls.map((c) => [c.ep, c.offset, c.limit]), [['/api_v1_master_goods/search', 0, L], ['/api_v1_master_setgoods/search', 0, L]]);
 });
 
 globalThis.fetch = realFetch;

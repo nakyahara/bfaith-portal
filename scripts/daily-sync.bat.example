@@ -5,7 +5,8 @@ set "DATA_DIR=C:\Users\bfaith\bfaith-portal\data"
 set "VPS_SSH_KEY=C:\tools\keys\id_ed25519_vps"
 cd /d C:\Users\bfaith\bfaith-portal
 if not exist logs mkdir logs
-forfiles /p logs /m daily-sync-*.log /d -14 /c "cmd /c del @path" >nul 2>&1
+rem ログは 60 日残す (2026-10-19。前は 14 日 = NE の API の回数を後から数えられなかった。daily-sync-retry-*.log も同じ決まりで消える)
+forfiles /p logs /m daily-sync-*.log /d -60 /c "cmd /c del @path" >nul 2>&1
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd_HHmmss"') do set "TS=%%i"
 set "LOG=logs\daily-sync-%TS%.log"
 echo [daily-sync.bat] start %TS% > "%LOG%"
@@ -15,4 +16,5 @@ echo [daily-sync.bat] node exit code: %RC% >> "%LOG%"
 rem 構造監査 H-3: exit≠0 のとき notify-crash.js を呼ぶ。lock ファイルが残っている場合のみ
 rem (= daily-sync が通知に到達せず abort した場合のみ) 🚨 を GChat へ即時通知する
 if not "%RC%"=="0" node apps/warehouse/notify-crash.js %RC% >> "%LOG%" 2>&1
+if "%RC%"=="0" (powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\bfaith\bfaith-portal\scripts\jobs-monitor\ping.ps1 -Id warehouse-daily-sync -Status ok >nul 2>&1) else (powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\bfaith\bfaith-portal\scripts\jobs-monitor\ping.ps1 -Id warehouse-daily-sync -Status fail >nul 2>&1)
 exit /b %RC%

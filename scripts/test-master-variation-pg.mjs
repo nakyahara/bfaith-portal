@@ -12,6 +12,7 @@
  *     取引全体も短い (測った値を出す)・121 子は断る (上限 120 = 中原さんの決定 10/10)
  *   4b 上限ちょうど: 40 色 × 3 サイズ = 120 子 (上限 120 のまま通る・時間を測る)
  *   6 NE のコードの鍵 (#1677 Codex R1 High): 照合の ops.record_ne_codes と まとめての登録・子の廃止・代表の採用・CSV を作る取引を並べる = 待って順に・後の方は新しい NE のコードを見る・40P01 なし
+ *   🆕 7 (0091) 子の廃止とロジザード登録の CSV を出す取引が競る: 出すが先 = 廃止は SKU の鍵で待って lz_issued / 廃止が先 = 出すは待って「使える商品でない」(片方だけ・40P01 なし)
  *   5 本物のログイン: 画面のロールはまとまりの表を直接書けない・部品を実行できない・関数は実行できる
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-variation-pg.mjs
  *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す・ロール master_* をクラスタに作る)。localhost 以外の URL は拒む。TEST_PG_URL が無ければ飛ばす
@@ -362,6 +363,56 @@ try {
     for (const r of [rwf, rbf]) assert.notEqual(r.err?.code, '40P01', r.err?.message);
     assert.ok(rwf.ok, rwf.err?.message);
     assert.ok(a2.close.revision >= 1);
+  });
+
+  await ta('[7] (0091) 子の廃止とロジザード登録の CSV を出す取引が競る = 同時でも片方だけ: 出すが先 = 廃止は SKU の鍵で待って lz_issued / 廃止が先 = 出すは待って「使える商品でない」・40P01 なし', async () => {
+    const lzPrep = async (code) => {
+      const id = (await q('select sku_id::text as id from core.skus where code = $1', [code]))[0].id;
+      const b = (await A.query("select ops.set_sku_logizard_barcode($1::uuid, $2, $3::bigint, 'lz_assign', null, 'sku_page', null, null, null) as r", [uuid(), 'naka@test', id])).rows[0].r;
+      return { id, items: JSON.stringify([{ sku_id: id, code, rule_row: String(b.rule_row), kind: 'lz_assign', value: null, expiry_code: '01', inbound_code: '0' }]) };
+    };
+    const LZ_ISSUE = 'select ops.lz_new_export_issue($1::uuid, $2, $3::jsonb, now(), null) as r';
+    const CANCEL = 'select ops.cancel_variation_child($1::uuid, $2, $3, $4::jsonb, $5::bigint) as r';
+    const regOf = async (id) => (await q('select state from ops.master_registrations where sku_id = $1', [id]))[0].state;
+    await batchTx(A, { group: { product_id: GRP1 }, options: [{ axis: 1, code: '-Z1', name: 'Z1' }, { axis: 1, code: '-Z2', name: 'Z2' }],
+      children: [{ code: 'grp1-Z1', choices: { 1: '-Z1' } }, { code: 'grp1-Z2', choices: { 1: '-Z2' } }] });
+    /** 先の取引を開いたまま相手を走らせる。試験が途中で落ちても先の取引を閉じ、相手の終わりを待つ (後の試験 [5] に開いた取引・aborted を残さない・Codex R1 Medium) */
+    const race = async (first, body) => {
+      let other = null;
+      try {
+        await first.query('begin');
+        await body((s) => { other = launch(s); return other; });
+      } finally {
+        try { await first.query('rollback'); } catch { /* commit の後 = 何もしない */ }
+        if (other) await other.promise;
+      }
+    };
+    // (a) 出すが先 (commit 前)
+    const z1 = await lzPrep('grp1-Z1');
+    await race(A, async (start) => {
+      const f = (await A.query(LZ_ISSUE, [uuid(), 'naka@test', z1.items])).rows[0].r;
+      const ca = start(B.query(CANCEL, [uuid(), 'naka@test', 'やめる', OWN, z1.id]));
+      await sleep(400);
+      assert.equal(ca.done, false, '子の廃止は CSV を出すの commit を待つ');
+      await A.query('commit');
+      const rca = await ca.promise;
+      assert.notEqual(rca.err?.code, '40P01');
+      assert.match(String(rca.err?.message), new RegExp(`^lz_issued: grp1-Z1 はロジザード登録の CSV に出しています \\(ファイル #${f.export_id}\\)`), rca.err?.message ?? JSON.stringify(rca.ok));
+    });
+    assert.equal(await regOf(z1.id), 'draft');
+    // (b) 廃止が先 (commit 前)
+    const z2 = await lzPrep('grp1-Z2');
+    await race(B, async (start) => {
+      await B.query(CANCEL, [uuid(), 'naka@test', 'やめる', OWN, z2.id]);
+      const ib = start(A.query(LZ_ISSUE, [uuid(), 'naka@test', z2.items]));
+      await sleep(400);
+      assert.equal(ib.done, false, 'CSV を出すは子の廃止の commit を待つ');
+      await B.query('commit');
+      const rib = await ib.promise;
+      assert.notEqual(rib.err?.code, '40P01');
+      assert.match(String(rib.err?.message), /^invalid_input: grp1-Z2 は単品で使える商品でない/, rib.err?.message ?? JSON.stringify(rib.ok));
+    });
+    assert.equal(await regOf(z2.id), 'cancelled');
   });
 
   await ta('[5] 本物のログイン: 画面のロールはまとまりの表を直接書けない・部品を実行できない・関数は実行できる (ロールの script を流した後)', async () => {

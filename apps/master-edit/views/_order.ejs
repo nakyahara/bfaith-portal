@@ -23,8 +23,18 @@
     + opts.map(([v, t]) => '<button type="button" data-v="' + v + '" aria-pressed="' + (value === v ? 'true' : 'false') + '"' + (value === v ? ' class="on"' : '') + D + '>' + hh(t) + '</button>').join('') + '</div>';
   const num = (v) => (v == null ? '' : String(v));
   const condLabel = (c) => c.id + ' — ' + (c.name || '') + (c.supplier ? ' (仕入先 ' + c.supplier + ')' : '');
+  // 🆕 ⑤-1 / ⑤-2 (CompanyDB構想 27 §2.4): 先方品番・入数 (発注アプリの先方番号対応表・仕入先ごと)。
+  //   商品の画面 = vendorSettings (order-settings.mjs vendorScreen の答え・router が渡す)・新商品の登録 (単品だけ) = vendorNew (router が渡す)。
+  //   どちらも無い画面 (まとまりの登録・代表の画面) = 出さない
+  const vs = mode === 'sku' && typeof vendorSettings !== 'undefined' ? vendorSettings : null;
+  const vendorNewOn = mode === 'new' && typeof vendorNew !== 'undefined' && vendorNew === true;
+  const vEditable = vs && vs.editable ? vs.editable : { supplier: null, error: null };
+  const vRows = vs && vs.data && vs.data.ok ? vs.data.rows : [];
+  const vSup = (c) => (vs && vs.data && vs.data.ok && vs.data.suppliers[c] ? vs.data.suppliers[c] : { name: '', lead_days: null, known: false });
+  const vCanWrite = !!(vs && vs.canWrite);
+  const vPrimary = vs ? normSup(vs.primarySupplier) : '';
   const pageData = d ? {
-    mode, base, code: code || null, canWrite: !ro, noneOn, supplier: sup || null,
+    mode, base, code: code || null, canWrite: !ro, noneOn, supplier: sup || null, vendorOn: !!vs || vendorNewOn,
     seen: d.row ? d.row.updated_at : null,
     conditions: d.conditions.map((c) => ({ id: c.id, supplier: c.supplier })),
     lotSource: d.lotSource, neLot: d.neLot,
@@ -102,7 +112,7 @@
       <summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>ケース・容量 (使う商品だけ)</summary>
       <div class="body">
         <% if (noneOn) { %><div class="hint" style="padding:4px 0 6px">使わない商品は、欄ごとに「入力なし」を押します</div><% } %>
-        <div class="f" data-row="order_settings.case_lot"><label class="lab" for="po-case_lot">ケースロット</label><div class="ctl"><input class="in w-s" id="po-case_lot" inputmode="numeric" autocomplete="off" placeholder="—" value="<%= num(cur.case_lot) %>"<%- track('case_lot', 'ケースロット') %><%- part('case_lot') %><%= D %>><span class="unit">個 / ケース</span><%- none('case_lot', 'ケースロット') %><span class="hint">ケース単位で発注する仕入先だけ</span></div></div>
+        <div class="f" data-row="order_settings.case_lot"><label class="lab" for="po-case_lot">ケースロット</label><div class="ctl"><input class="in w-s" id="po-case_lot" inputmode="numeric" autocomplete="off" placeholder="—" value="<%= num(cur.case_lot) %>"<%- track('case_lot', 'ケースロット') %><%- part('case_lot') %><%= D %>><span class="unit">個 / ケース</span><%- none('case_lot', 'ケースロット') %><span class="hint">ケース単位で発注する仕入先だけ · 発注の計算に使う弊社の個数 (「先方 1 単位 = 弊社 n 個」の入数・箱に何個入っているかとは別)</span></div></div>
         <div class="f" data-row="order_settings.case_group"><label class="lab" for="po-case_group">ケースグループ</label><div class="ctl"><input class="in w-m" id="po-case_group" maxlength="100" autocomplete="off" placeholder="—" value="<%= cur.case_group || '' %>"<%- track('case_group', 'ケースグループ') %><%- part('case_group') %><%= D %>><%- none('case_group', 'ケースグループ') %><span class="hint">同じケースに混ぜて入れられる商品に同じ名前</span></div></div>
         <div class="f" data-row="order_settings.capacity_per_unit"><label class="lab" for="po-capacity_per_unit">容量 / 個</label><div class="ctl"><input class="in w-s" id="po-capacity_per_unit" inputmode="decimal" autocomplete="off" placeholder="—" value="<%= num(cur.capacity_per_unit) %>"<%- track('capacity_per_unit', '容量/個') %><%- part('capacity_per_unit') %><%= D %>><%- none('capacity_per_unit', '容量 / 個') %><span class="hint">原料グループの最低発注量を見るとき (例: 100ml の商品 = 100)</span></div></div>
       </div>
@@ -114,6 +124,53 @@
       <span class="msgline" id="po-msg" role="status" aria-live="polite"></span>
       <button class="btn pri" type="button" id="po-save" disabled>発注の設定を保存</button>
     </div>
+    <% } %>
+    <% if (vendorNewOn) { %>
+    <%# 新商品の登録 (単品): 代表の仕入先の先方品番・入数 (任意・「入力なし」には数えない)。下書きの保存と一緒に送る = 知らせ v2 で発注アプリへ %>
+    <div class="po-sub" id="po-vendor" style="margin-top:12px">
+      <div class="ttl"><svg class="ic" aria-hidden="true"><use href="#i-tag"/></svg>先方品番・入数 (代表の仕入先・使う仕入先だけ)</div>
+      <div class="f" data-row="order_settings.vendor_code"><label class="lab" for="po-vendor_code">先方品番</label><div class="ctl"><input class="in w-m mono" id="po-vendor_code" maxlength="100" autocomplete="off" spellcheck="false" placeholder="例: AC-1234"<%- track('vendor_code', '先方品番') %><%= D %>><span class="hint">仕入先の品番 (発注書の CSV・出荷明細の番号)。使わない仕入先は空のまま</span></div></div>
+      <div class="f" data-row="order_settings.qty_per_unit"><label class="lab" for="po-qty_per_unit">入数</label><div class="ctl"><span class="unit">先方 1 単位 = 弊社</span><input class="in w-s" id="po-qty_per_unit" inputmode="decimal" autocomplete="off" placeholder="1"<%- track('qty_per_unit', '入数 (先方 1 単位 = 弊社 n 個)') %><%= D %>><span class="unit">個</span><span class="hint">入荷予定の換算 (出荷明細の数 × この数) · 空 = 1 · ケースロット・箱の入数とは別</span></div></div>
+    </div>
+    <% } %>
+    <% if (vs && vs.canSee) { %>
+    <%# 商品の画面: 先方品番・入数 (仕入先ごと・発注アプリの対応表 = 正本を直接読む)。1 行ずつ「保存」「消す」= 発注の設定の保存とは別 %>
+    <div class="po-sub" id="po-vendor" style="margin-top:14px" data-can-write="<%= vCanWrite ? '1' : '' %>">
+      <div class="ttl"><svg class="ic" aria-hidden="true"><use href="#i-tag"/></svg>先方品番・入数 (仕入先ごと)<span class="right" style="margin-left:auto"><a class="hint" href="/apps/purchase-orders/admin?grp=vendormap<%= vEditable.supplier ? '&sup=' + encodeURIComponent(vEditable.supplier) : '' %>" target="_blank" rel="noopener">対応表で見る <svg class="ic s" style="vertical-align:-2px" aria-hidden="true"><use href="#i-ext"/></svg></a></span></div>
+      <div class="hint" style="padding-bottom:6px">入数 = 先方 1 単位 (出荷明細の数 1) が弊社の何個か (入荷予定の換算・空 = 1)。発注のケースロット・箱に何個入っているかとは別です。1 行ずつ保存します (ほかの人が先に直していたら保存せずに知らせます)。</div>
+      <% if (!vs.data || !vs.data.ok) { %>
+        <div class="callout err"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><%= vs.why || '発注アプリの先方番号対応表を読めません' %></div></div>
+      <% } else { %>
+        <% if (!vCanWrite && vs.why) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow">見るだけです: <%= vs.why %></div></div><% } %>
+        <% if (vEditable.error) { %><div class="callout info" id="po-vendor-why"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">先方品番を足す・直すことはできません: <%= vEditable.error %></div></div><% } %>
+        <% if (vEditable.supplier && vPrimary && vPrimary !== vEditable.supplier) { %><div class="callout warn" id="po-vendor-supdiff"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow">代表の仕入先 (<%= vPrimary %>) と商品管理リストの仕入先 (<%= vEditable.supplier %>) が違います。直せるのは発注アプリと同じ <%= vEditable.supplier %> の行です (NE に届くと揃います)。</div></div><% } %>
+        <% const showRows = vRows.slice(); if (vEditable.supplier && !vRows.some((r) => r.supplier_code === vEditable.supplier)) showRows.push({ supplier_code: vEditable.supplier, vendor_code: '', qty_per_unit: null, updated_at: null, add: true }); %>
+        <% if (!showRows.length) { %><div class="hint" id="po-vendor-none">対応表にこの商品の行はありません</div><% } %>
+        <% for (const r of showRows) { const si = vSup(r.supplier_code); const mine = !!vEditable.supplier && r.supplier_code === vEditable.supplier; const w = vCanWrite && mine; %>
+        <div class="f po-vrow" data-sup="<%= r.supplier_code %>" data-base="<%= r.updated_at || '' %>" data-mine="<%= mine ? '1' : '' %>" style="align-items:start">
+          <div class="lab" style="padding-top:8px"><span class="mono"><%= r.supplier_code %></span> <%= si.name %></div>
+          <div class="ctl col" style="gap:6px">
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+              <input class="in w-m mono po-v-code" maxlength="100" autocomplete="off" spellcheck="false" placeholder="<%= r.add ? '先方品番 (まだ無い)' : '先方品番' %>" aria-label="先方品番 (<%= r.supplier_code %>)" value="<%= r.vendor_code || '' %>"<%= w ? '' : ' disabled' %>>
+              <span class="unit">先方 1 単位 = 弊社</span><input class="in w-s po-v-qpu" inputmode="decimal" autocomplete="off" placeholder="1" aria-label="入数 (<%= r.supplier_code %>・先方 1 単位 = 弊社 n 個)" value="<%= r.qty_per_unit == null ? '' : r.qty_per_unit %>"<%= w ? '' : ' disabled' %>><span class="unit">個</span>
+              <% if (w) { %><button class="btn pri sm po-v-save" type="button" disabled><%= r.add ? '足す' : '保存' %></button><% } %>
+              <% if (vCanWrite && !r.add) { %><button class="btn soft sm po-v-del" type="button">消す</button><% } %>
+            </div>
+            <% if (!mine && !r.add) { %><span class="hint">この商品の仕入先 (発注アプリの決まり) ではないので直せません · 古い行なら「消す」</span><% } %>
+            <% if (si.lead_days != null) { %><span class="hint po-v-lead">標準リードタイム <%= si.lead_days %> 日 (仕入先の値・<a href="/apps/purchase-orders/admin?grp=suppliers" target="_blank" rel="noopener">発注アプリの仕入先</a>)</span><% } %>
+            <span class="msgline po-v-msg" role="status" aria-live="polite"></span>
+          </div>
+        </div>
+        <% } %>
+        <% if (vs.data.pending.length) { %>
+        <div class="callout info" id="po-vendor-pending"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">仮登録 (出荷明細で見た、まだ結んでいない番号) があります:
+          <% for (const p of vs.data.pending) { %><span class="linkchip"><span class="mono"><%= p.supplier_code %></span> <span class="mono"><%= p.vendor_code %></span><%= p.vendor_name ? ' ' + p.vendor_name : '' %><%= p.provisional_qty_per_unit ? ' (入数 ' + p.provisional_qty_per_unit + ')' : '' %></span><% } %>
+          · 結ぶのは <a href="/apps/purchase-orders/admin?grp=vendormap" target="_blank" rel="noopener">発注アプリの対応表</a> で (自動では結びません)</div></div>
+        <% } %>
+      <% } %>
+    </div>
+    <% } else if (vs && !vs.canSee) { %>
+    <div class="hint" id="po-vendor" style="margin-top:12px">先方品番・入数: <%= vs.why %></div>
     <% } %>
     <script type="application/json" id="me-order"><%- JSON.stringify(pageData).replace(/</g, '\\u003c') %></script>
   <% } %>

@@ -26,6 +26,7 @@
   const lockWhy = (f) => {
     if (L[f]) {
       const ids = L[f].exports.map((x) => '#' + x).join('・');
+      if (L[f].why === 'reg_wait') return '<span class="lockwhy">NE への登録の確かめ (翌朝の照合) が終わると直せます</span>';   // 🆕 0093: セットの構成だけ
       return L[f].why === 'reg'
         ? '<span class="lockwhy">NE に送った値 (ファイル ' + h(ids) + ')</span>'
         : '<span class="lockwhy">NE に取り込む CSV (ファイル ' + h(ids) + ') が出ているので直せません · <a href="/apps/master-decisions/csv">マスタの判断 ↗</a></span>';
@@ -129,8 +130,26 @@
           <% if (last) { %><span>最後に直した人 <%= ui.actorWords(last) %></span><span class="dotsep" aria-hidden="true"></span><span><%= ui.fmtJst(last.recorded_at, { nowMs }) %></span><% } else { %><span>変更の記録はまだありません</span><% } %>
           <% if (!isSet && c.primary_supplier) { %><span class="dotsep" aria-hidden="true"></span><span>仕入先 <%= c.primary_supplier %> <%= supName(c.primary_supplier) %></span><% } %>
           <% if (!isSet && c.maker) { %><span class="dotsep" aria-hidden="true"></span><span id="maker-head">メーカー <%= c.maker.name %></span><% } %>
+          <% if (!isSet && c.brand) { %><span class="dotsep" aria-hidden="true"></span><span id="brand-head">ブランド <%= c.brand.name %><%= c.brand.own_brand ? ' (自社)' : '' %></span><% } %>
           <% if (page.registered) { %><span class="dotsep" aria-hidden="true"></span><span id="registered-on">登録日 <%= page.registered.date ? page.registered.date.replace(/-/g, '/') + ' (' + page.registered.label + ')' : '— (分かりません)' %></span><% } %>
         </div>
+        <%# 🆕 10/20 中原さん「商品マスタからそれぞれのモールに飛ぶリンク」: この商品だけでできた出品の商品ページ (apps/master-edit/mall-links.mjs・Company DB の出品)。
+            見出しの中 = どのタブでも見える。新しいタブで開く。出品の無いモールは出さない・1 つも無い = 一言だけ・読めない = 出さない %>
+        <% const ML = locals.mallLinks; %>
+        <% if (ML && ML.ok) { %>
+        <div class="malls" id="sku-malls">
+          <span class="malls-t" id="malls-t">モール</span>
+          <% if (ML.malls.length) { %>
+          <ul class="malls-list" aria-labelledby="malls-t">
+            <% for (const m of ML.malls) { %><% for (const l of m.links) { %>
+            <li><a class="mall" data-mall="<%= m.mall %>" href="<%= l.url %>" target="_blank" rel="noopener noreferrer" title="<%= l.title %>"><%= m.label %><% if (l.text) { %><small><%= l.text %></small><% } %><svg class="ic s" aria-hidden="true"><use href="#i-ext"/></svg><span class="sr">(新しいタブで開く)</span></a></li>
+            <% } %><% if (m.more > 0) { %><li class="mall-more" title="<%= m.label %> の出品はほかに <%= m.more %> つ">ほか <%= m.more %></li><% } %><% } %>
+          </ul>
+          <% } else { %>
+          <span class="malls-none">出品が見つかりません</span>
+          <% } %>
+        </div>
+        <% } %>
       </div>
       <div class="ph-actions" style="align-items:center">
         <% if (!isSet && c.sku_kind !== 'exception') { %>
@@ -141,11 +160,25 @@
         <a class="btn" href="<%= base %>/sku/<%= encodeURIComponent(c.code) %>/history"><svg class="ic" aria-hidden="true"><use href="#i-history"/></svg>変更の記録</a>
       </div>
     </div>
+    <%# 🆕 10/19 中原さん「グラフとか入出庫履歴とか行くときにスクロールしないといけないからボタンかタブにしてほしい」:
+        画面をタブに分ける (public/me-tabs.js)。基本情報 = 直す欄と保存の箱 / 販売数のグラフ / 入出庫の履歴 (単品は月別のまとめも)。
+        タブの帯は小見出しと一緒に上の帯の下に残る (直す欄の途中からでも 1 回で行ける)。グラフ・履歴はそのタブを初めて開いたときに読む。
+        選んだタブはアドレスの #tab=… に残す (読み込み直す・戻る・前へ / 次へでも同じタブ)。タブを替えても欄の値はそのまま (隠すだけ) %>
+    <% const hasMoves = c.sku_kind === 'single' || isSet; %>
+    <div class="sku-top" id="sku-top">
     <div class="stickyid" id="sku-sticky" hidden>
       <span class="code-pill"><%= c.code %></span><span class="nm"><%= c.name %></span>
       <span class="right"><button class="unsaved" type="button" id="sticky-unsaved" hidden>● 未保存</button>
         <% if (editable('name')) { %><button class="btn sm" type="button" data-name-open>✎ 名前を直す</button><% } %></span>
     </div>
+    <div class="sku-tabs" id="sku-tabs" role="tablist" aria-label="この商品の画面">
+      <button type="button" class="sku-tab on" role="tab" id="tab-basic" data-tab="basic" aria-controls="tp-basic" aria-selected="true"><svg class="ic" aria-hidden="true"><use href="#i-edit"/></svg>基本情報<span class="tab-dirty" id="tab-basic-dirty" hidden><span aria-hidden="true">●</span><span class="sr">未保存の変更あり</span></span></button>
+      <button type="button" class="sku-tab" role="tab" id="tab-sales" data-tab="sales" aria-controls="tp-sales" aria-selected="false" tabindex="-1"><svg class="ic" aria-hidden="true"><use href="#i-cart"/></svg>販売数のグラフ</button>
+      <% if (hasMoves) { %><button type="button" class="sku-tab" role="tab" id="tab-moves" data-tab="moves" aria-controls="tp-moves" aria-selected="false" tabindex="-1"><svg class="ic" aria-hidden="true"><use href="#i-truck"/></svg>入出庫の履歴<% if (!isSet) { %><small>・月別</small><% } %></button><% } %>
+    </div>
+    </div>
+
+    <div class="sku-tp" id="tp-basic" role="tabpanel" aria-labelledby="tab-basic">
 
     <% if (closed) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">いまは保存できません (<%= closedWhy %>)</div><div class="hint">見るだけです。切替日までは、この商品の正は NE・/register です。</div></div></div><% } %>
     <% if (!canEdit) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= gateMessage %></div></div><% } %>
@@ -153,16 +186,11 @@
     <% if (reg === 'draft' && !page.locks.regExports.length) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><div class="t">下書きです (新商品の登録)</div><div class="hint">NE・ロジザードへの登録はまだです。値はこの画面で直せます (ロジザードの有効期限・入荷日の管理も、NE 登録の CSV を配るまでは直せます)。NE への登録は「NE 登録の CSV」で行います。</div></div><a class="btn sm" href="<%= base %>/reg-csv">NE 登録の CSV を開く</a></div><% } %>
     <%# 🆕 0071: 新商品の下書きを消す (下書きのときだけ・DB の確かめの答え = deldraft) %>
     <%- include('_deldraft', { c }) %>
+    <%# 🆕 0098: NE にもう同じ商品がある下書き・NE 登録待ち = 「NE にあるので登録済みにする」(DB の確かめの答え = dine) %>
+    <%- include('_draftinne', { c }) %>
     <% if (cancelled) { %><div class="callout warn" id="cancelled-band"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">この商品は登録をやめました (やめた)</div><div class="hint">登録をやめた商品は直せません (見るだけです)。使うときは、新しい商品として登録し直してください。</div></div></div><% } %>
     <% if (reg === 'quarantined') { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">要確認</div><div class="hint">切替の後に夜間の処理が NE で見つけた、登録の記録の無い商品です。業務ではまだ使えません。</div></div></div><% } %>
-    <% if (page.locks.regExports.length) { %>
-      <div class="callout lock"><svg class="ic l" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow">
-        <div class="t">NE に送った <%= REG_FIELDS.length %> つの欄には鍵がかかっています</div>
-        <div class="hint">NE 登録の CSV (ファイル <%= page.locks.regExports.map((x) => '#' + x).join('・') %>) を配ったので、NE に送った値 (<%= REG_FIELDS.map(labelOf).join('・') %>) はここでは直せません。直したいときは:</div>
-        <ol><li>NE 登録の CSV で そのファイルを「使わない」にする (NE で何をしたかも書く)</li><li>ここで値を直す</li><li>もう一度 CSV を作って配る</li></ol></div>
-        <a class="btn sm" href="<%= base %>/reg-csv">NE 登録の CSV を開く</a></div>
-    <% } %>
-    <% if (page.locks.taxParentCodes.length) { %><div class="callout lock"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow">税率は、この商品を使うセット <%= page.locks.taxParentCodes.join('・') %> の NE 登録の CSV (配った後) にも入っているので直せません。</div></div><% } %>
+    <%# 🆕 0093 (2026-10-19 中原さん): NE 登録の CSV を配った後も、ほかの商品と同じように直せる (案内のカードは出さない)。0093 の前の DB だけ欄が 🔒 (lockWhy) %>
 
     <form class="edit" id="f" onsubmit="return false" novalidate data-token="<%= page.token %>" data-event-id="<%= page.seenEventId %>" data-can-save="<%= canSave ? '1' : '0' %>">
       <div>
@@ -243,6 +271,9 @@
           <% } %>
         </section>
 
+        <%# 🆕 0087 梱包した状態の 縦・横・高さ・重さ (単品だけ・人の値は右の「保存する」で一緒に・出どころの値と食い違いも見せる・部品 = _package.ejs・public/me-package.js) %>
+        <% if (typeof pkg !== 'undefined' && pkg && c.sku_kind === 'single') { %><%- include('_package', { pkg, editable: !!pkg.ready && editable('pkg_length'), lockWhyHtml: pkg.ready ? lockWhy('pkg_length') : '' }) %><% } %>
+
         <section class="panel" aria-labelledby="h-tax">
           <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-percent"/></svg></span><h2 id="h-tax">税・分類</h2></div>
           <%- row('tax_rate', '税率', seg('tax_rate', c.tax_rate == null ? '' : String(c.tax_rate), [['0.08', '8%', '軽減'], ['0.1', '10%', '標準']]) + (c.tax_rate == null ? '<span class="misslabel"><svg class="ic s" aria-hidden="true"><use href="#i-warn"/></svg>まだ入っていません</span>' : ''), taxText(c.tax_rate)) %>
@@ -250,7 +281,7 @@
         </section>
 
         <section class="panel" aria-labelledby="h-sup">
-          <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-building"/></svg></span><h2 id="h-sup">仕入先</h2><span class="right"><a href="/apps/purchase-orders" class="hint">先方品番は 発注アプリ <svg class="ic s" style="vertical-align:-2px" aria-hidden="true"><use href="#i-ext"/></svg></a></span></div>
+          <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-building"/></svg></span><h2 id="h-sup">仕入先</h2><span class="right"><% if (typeof vendorSettings !== 'undefined' && vendorSettings && vendorSettings.canSee) { %><a href="#po-vendor" class="hint">先方品番は 下の「発注の設定」で</a><% } else { %><a href="/apps/purchase-orders" class="hint">先方品番は 発注アプリ <svg class="ic s" style="vertical-align:-2px" aria-hidden="true"><use href="#i-ext"/></svg></a><% } %></span></div>
           <%- row('primary_supplier', '代表の仕入先', '<select class="in w-m" id="f-primary_supplier" ' + meta('primary_supplier') + '>' + (!c.primary_supplier ? '<option value="" selected>(なし)</option>' : '') + page.activeSuppliers.map((s) => '<option value="' + h(s.code) + '"' + (s.code === c.primary_supplier ? ' selected' : '') + '>' + h(s.code) + ' · ' + h(s.name) + '</option>').join('') + (c.primary_supplier && !page.activeSuppliers.some((s) => s.code === c.primary_supplier) ? '<option value="' + h(c.primary_supplier) + '" selected>' + h(c.primary_supplier) + ' (取引停止)</option>' : '') + '</select>', c.primary_supplier ? c.primary_supplier + ' · ' + supName(c.primary_supplier) : 'なし', { forId: 'f-primary_supplier', hint: '選べるのは取引中で、NE への登録の申告が済んだ仕入先だけです' }) %>
           <%# 🆕 0084 メーカー (中原さん 2026-10-17・代表の仕入先のすぐ下)。Company DB だけ (NE・ロジザード・product-hub には送らない)。保存は右の「保存する」と一緒。0084 の前の DB = 出さない %>
           <% if (locals.makerReady) { %>
@@ -259,6 +290,11 @@
           <% } %>
           <div class="f"><div class="lab">この商品の仕入先</div><div class="ctl"><% if (!page.suppliers.length) { %><span class="muted">まだありません</span><% } %><% for (const s of page.suppliers) { %><span class="linkchip"><span class="mono"><%= s.code %></span> <%= s.name %><span class="n2"><%= s.vendor_code ? ' 先方品番 ' + s.vendor_code : '' %><%= s.is_primary ? ' · ★代表' : '' %></span></span><% } %></div></div>
         </section>
+
+        <%# 🆕 0088 ブランド・商品の段階 (中原さん 2026-10-17・単品だけ・別の板 = 部品 _brandlife-sku.ejs)。0088 の前の DB・ロールの流し直しの前 = 出さない %>
+        <% if (!isSet && locals.brandLife) { %><%- include('_brandlife-sku', { c, bl: brandLife, row, meta, editable, canSave, base }) %><% } %>
+        <%# 🆕 0090 表示の項目 (原産国・内容量・メーカー型番・消費期限の目安・単品だけ・人の値は右の「保存する」で一緒に・product-hub の今の値は参考・部品 = _label.ejs・public/me-label.js) %>
+        <% if (typeof label !== 'undefined' && label && c.sku_kind === 'single') { %><%- include('_label', { lb: label, editable: !!label.ready && editable('lbl_country'), lockWhyHtml: label.ready ? lockWhy('lbl_country') : '', suggest: label.suggest || [], uoms: label.uoms || [] }) %><% } %>
 
         <%# 発注の設定 (発注アプリに保存・10/9 中原さん)。Company DB の「保存する」とは別のボタン (部品 = _order.ejs・public/me-order.js) %>
         <% if (orderSettings) { %><%- include('_order', { os: orderSettings, mode: 'sku', dis: '', stepNo: null, base, code: c.code }) %><% } %>
@@ -284,16 +320,19 @@
       <% } else { %>
         <% if (c.component_request) { const rq = c.component_request; const curMap = new Map(c.components.map((x) => [x.code, x.qty])); const reqMap = new Map(rq.rows.map((x) => [x.code, x.qty]));
              const removed = c.components.filter((x) => !reqMap.has(x.code)); const added = rq.rows.filter((x) => !curMap.has(x.code)); const qtyCh = rq.rows.filter((x) => curMap.has(x.code) && curMap.get(x.code) !== x.qty);
-             const todo = [...removed.map((x) => x.code + ' (' + (x.name || '') + ') を外し'), ...added.map((x) => x.code + ' (' + (x.name || '') + ') を ' + x.qty + ' 個 入れ'), ...qtyCh.map((x) => x.code + ' の数を ' + curMap.get(x.code) + ' → ' + x.qty + ' にし')]; %>
+             const todo = [...removed.map((x) => x.code + ' (' + (x.name || '') + ') を外し'), ...added.map((x) => x.code + ' (' + (x.name || '') + ') を ' + x.qty + ' 個 入れ'), ...qtyCh.map((x) => x.code + ' の数を ' + curMap.get(x.code) + ' → ' + x.qty + ' にし')];
+             /* 🆕 0099: 新しいセット (NE 登録の前・今の構成なし) = NE でやることは「NE 登録の CSV を取り込む」 */ const newSet = !c.components.length && c.registration && ['draft', 'ne_pending'].includes(c.registration.state); %>
         <section class="panel" aria-labelledby="h-req">
           <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-layers"/></svg></span><h2 id="h-req">構成の依頼の進み</h2><span class="sub"><%= rq.reason ? '「' + rq.reason + '」 · ' : '' %><%= rq.requested_by %> <%= ui.fmtJst(rq.created_at, { nowMs }) %> · 依頼は保存してすぐには効かず、NE で確かめた後に「今の構成」になります</span></div>
           <ol class="steps" aria-label="構成の依頼の進み">
             <li class="step done"><div class="dot"><svg class="ic s" aria-hidden="true"><use href="#i-check"/></svg></div><div class="t">依頼した</div><div class="s"><%= ui.fmtJst(rq.created_at, { nowMs }) %></div></li>
-            <li class="step cur" aria-current="step"><div class="dot">2</div><div class="t">NE で構成を直す</div><div class="s">NE の画面で</div><span class="here">いまここ</span></li>
+            <li class="step cur" aria-current="step"><div class="dot">2</div><div class="t"><%= newSet ? 'NE に登録する' : 'NE で構成を直す' %></div><div class="s"><%= newSet ? 'NE 登録の CSV で' : 'NE の画面で' %></div><span class="here">いまここ</span></li>
             <li class="step"><div class="dot">3</div><div class="t">翌朝の確かめ</div><div class="s">NE の構成が依頼と同じか</div></li>
             <li class="step"><div class="dot">4</div><div class="t">今の構成になる</div><div class="s">依頼を閉じる</div></li>
           </ol>
+          <% if (newSet) { %><div class="nextline"><svg class="ic" aria-hidden="true"><use href="#i-arrow"/></svg><span class="grow"><b>NE でやること:</b> このセットは「NE 登録の CSV」に入ります。NE に取り込むと、次の朝に確かめて、その夜に「今の構成」になります (構成: <%= compKey(rq.rows) %>)。</span></div><% } else { %>
           <div class="nextline"><svg class="ic" aria-hidden="true"><use href="#i-arrow"/></svg><span class="grow"><b>NE でやること (構成の依頼):</b> <%= todo.length ? todo.join('、') + 'てください。' : '構成品の並びを依頼のとおりにしてください。' %>並びも下の「依頼」のとおりに (依頼した構成: <%= compKey(rq.rows) %> · 今の構成: <%= compKey(c.components) || 'なし' %>)。</span></div>
+          <div class="hint" id="req-how">足す・数を変える = 「<a href="<%= base %>/ne-update">NEへ送る</a>」の「セットの中身の CSV」で送れます (依頼を直したら作り直し、前に作ったファイルは捨ててください)。外す・入れ替えるは NE の画面で直してください (CSV ではできません)。翌朝 NE とそろえば、その夜に今の構成になります</div><% } %>
         </section>
         <% } %>
         <% const BK = { mismatch: 'NE の構成が依頼と違う', stale: '依頼から日がたっても NE の構成が違う', unrequested_diff: '依頼が無いのに NE の構成が今の構成と違う' }; %>
@@ -450,7 +489,7 @@
           <div class="kv">
             <% if (!isSet) { %><div class="row"><span class="k">セット <%= page.usedInCount %> 件<%= page.usedInCount > page.usedIn.length ? ' (' + page.usedIn.length + ' 件を表示)' : '' %></span><span class="v"><% if (!page.usedIn.length) { %><span class="muted">なし</span><% } %><% for (const u of page.usedIn) { %><a class="linkchip" href="<%= base %>/sku/<%= encodeURIComponent(u.code) %>" title="<%= u.name %>"><span class="mono"><%= u.code %></span>×<%= u.qty %></a><% } %></span></div><% } %>
             <div class="row"><span class="k">Amazon SKU</span><span class="v"><% if (page.amazon) { %><a class="linkchip" href="<%= base %>/amazon/?q=<%= encodeURIComponent(c.code) %>"><%= page.amazon %> 件を見る</a><% } else { %><span class="muted">0 件</span><% } %></span></div>
-            <div class="row"><span class="k">NE の待ち</span><span class="v"><% if (page.csvRows.length) { %><span class="b warn">NE に取り込む CSV <%= page.csvRows.length %> 列</span><span class="hint" style="display:block"><%= page.csvRows.map((r) => r.col + (r.child ? '(' + r.child + ')' : '')).join('・') %> · <a href="/apps/master-decisions/csv">マスタの判断 ↗</a></span><% } else if (isSet && c.component_request) { %><span class="b warn">構成の依頼 1 件</span><% } else { %><span class="b ok"><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>なし</span><% } %></span></div>
+            <div class="row"><span class="k">NE</span><span class="v" id="ne-diff"><% if (locals.neDiff && neDiff.count) { %><a href="<%= base %>/ne-update">NE とちがう所が <%= neDiff.count %> つあります → NEへ送る</a><% } else if (locals.neDiff) { %><span class="b ok"><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>NE と同じ</span><% } else { %><span class="hint">—</span><% } %><% if (isSet && c.component_request) { %> <span class="b warn">構成の依頼 1 件</span><% } %></span></div>
           </div>
         </section>
 
@@ -607,6 +646,68 @@
         </section>
       </aside>
     </form>
+    </div>
+    <%# タブ「販売数のグラフ」(初めて開いたときに読む = public/me-sales-chart.js が me:tabshown を待つ) %>
+    <div class="sku-tp" id="tp-sales" role="tabpanel" aria-labelledby="tab-sales" tabindex="0" hidden>
+    <%# 🆕 販売数のグラフ (10/17 中原さん・参考 = 読むだけ)。グラフと表は画面の JS (public/me-sales-chart.js) が API (/api/sku/:code/sales-chart) から読んで描く。
+        単品 = セットで売れた分も入れた数 + ロジザードの在庫の線 (別のグラフ・軸を 2 つにしない) / セット = そのセットとして売れた数 (在庫の線なし) %>
+    <section class="panel moves sc" id="p-sales" aria-labelledby="h-sales" data-base="<%= base %>" data-code="<%= c.code %>" data-kind="<%= c.sku_kind %>">
+      <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-cart"/></svg></span><h2 id="h-sales">販売数のグラフ</h2><span class="sub">参考 · モールの注文の数 (注文日・キャンセルを引いた数)<%= isSet ? ' · このセットとして売れた数' : ' · セットで売れた分も入れた数' %></span></div>
+      <div class="sc-bar">
+        <div class="seg" id="sc-unit" role="group" aria-label="グラフの期間" data-value="week">
+          <button type="button" class="on" aria-pressed="true" data-v="week">週<small>52 週</small></button><button type="button" aria-pressed="false" data-v="month">月<small>24 か月</small></button><button type="button" aria-pressed="false" data-v="day">日<small>90 日</small></button>
+        </div>
+      </div>
+      <div class="hint sc-sum" id="sc-sum" aria-live="polite">読んでいます…</div>
+      <%# 🆕 10/19: 時間切れ (8 秒) のときだけ出す = 押すと長く (30 秒まで) 待って読み直す (public/me-sales-chart.js) %>
+      <div class="sc-retry" id="sc-retry" hidden><button type="button" class="btn soft sm" id="sc-retry-btn">もう一度読む (時間がかかることがあります)</button><span class="sc-wait hint" id="sc-wait" hidden><span class="sc-spin" aria-hidden="true"></span>読み込み中…</span></div>
+      <ul class="sc-legend" id="sc-legend" hidden></ul>
+      <div class="sc-chart" id="sc-chart" tabindex="0" role="group" aria-roledescription="グラフ" aria-label="販売数のグラフ (左右の矢印で期間を選ぶ)" aria-describedby="sc-sum" hidden>
+        <div class="sc-svg" id="sc-sales"></div>
+        <div class="sc-stock-h hint" id="sc-stock-h" hidden></div>
+        <div class="sc-svg" id="sc-stock"></div>
+        <div class="sc-tip" id="sc-tip" aria-hidden="true" hidden></div>
+      </div>
+      <div class="sr" id="sc-live" aria-live="polite"></div>
+      <details class="more sc-table" id="sc-table-box" hidden><summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>表で見る (グラフと同じ数)</summary>
+        <div class="tblwrap"><table class="tbl mv" id="sc-tbl"><caption class="sr">販売数 (新しい順)</caption><thead id="sc-thead"></thead><tbody id="sc-rows"></tbody></table></div>
+      </details>
+      <div class="hint mv-notes" id="sc-notes">数える範囲 = Company DB に注文を入れているモール (楽天・Amazon (FBA も)・Yahoo!・その他 = au PAY・Qoo10・LINE ギフト・メルカリ)。卸・ほかの NE の店・FBA 納品は入りません = 「基本情報」の「売れた数」(商品管理リスト) と少し違います · 今日は入れない (前日まで) · 注文は 2025-01 から (LINE ギフト 2026-02・Qoo10 2026-03 から) = それより前は空欄<%= isSet ? '' : ' · 在庫 = ロジザードの毎日の在庫 (その日の締め・倉庫だけ。FBA の在庫は入りません)' %></div>
+    </section>
+    </div>
+    <%# タブ「入出庫の履歴」(単品 = 初めて開いたときに読む = public/me-moves.js が me:tabshown を待つ / セット = 構成品の画面へのリンク) %>
+    <% if (hasMoves) { %><div class="sku-tp" id="tp-moves" role="tabpanel" aria-labelledby="tab-moves" tabindex="0" hidden><% } %>
+    <%# 🆕 入出庫の履歴と月別のまとめ (CompanyDB構想 26 の PR-1・PR-2・参考 = 読むだけ)。表は画面の JS (public/me-moves.js) が API から読んで描く。
+        単品だけ (セットには在庫が無い = 構成品の画面へ・Q10 = a)。仕入・発注は発注アプリの権限がある人だけ (Q9 = a) %>
+    <% if (c.sku_kind === 'single') { %>
+    <section class="panel moves" id="p-moves" aria-labelledby="h-moves" data-base="<%= base %>" data-code="<%= c.code %>" data-po="<%= poAccess ? '1' : '0' %>">
+      <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-truck"/></svg></span><h2 id="h-moves">入出庫の履歴</h2><span class="sub">参考 · 出荷 (NE の出荷確定)<%= poAccess ? '・仕入 (発注アプリの入荷)' : '' %> · 在庫数はロジザードの毎日の在庫で合わせています</span></div>
+      <div class="hint mv-head" id="mv-head" aria-live="polite">読んでいます…</div>
+      <%# 🆕 10/19 中原さん「下にスクロールするのが長すぎる」: 履歴は高さを決めた枠の中でスクロールする (見出しの行は枠の上に残す・Tab で枠に来て矢印で送れる)。件数は枠の下 (#mv-msg) %>
+      <div class="tblwrap mv-scroll" id="mv-box" tabindex="0" role="region" aria-label="入出庫の履歴の表 (枠の中でスクロール)"><table class="tbl mv" id="mv-tbl"><caption class="sr">入出庫の履歴 (新しい順)</caption>
+        <thead><tr><th scope="col">日時</th><th scope="col">処理</th><th scope="col" class="n">入庫</th><th scope="col" class="n">出庫</th><th scope="col" class="n">在庫数</th><th scope="col">伝票番号</th><th scope="col">店舗・仕入先</th><th scope="col">理由</th><th scope="col">担当者</th></tr></thead>
+        <tbody id="mv-rows"></tbody>
+      </table></div>
+      <div class="mv-foot"><button class="btn sm" type="button" id="mv-more" hidden>もっと前を見る</button><span class="hint" id="mv-msg" aria-live="polite"></span></div>
+      <div class="hint mv-notes">伝票番号: 出荷 = NE の伝票番号 / 仕入 = ロジザードの伝票NO (NE の仕入伝票の番号とは別) · 「<%= '在庫の調整 (ずれ)' %>」= ロジザードの毎日の在庫と、出荷<%= poAccess ? '・仕入' : '' %>の差 (NE の他勘定出庫・棚卸し・返品など。理由は分かりません) · 担当者 = 仕入の CSV を発注アプリに取り込んだ人 (倉庫で受けた人ではありません) · FBA のお客の注文は倉庫の在庫が動かないので入りません</div>
+    </section>
+    <section class="panel moves" id="p-monthly" aria-labelledby="h-monthly">
+      <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-yen"/></svg></span><h2 id="h-monthly">月別のまとめ</h2><span class="sub">参考 · 直近 13 か月 · 受注数 = NE の受注日 · 売上数 = 出荷確定日<%= poAccess ? ' · 仕入数 = 良品数 (入庫日) · 発注数 = 発行した数 (減数・取消は引かない)' : '' %></span></div>
+      <div class="hint" id="mo-head" aria-live="polite">読んでいます…</div>
+      <div class="tblwrap"><table class="tbl mv" id="mo-tbl"><caption class="sr">月別のまとめ</caption>
+        <thead><tr><th scope="col">月</th><th scope="col" class="n">受注数</th><th scope="col" class="n">売上数</th><% if (poAccess) { %><th scope="col" class="n">仕入数</th><th scope="col" class="n">発注数</th><% } %><th scope="col" class="n">受注金額</th><th scope="col" class="n">売上金額</th><% if (poAccess) { %><th scope="col" class="n">仕入金額</th><th scope="col" class="n">発注金額</th><% } %></tr></thead>
+        <tbody id="mo-rows"></tbody>
+      </table></div>
+      <div class="hint mv-notes">空欄 = データの無い月 (0 ではありません): 受注金額・売上金額はまだ出せません (NE の明細の金額を Company DB に送っていない)<%= poAccess ? ' · 仕入・発注は発注アプリを使い始めた 2026-07 から (それより前は NE だけで持っています)' : '' %></div>
+    </section>
+    <% } else if (isSet) { %>
+    <section class="panel moves" id="p-moves" aria-labelledby="h-moves">
+      <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-truck"/></svg></span><h2 id="h-moves">入出庫の履歴</h2></div>
+      <div class="hint" id="mv-set">セットには在庫がありません (在庫は構成品が持ちます)。入出庫の履歴は構成品の画面で見ます<% if (c.components.length) { %>:
+        <% c.components.forEach((x, i) => { %><%= i ? ' · ' : '' %><a class="code" href="<%= base %>/sku/<%= encodeURIComponent(x.code) %>#tab=moves"><%= x.code %></a><% }) %><% } %></div>
+    </section>
+    <% } %>
+    <% if (hasMoves) { %></div><% } %>
     <% if (typeof gone !== 'undefined' && gone && gone.show && gone.canGo && gone.canApprove && !dbError && !closed) { %>
     <div class="modal-bg" id="gone-bg">
       <div class="modal danger" role="alertdialog" aria-modal="true" aria-labelledby="gone-t" aria-describedby="gone-d">
@@ -621,15 +722,19 @@
   <% } %>
   </div>
   <%- include('_footer') %>
+  <%# 🆕 10/19: 画面のタブ (基本情報 / 販売数のグラフ / 入出庫の履歴)。いちばん先 = グラフ・履歴の JS より前に #tab=… のタブを開いておく (開いたタブだけ読む)・me-sku.js が MasterEdit.showTab を使う %>
+  <% if (page) { %><script src="<%= base %>/public/me-tabs.js?v=<%= assetV %>" defer></script><% } %>
   <%# 🆕 PR-7b: まとまりの操作の窓 (名前を直す・子の廃止・代表の採用) %>
   <% if (page && locals.variationOn && canEdit && !closed) { %><%- include('_vops') %><script src="<%= base %>/public/me-vops.js?v=<%= assetV %>" defer></script><% } %>
   <%# 🆕 0084: メーカーの欄 (直せるときだけ・me-sku.js の前 = 未保存の「前 → 後」に名前を出す) %>
-  <% if (page && locals.makerReady && c.sku_kind === 'single' && editable('maker')) { %><script src="<%= base %>/public/me-maker.js?v=<%= assetV %>" defer></script><% } %>
+  <% if (page && c.sku_kind === 'single' && ((locals.makerReady && editable('maker')) || (locals.brandLife && editable('brand')))) { %><script src="<%= base %>/public/me-maker.js?v=<%= assetV %>" defer></script><% } %>
   <% if (page) { %><script src="<%= base %>/public/me-sku.js?v=<%= assetV %>" defer></script><% } %>
   <%# 🆕 10/17: 一覧の前・次の商品へ (離れるときの確認は me-shell.js のリンクの見張りがそのまま効く) %>
   <% if (page) { %><script src="<%= base %>/public/me-prevnext.js?v=<%= assetV %>" defer></script><% } %>
   <%# 🆕 0071: 下書きを消す = 押せる人・押せるときだけ (me-sku.js の後 = 未保存の数を読む) %>
   <% if (page && typeof deldraft !== 'undefined' && deldraft && deldraft.show && deldraft.canGo && canEdit && !dbError && !closed) { %><script src="<%= base %>/public/me-draft-cancel.js?v=<%= assetV %>" defer></script><% } %>
+  <%# 🆕 0098: NE にあるので登録済みにする = 押せる人・押せるときだけ (me-sku.js の後 = 未保存の数を読む) %>
+  <% if (page && typeof dine !== 'undefined' && dine && dine.show && dine.canGo && dine.canApprove && !dbError && !closed) { %><script src="<%= base %>/public/me-draft-in-ne.js?v=<%= assetV %>" defer></script><% } %>
   <%# me-order.js は me-sku.js の後 (MasterEdit.dirty に発注の設定の未保存を足す) %>
   <% if (page && orderSettings && orderSettings.data && orderSettings.data.ok) { %><script src="<%= base %>/public/me-order.js?v=<%= assetV %>" defer></script><% } %>
   <%# me-amclabel.js も me-sku.js の後 (MasterEdit.dirty に AMC ラベルの未保存を足す) %>
@@ -638,7 +743,15 @@
   <% if (page && typeof lzBarcode !== 'undefined' && lzBarcode && lzBarcode.show && !lzBarcode.error && lzBarcode.canWrite) { %><script src="<%= base %>/public/me-lzbarcode.js?v=<%= assetV %>" defer></script><% } %>
   <%# 利益 (1 個あたり) をその場で計算し直す = lib/profit-estimate.js を同じ版で import する (public/me-profit.js) %>
   <% if (page) { %><script src="<%= base %>/public/me-profit.js?v=<%= assetV %>" defer></script><% } %>
+  <%# 🆕 0087: 大きさ・重さの「この値を入れる」(直せるときだけ・欄の数え直しは me-sku.js) %>
+  <% if (page && typeof pkg !== 'undefined' && pkg && pkg.ready && c.sku_kind === 'single' && editable('pkg_length')) { %><script src="<%= base %>/public/me-package.js?v=<%= assetV %>" defer></script><% } %>
+  <%# 🆕 入出庫の履歴と月別のまとめ (単品だけ・読むだけ) %>
+  <% if (page && page.cur.sku_kind === 'single') { %><script src="<%= base %>/public/me-moves.js?v=<%= assetV %>" defer></script><% } %>
+  <%# 🆕 販売数のグラフ (読むだけ・単品とセット) %>
+  <% if (page) { %><script src="<%= base %>/public/me-sales-chart.js?v=<%= assetV %>" defer></script><% } %>
   <%# 🆕 0070: NE から消えた (やめる) = 押せる人・押せるときだけ %>
   <% if (page && typeof gone !== 'undefined' && gone && gone.show && gone.canGo && gone.canApprove && !dbError && !closed) { %><script src="<%= base %>/public/me-gone.js?v=<%= assetV %>" defer></script><% } %>
+  <%# 🆕 0090: 表示の項目の「この値を入れる」(直せるときだけ・欄の数え直しは me-sku.js) %>
+  <% if (page && typeof label !== 'undefined' && label && label.ready && c.sku_kind === 'single' && editable('lbl_country')) { %><script src="<%= base %>/public/me-label.js?v=<%= assetV %>" defer></script><% } %>
 </body>
 </html>

@@ -71,6 +71,7 @@
     if (el.classList.contains('seg')) return segText(el, v);
     if (el.tagName === 'SELECT') { var o = $$('option', el).filter(function (x) { return x.value === v; })[0]; return o ? o.textContent : v; }
     if (el.id === 'f-maker' && ME.maker) return ME.maker.label(v);   // 🆕 0084: 名簿の番号 → 名前 (空 = なし)
+    if (el.id === 'f-brand' && ME.brand) return ME.brand.label(v);   // 🆕 0088: ブランドも同じ
     if (v === '' || v == null) return '(空)';
     var unit = el.getAttribute('data-unit') || '';
     if (unit === ' 円' && intOf(v) != null) return yen(intOf(v)) + unit;
@@ -112,7 +113,7 @@
     if (!isSet && has('handling') && hv('handling') === 'discontinued') {
       if (sets.length) out.push([1, 'この商品を使うセット ' + sets.join('・') + ' も中止になります (構成品が 1 つでも中止ならセットも中止)']);
       if (P.amazon) out.push([1, 'この商品を使う Amazon SKU が ' + P.amazon + ' 件あります (Amazon SKU の対応はそのままです)']);
-      if (!(P.reg === 'draft' || P.reg === 'ne_pending')) out.push([0, 'NE の取扱区分は、翌朝の照合で NE との差になり CSV で入れます']);
+      if (!(P.reg === 'draft' || P.reg === 'ne_pending')) out.push([0, 'NE の取扱区分は「NEへ送る」の画面で CSV を作って NE に取り込みます']);
     }
     if (!isSet && has('handling') && hv('handling') === 'active' && P.handling === 'discontinued' && sets.length) out.push([0, 'セット ' + sets.join('・') + ' の取扱も計算し直します (ほかの構成品も取扱中なら取扱中に戻ります)']);
     if (!isSet && has('tax_rate') && sets.length) out.push([0, 'この商品を使うセット ' + sets.join('・') + ' の税率も計算し直します (変わったら「NE でやること」に出ます)']);
@@ -125,7 +126,7 @@
     var neCsv = keys.filter(function (k) { var el = firstEl(k); return el && el.getAttribute('data-ne') === 'NE へ CSV' && k !== 'handling'; });
     var notInNe = P.reg === 'draft' || P.reg === 'ne_pending';   // 新商品で NE にまだ無い = NE への登録は NE 登録の CSV
     if (neCsv.length && notInNe) out.push([0, '新商品なので、NE への登録は「NE 登録の CSV」で行います (翌朝の照合の差にはなりません)']);
-    else if (neCsv.length) out.push([0, neCsv.map(function (k) { return k === 'cost' ? '原価' : (firstEl(k).getAttribute('data-label') || k); }).join('・') + ' は、翌朝の照合で NE との差になり、マスタの判断の CSV で NE に入れます']);
+    else if (neCsv.length) out.push([0, neCsv.map(function (k) { return k === 'cost' ? '原価' : (firstEl(k).getAttribute('data-label') || k); }).join('・') + ' は「NEへ送る」の画面で CSV を作って NE に取り込みます']);
     var regTouched = keys.filter(function (k) { return (P.regFields || []).indexOf(k) >= 0; });
     if (regTouched.length && (P.regBuilt || []).length) out.push([1, 'まだ配っていない NE 登録の CSV (ファイル ' + P.regBuilt.map(function (x) { return '#' + x; }).join('・') + ') は「使わない」になります (作り直してください)']);
     if (isSet && has('components')) {
@@ -149,6 +150,8 @@
     if (keys.indexOf('exception_cost') >= 0 && !$('#xcost-reason').value.trim()) out.push({ t: '例外原価を変えるときは、その「理由」が要ります', focus: '#xcost-reason' });
     // 🆕 0084 (#maker Codex R1 M): メーカーの名前を打ったが一覧から選んでいない = 保存しない (そのまま送ると今のメーカーを外してしまう)
     if (ME.maker && ME.maker.pending()) out.push({ t: 'メーカーは一覧から選ぶか「新しいメーカーとして登録」を押してください (外すときは欄を空に)', focus: '#f-maker-in' });
+    // 🆕 0088: ブランドも同じ (打っただけで選んでいない = 今のブランドを外してしまう)
+    if (ME.brand && ME.brand.pending()) out.push({ t: 'ブランドは一覧から選ぶか「新しいブランドとして登録」を押してください (外すときは欄を空に)', focus: '#f-brand-in' });
     return out;
   }
 
@@ -377,6 +380,7 @@
     $$('.f.err', scope).forEach(function (f) { f.classList.remove('err'); });
     clearNameError();
     if (ME.maker) ME.maker.sync();   // 🆕 0084: 隠した欄 (名簿の番号) に合わせて、メーカーの名前の欄も戻す
+    if (ME.brand) ME.brand.sync();   // 🆕 0088: ブランドも同じ
     update();
     if (nameBox && !nameBox.hidden) closeName();
     ME.toast('変更を元に戻しました');
@@ -393,7 +397,11 @@
   // 保存 1 回に 1 つ (通信が切れて押し直しても 2 回入らない)。返事が来た後にもう一度保存するときは新しい番号
   var requestId = uuid();
   var FIELDS = isSet ? ['name', 'standard_price', 'set_sales_class_override', 'handling_own', 'shipping_code', 'reorder_months']
-    : ['name', 'handling', 'standard_price', 'tax_rate', 'sales_class', 'primary_supplier', 'shipping_code', 'reorder_months', 'jan', 'expiry_managed', 'inbound_date_managed', 'maker'];   // ロジザードの 2 つは下書きの間だけ欄が出る (無ければ送らない)・🆕 0084 のメーカー (隠した欄 = 名簿の番号・空 = 外す・欄が無い = 送らない)
+    : ['name', 'handling', 'standard_price', 'tax_rate', 'sales_class', 'primary_supplier', 'shipping_code', 'reorder_months', 'jan', 'expiry_managed', 'inbound_date_managed', 'maker',
+      'pkg_length', 'pkg_width', 'pkg_height', 'pkg_weight'];   // ロジザードの 2 つは下書きの間だけ欄が出る (無ければ送らない)・🆕 0084 のメーカー (隠した欄 = 名簿の番号・空 = 外す・欄が無い = 送らない)・🆕 0087 梱包の大きさ・重さは 0087 があって直せるときだけ欄が出る
+  // 🆕 0088: ブランド (隠した欄 = 名簿の番号・空 = 外す)・区分・終売の予定日 (単品だけ・欄が無い = 送らない)
+  if (!isSet) FIELDS = FIELDS.concat(['brand', 'life_stage', 'end_planned_on']);
+  if (!isSet) FIELDS = FIELDS.concat(['lbl_country', 'lbl_net', 'lbl_net_uom', 'lbl_model', 'lbl_shelf']);   // 🆕 0090 表示の項目 (0090 があって直せるときだけ欄が出る・無ければ送らない)
   function collect() {
     var values = {};
     FIELDS.forEach(function (f) {
@@ -478,6 +486,7 @@
     box.innerHTML = savedHtml(n.j);
     var ph = $('#sku-ph'); if (ph && ph.parentNode) ph.parentNode.insertBefore(box, ph.nextSibling); else form.parentNode.insertBefore(box, form);
     $('#saved-note-close').addEventListener('click', function () { box.remove(); });
+    if (ME.showTab) ME.showTab('basic');   // 🆕 10/19: 保存の後に読み直したら基本情報のタブ (戻るの見張りで前の #tab に戻っていても)
     var ch = Array.isArray(n.j.changed) ? n.j.changed : [];
     ME.toast('保存しました' + (ch.length ? ' (' + changeText(ch[0]) + (ch.length > 1 ? ' ほか ' + (ch.length - 1) + ' 件' : '') + ')' : ''));
   }
@@ -525,6 +534,8 @@
   }
   function doSave() {
     if (!saveBtn || saveBtn.disabled || busy) return;
+    // 🆕 10/19: グラフ・履歴のタブで Ctrl+S = 基本情報のタブに戻してから (保存の箱・断られた欄が見える)
+    if (ME.showTab) ME.showTab('basic');
     // JAN の欄に打ったままなら、先に札にする (Ctrl+S は欄を離れない = blur が来ない)。札にできなければ保存しない (#1589 Codex R2 M1)
     if (janPending()) {
       if (!janAdd(janIn.value)) { msg('JAN の欄を直してから保存してください (何も保存していません)', 'err'); janIn.focus(); return; }
@@ -547,6 +558,7 @@
           return;
         }
         msg('', 'err');
+        if (ME.showTab) ME.showTab('basic');   // 返事を待つ間に別のタブへ移っていても、断られた理由と欄を見せる
         var reopen = showError(x.j, x.r.status);
         requestId = uuid();   // 返事が来た = この番号の保存は終わった。直してもう一度保存するときは新しい番号
         if (reopen) mustReload = true;
@@ -561,6 +573,7 @@
   var box = $('#savebox'), boxToggle = $('#savebox-toggle');
   function review() {
     if (!box) return;
+    if (ME.showTab) ME.showTab('basic');   // 🆕 10/19: 未保存の札・離れるときの「変更内容を確認する」= 基本情報のタブの保存の箱へ
     box.classList.add('open'); if (boxToggle) boxToggle.setAttribute('aria-expanded', 'true');
     box.scrollIntoView({ behavior: 'smooth', block: 'center' });
     var need = lastState.need && lastState.need[0];
@@ -573,7 +586,7 @@
   ME.onSave = canSave ? function () {
     if (saveBtn && !saveBtn.disabled) { doSave(); return; }
     if (lastState.need && lastState.need.length) { review(); ME.toast(lastState.need[0].t); return; }
-    if (mustReload) { ME.toast('この画面は古くなりました。「画面を開き直す」を押してください'); var rb = $('#reload'); if (rb) rb.focus(); return; }
+    if (mustReload) { if (ME.showTab) ME.showTab('basic'); ME.toast('この画面は古くなりました。「画面を開き直す」を押してください'); var rb = $('#reload'); if (rb) rb.focus(); return; }
     ME.toast(saved ? '保存しました。保存した後の値を読み直しています' : '保存する変更がありません');
   } : null;
 

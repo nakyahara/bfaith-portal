@@ -59,6 +59,7 @@ import {
 import { syncDraftLinks } from '../product-links/sync.js';
 import { parseDriveLink, thumbnailUrl, fileViewUrl, THUMB_WIDTHS, DRIVE_FILE_ID_PATTERN } from './lib/drive-link.js';
 import { backLinkOf } from './lib/back-link.js';
+import { boardThemeOf, saveBoardTheme } from './lib/board-theme.js';
 // セットの画像計画の語彙 (§4.7)。画面と依頼書で同じ言葉を使う
 import {
   SET_IMAGE_ACTIONS, SET_IMAGE_ACTION_LABELS, productionInstructions, imageSortOfSlot,
@@ -74,7 +75,7 @@ import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, newKindOfCode, MAX_REGISTER_CODES } from './services/new-product-intake.js';
 // Company DB の「新商品の登録」から作るカード (2026-10-01・Company DB構想 14 ⑤-2a)。知らせ (outbox) の取り込みと、新規作成の入口の切り替え
 import { applyCdbCardEvent, cdbShippingCheckIds } from './services/cdb-card-intake.js';
-import { setPlanDraftAges, setCodeHeld } from './services/cdb-set-plan.js';
+import { setPlanDraftAges, setCodeHeld, liveTakeoverOf } from './services/cdb-set-plan.js';
 import { SET_PLAN_ALERT_DAYS } from '../../lib/set-plan.mjs';
 // 🆕 まとまり (色違い・サイズ違い) のカード (Company DB構想 20 v7 §⑤・PR-4): 取り込み・「要確認」・状態 (NE の写し待ち / 2 軸 = 出品の門)
 import { applyCdbGroupEvent, ackCdbGroupAttention } from './services/cdb-group-intake.js';
@@ -120,7 +121,7 @@ import { photoSource, driveDownload } from '../inbound-check/back-label.js';
 import {
   transferImagesToCabinet, buildItemPayload, registerItem, parseAttributes,
   setItemVisibility,
-  fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, listDriveFolderMaterialImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState, buildDescriptionPreview, rakutenItemPageUrl, rakutenRmsItemUrl,
+  fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, listDriveFolderMaterialImages, MATERIAL_SCAN_LIMITS, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState, buildDescriptionPreview, rakutenItemPageUrl, rakutenRmsItemUrl,
   importSkuImagesFromFolder, transferSkuImagesToCabinet, syncSkuImagesToRms,
   getDriveThumbnail, SHIPPING_BANNER_LOCATIONS, COMMON_TRAILING_BANNERS, cabinetImageUrl, effectiveShippingForDraft,
   isValidGtin, MODEL_ATTR_NAME, skuAttributeGrid, genreIdFromItemUrl,
@@ -154,7 +155,7 @@ import {
 import {
   lpComposeEnabled, importSpec as importLpSpec, latestSpec as latestLpSpec, specSummary as lpSpecSummary, SPEC_KIND_LABELS as LP_SPEC_KIND_LABELS,
   requestJob as requestLpComposeJob, requestBlockReason as lpComposeBlockReason, requestPrecheck as lpComposeRequestPrecheck,
-  queueSummary as lpComposeQueueSummary, claimJob as claimLpComposeJob,
+  folderMaterials as lpComposeFolderMaterials, queueSummary as lpComposeQueueSummary, claimJob as claimLpComposeJob,
   reserveGeneration as reserveLpComposeGeneration, submitResult as submitLpComposeResult,
   failJob as failLpComposeJob, releaseJob as releaseLpComposeJob,
   lpComposeImageRef, recordImageServed as recordLpComposeImageServed, imagePlan as lpComposeImagePlan, recordModelCheck as recordLpComposeModelCheck, jobStateFor as lpComposeStateFor, LP_COMPOSE_IMAGE_WIDTH, MAX_PRODUCT_IMAGES as LP_COMPOSE_MAX_PRODUCT_IMAGES,
@@ -181,6 +182,8 @@ import { masterLegacyGate, legacyBannerHtml, legacyNewKindNoticeHtml, refuseLega
 import { resolveCdbDraftTax } from './services/cdb-tax-rate.mjs';
 import { resolveListingTax } from './services/listing-tax.mjs';
 import { compareJanUnits, janUnitsForDraftId, boardJanMarks, parseBoardDraftIds, janWarningsOf, readCdbJans, JAN_READ_DEADLINE_MS } from './services/cdb-jan-compare.mjs';
+// 🆕 0090 表示の項目を商品マスタと比べる (Company DB構想 27 ④-2・読むだけ)
+import { compareDraftLabels } from './services/cdb-label-compare.mjs';
 import {
   janEnforceOn, listingJanUnits, resolveListingJans, janLinkNotices, pickViewOf, verifySelection, enforceForecast, looseJan, JAN_ENFORCE_ENV, JAN_GATE_PROBLEMS,
 } from './services/listing-jan.mjs';
@@ -2857,6 +2860,20 @@ router.post('/api/drafts/:id/sku-prices', (req, res) => {
   res.json({ ok: true });
 });
 
+// 🆕 0090 表示の項目 (原産国・内容量・メーカー型番・消費期限の目安) を商品マスタ (Company DB) と比べる印 (Company DB構想 27 ④-2・読むだけ)。
+//    詳細画面が開いた後に読む (画面の表示を Company DB で待たせない)。Company DB も product-hub の SQLite も書かない (「マスタの値を入れる」は画面の欄に入れるだけ)。
+//    読めないときも 200 で「読めない」を返す
+router.get('/api/drafts/:id/label-check', async (req, res) => {
+  const deadlineAt = Date.now() + JAN_READ_DEADLINE_MS;
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  try {
+    res.json(await compareDraftLabels(getDB(), draft, { deadlineAt }));
+  } catch (e) {
+    res.json({ ok: true, readable: false, ready: true, reason: String((e && e.message) || e).slice(0, 160), mode: null, units: [], items: null, set: null, kids: null, summary: { severity: 'muted', label: '読めない' } });
+  }
+});
+
 // 🆕 JAN を Company DB と比べる印 (Company DB構想 21 §5 B1・読むだけ)。詳細画面が開いた後に読む (画面の表示を Company DB で待たせない)。
 //    単品 = 出品の商品コード ↔ product_drafts.jan_code / まとまり = 子の SKU ごと ↔ draft_sku_jans (楽天に送る値と同じ決め方)。
 //    Company DB も product-hub の SQLite も書かない。読めないときも 200 で「読めない」の印を返す
@@ -3392,6 +3409,8 @@ router.get('/board', (req, res, next) => { sweepCdbCards().then(() => next()); }
   const neCount = neRegistrationCount(db);
   res.render(view('board.ejs'), {
     title: '工程ボード',
+    // 背景 (黒 / 白) は人ごと (2026-10-19)。鍵 = ログインのメール
+    boardTheme: boardThemeOf(db, req.session?.email),
     displayName: req.session?.displayName || req.session?.email || '',
     board,
     boardView,
@@ -3690,6 +3709,19 @@ router.post('/api/board/reorder', (req, res) => {
     const r = saveBoardOrder(getDB(), { view: req.body?.view, col: req.body?.col, items });
     res.json({ ok: true, saved: r.saved });
   } catch (e) { workflowError(res, e); }
+});
+
+// ボードの背景 (黒 / 白) を自分の分だけ保存する (2026-10-19 中原さん要望「アカウントごとに」)。
+// 鍵はセッションのメール = 本文に人の名前は受けない。見た目だけなので履歴 (draft_events) には残さない
+router.post('/api/board/theme', (req, res) => {
+  try {
+    const theme = saveBoardTheme(getDB(), req.session?.email, String(req.body?.theme ?? ''));
+    res.json({ ok: true, theme });
+  } catch (e) {
+    if (e && (e.status === 400 || e.status === 403)) return res.status(e.status).json({ ok: false, error: e.message });
+    console.error(`[product-hub] ボードの背景を保存できない: ${e && e.message}`);
+    res.status(500).json({ ok: false, error: '背景の設定を保存できませんでした' });
+  }
 });
 
 // TOP画像の重要度 (どれぐらい力を入れて作るかの目安)。現場の目安情報なので誰でも変更可・履歴は残す
@@ -4028,6 +4060,14 @@ router.post('/api/drafts/:id/set-code', (req, res) => {
   const db = getDB();
   if (draft.provisional_code !== 1) {
     return res.status(400).json({ ok: false, error: 'この商品の商品コードは仮ではありません' });
+  }
+  // 🆕 2026-10-21: Company DB の商品に結んだカード (マスタの入力でセットとして登録して引き継いだ下書きなど) = コードは Company DB と同じでないといけない = ここでは変えない
+  if (draft.cdb_sku_id != null) {
+    return res.status(400).json({ ok: false, error: 'このカードはマスタの入力で登録した商品に結んであるので、ここでは商品コードを変えられません (コードはマスタの入力の商品の画面で確かめてください)' });
+  }
+  //   🆕 Codex R1 Medium: マスタの入力でこのカードを引き継ぐセットの登録が動いている (予約あり・カードの取り込み待ち) = 変えない (変えると引き継げない)
+  if (liveTakeoverOf(draft.id, { db })) {
+    return res.status(409).json({ ok: false, error: 'マスタの入力でこのカードを引き継ぐセットの登録をしているところなので、いまは商品コードを変えられません (少し待ってから画面を開き直してください)' });
   }
   // 出品先を決める不可逆な操作なので、担当者本人か admin だけに許す (Codex R1 high)。
   // セット企画者はセットの NE登録工程を動かせる (§4.1) ので、本コードの入力もできないと
@@ -4369,7 +4409,22 @@ function lpComposeInitialState(db, draft) {
     // 押したときに素材 (画像フォルダの下のフォルダ) を読むか。読むのは押したときだけ (ここでは Drive を読まない)
     materials_folder: parseDriveLink(draft.drive_folder_url)?.type === 'folder',
     spec: lpSpecSummary(db, 'product_analysis'),
+    shoot_sheet_info: lpComposeShootSheetInfo(db, draft),
   };
+}
+
+/**
+ * 撮影指示書の案内 (どの構成から何カット)。構成ができたら、読み直さなくても撮影指示書の欄の案内を書き換える
+ * (2026-10-21 スタッフ要望: 構成を作った直後も「LP構成がまだ無い」と出たまま)。文は shootSheetStateFor と同じ
+ */
+function lpComposeShootSheetInfo(db, draft) {
+  try {
+    const ip = db.prepare('SELECT * FROM draft_image_production WHERE draft_id = ?').get(draft.id) || null;
+    return shootSheetStateFor(db, draft, ip).infoText;
+  } catch (e) {
+    console.error('[product-hub] 撮影指示書の案内:', String(e?.message || e).slice(0, 200));
+    return null;
+  }
 }
 
 // 誰でも押せる (中原さん 2026-10-01。既存の定型文ボタンと同じ扱い)。
@@ -4381,7 +4436,7 @@ router.post('/api/drafts/:id/lp-compose', async (req, res) => {
   if (!draft) return;
   const db = getDB();
   const spec = latestLpSpec(db, 'product_analysis');
-  const { productInfo, colorVariations, images } = lpComposeMaterial(db, draft);
+  const { productInfo, colorVariations, images, skuLabels } = lpComposeMaterial(db, draft);
   // 素材画像 = 商品の画像フォルダの**サブフォルダ (何階層下でも)** の画像 (2026-10-02 中原さん)。
   // 押したときに 1 回だけ Drive を読み、packet に固定する (画面のポーリング GET では読まない)。
   // 同じキーの再送は前の依頼を返すだけなので読まない (Drive が一時的に落ちていても再送は通る)。
@@ -4391,22 +4446,29 @@ router.post('/api/drafts/:id/lp-compose', async (req, res) => {
   const pre = lpComposeRequestPrecheck(db, { draft, productInfo, spec, images, idempotencyKey: req.body?.idempotency_key });
   if (pre?.code) return res.status(lpReqStatus(pre.code)).json({ ok: false, code: pre.code, error: pre.error });
   let materials = [];
+  let folderFiles = null;
   const folder = parseDriveLink(draft.drive_folder_url);
   if (!pre?.prior && folder && folder.type === 'folder') {
     try {
-      materials = (await listDriveFolderMaterialImages(folder.id)).map((m) => ({
-        file_id: m.id, drive_modified_time: m.modifiedTime, role: 'material', name: m.name, folder: m.folder,
-      }));
+      // フォルダ直下も読む (2026-10-21 スタッフ要望): 直下の商品画像の枠 (商品コード_00 / _top / _番号) 以外の画像
+      // (色別の nabesiki-be.jpg など) は画像タブにも素材にも入らず、AI が「1 色分しかない」と判定していた。
+      // 枠の画像は画像タブ (draft_images) から渡しているので、枠以外だけを素材として先頭に足す
+      // 直下も素材の一覧と同じ時間の上限で読む (Drive が止まっていても押した画面をぶら下げない・Codex)
+      const [rootFiles, subFiles] = await Promise.all([
+        listDriveFolderImages(folder.id, { deadlineMs: MATERIAL_SCAN_LIMITS.deadlineMs }),
+        listDriveFolderMaterialImages(folder.id),
+      ]);
+      ({ materials, folderFiles } = lpComposeFolderMaterials({ rootFiles, subFiles, neCode: draft.ne_code, skuLabels }));
     } catch (e) {
       console.error('[product-hub] lp-compose materials failed:', draft.id, String(e?.message || e).slice(0, 300));
       return res.status(502).json({
         ok: false, code: 'materials_unavailable',
-        error: '素材画像 (画像フォルダの下のフォルダ) を Drive から読めませんでした: ' + String(e?.message || e).slice(0, 160) + ' — もう一度押してください',
+        error: '画像フォルダの画像を Drive から読めませんでした: ' + String(e?.message || e).slice(0, 160) + ' — もう一度押してください',
       });
     }
   }
   const r = requestLpComposeJob(db, {
-    draft, productInfo, colorVariations, images: [...images, ...materials], spec,
+    draft, productInfo, colorVariations, images: [...images, ...materials], spec, folderFiles,
     idempotencyKey: req.body?.idempotency_key, actor: actorOf(req),
   });
   if (!r.ok) return res.status(lpReqStatus(r.code)).json({ ok: false, code: r.code, error: r.error });
@@ -4437,6 +4499,7 @@ router.get('/api/drafts/:id/lp-compose', (req, res) => {
     materials_folder: parseDriveLink(draft.drive_folder_url)?.type === 'folder',
     // 「仕様書: ○○ (YYYY-MM-DD 取込)」。古ければ人が上げ直す (設計 §4.1 のアップロード忘れ対策)
     spec: lpSpecSummary(db, 'product_analysis'),
+    shoot_sheet_info: lpComposeShootSheetInfo(db, draft),
   });
 });
 
@@ -4731,7 +4794,15 @@ function lpComposeMaterial(db, draft) {
       ? [{ drive_file_id: wb.white_bg_drive_file_id, drive_modified_time: wb.white_bg_modified_time, role: 'white_bg' }] : []),
     ...rows.map((r) => ({ drive_file_id: r.drive_file_id, drive_modified_time: r.drive_modified_time, role: 'slot:' + (Number(r.sort) + 1) })),
   ];
-  return { productInfo, colorVariations, images };
+  // SKU の商品コード (小文字) → 色・種類名 (カラバリの行と同じ値)。画像フォルダの「商品コード.jpg」が何色の写真かを AI に伝える (2026-10-21)
+  const skuLabels = new Map();
+  for (const m of (variation?.kind === 'variation' ? (variation.members || []) : [])) {
+    const key = String(m.商品コード || '').trim().toLowerCase();
+    if (!key) continue;
+    const label = String(selectorValues[key] || '').trim() || String(m.商品名 || '').trim();
+    if (label) skuLabels.set(key, label);
+  }
+  return { productInfo, colorVariations, images, skuLabels };
 }
 
 // ─── LP 構成の AI 生成 (段階1・2026-10-01) ───────────────────────

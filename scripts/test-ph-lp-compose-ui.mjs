@@ -247,7 +247,7 @@ console.log('⑥c 🚨 商品画像が無ければ押す前に止める (2026-10
   const pk2 = JSON.parse(db.prepare('SELECT packet_json FROM ph_lp_compose_jobs WHERE draft_id = ? ORDER BY id DESC LIMIT 1').get(d4).packet_json);
   eq(pk2.images.map((im) => im.file_id), ['FILEIDWHITE01', 'FILEIDTOP004'], '白抜きが先頭・続けて TOP・重複は 1 回');
   eq(pk2.images.map((im) => im.role), ['white_bg', 'slot:1'], '🚨 画像に役割が残る (白抜き / 画像タブの番号・codex #1592 Medium)');
-  eq(pk2.packet_version, 6, 'packet の版 = 6 (撮影判定の仕様書 PR-C2)');
+  eq(pk2.packet_version, 7, 'packet の版 = 7 (6 = 撮影判定の仕様書 PR-C2・7 = 画像フォルダの全画像)');
   db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE draft_id = ?`).run(d4);
 
   console.log('⑥e 白抜き + 商品画像 6 枚 → 白抜き + 1〜5 (合わせて 6 枚)・画面に並びが出る (codex #1592 High・Low)');
@@ -298,7 +298,7 @@ console.log('⑥c 🚨 商品画像が無ければ押す前に止める (2026-10
   db.prepare('UPDATE product_drafts SET drive_folder_url = ? WHERE id = ?').run('https://drive.google.com/drive/folders/1MtcKdnRZPf1iqKiNxMJ1ODDPJE3vX9JR', d4);
   const sF = embedded((await getDetail(d4)).html);
   eq(sF.materials_folder, true, '画像フォルダがあれば「押したときに素材を読む」が画面に渡る');
-  ok(lpcImagesText(sF, false).includes('+ 素材 (画像フォルダの下のフォルダから最大 10 枚・押したときに読む)'), '押す前の案内に素材のことが出る');
+  ok(lpcImagesText(sF, false).includes('+ 素材 (画像フォルダの、商品画像の枠以外の画像 (色別の画像・中のフォルダ) から最大 10 枚・押したときに読む)'), '押す前の案内に素材のことが出る');
   // 🚨 Drive が読めなければ依頼を作らない (素材なしで作った結果を素材ありと同じ測定に混ぜない)
   const savedKey = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
   delete process.env.GOOGLE_SERVICE_ACCOUNT_KEY;

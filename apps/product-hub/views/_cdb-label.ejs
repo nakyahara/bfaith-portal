@@ -1,0 +1,112 @@
+<%#
+  🆕 0090 表示の項目 (原産国・内容量・メーカー型番・消費期限の目安) を商品マスタ (Company DB) と比べる箱 (Company DB構想 27 ④-2・中原さんの決定 Q6 = a)。
+  画面を開いた後に /label-check を読んで出す (画面の表示は待たせない・読むだけ)。「マスタの値を入れる」= この画面の欄に入れるだけ
+  (ページ表記は今の自動保存で保存される・型番は楽天のタブ (カテゴリ・属性) の保存で保存される)。黙って上書きはしない。
+  渡す値: draftId
+%>
+<div id="cdb-label-box" class="cdb-label-box" aria-live="polite" hidden
+     style="border:1px solid #e5e7eb; border-radius:8px; padding:8px 12px; margin:8px 0 12px; background:#f9fafb; font-size:13px;">
+  <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+    <strong>商品マスタ (Company DB) の値</strong>
+    <span id="cdb-label-summary"></span>
+    <span class="muted" style="font-size:12px;">原産国・内容量・メーカー型番・消費期限の目安の正本はマスタの入力の商品の画面です · 違っても止めません (知らせだけ)</span>
+  </div>
+  <div id="cdb-label-body" style="margin-top:6px; overflow-x:auto;"></div>
+  <div id="cdb-label-note" class="muted" style="font-size:12px; margin-top:4px;"></div>
+</div>
+<script>
+(() => {
+  const box = document.getElementById('cdb-label-box');
+  if (!box) return;
+  const URL_ = '/apps/product-hub/api/drafts/<%= draftId %>/label-check';
+  const body = document.getElementById('cdb-label-body');
+  const note = document.getElementById('cdb-label-note');
+  const summary = document.getElementById('cdb-label-summary');
+  const COLORS = { warn: '#b45309', info: '#2563eb', muted: '#6b7280', ok: '#15803d', none: '#6b7280' };
+  const el = (tag, attrs, ...kids) => {
+    const e = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs || {})) { if (k === 'style') e.style.cssText = v; else if (k === 'text') e.textContent = v; else e.setAttribute(k, v); }
+    for (const k of kids) if (k != null) e.append(k);
+    return e;
+  };
+  const badge = (sev, text) => (text ? el('span', { style: `color:${COLORS[sev] || '#374151'}; font-weight:600;`, text }) : null);
+  /** 欄に値を入れて、今の自動保存・数え直しを動かす (input / change) */
+  const put = (id, v) => {
+    const e = document.getElementById(id);
+    if (!e) return false;
+    e.value = v;
+    e.dispatchEvent(new Event('input', { bubbles: true }));
+    e.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  };
+  const putCountry = (p) => put('pi-origin-type', p.origin_type) && put('pi-origin-country', p.origin_country);
+  const useBtn = (label, fn, after) => {
+    const b = el('button', { type: 'button', class: 'btn btn-sm cdb-label-use', text: label });
+    b.addEventListener('click', () => {
+      const ok = fn();
+      note.textContent = ok ? after : '欄が見つからないので入れられませんでした';
+      if (ok) setTimeout(load, 2500);   // 自動保存の後にもう一度比べる
+    });
+    return b;
+  };
+  const AFTER_PI = 'ページ表記の欄に入れました (自動で保存されます)';
+  const AFTER_RK = '楽天のタブ (カテゴリ・属性) のメーカー型番の欄に入れました。保存はそのタブの「カテゴリ・属性を保存」で';
+  const row = (name, it, act) => {
+    const tr = el('tr', {},
+      el('th', { style: 'text-align:left; padding:2px 8px 2px 0; white-space:nowrap; font-weight:500;', text: name }),
+      el('td', { style: 'padding:2px 8px;' }, it.master ? el('span', { text: it.master }) : el('span', { class: 'muted', text: '—' }), it.master && it.masterWords ? el('span', { class: 'muted', text: ` (${it.masterWords})` }) : null),
+      el('td', { style: 'padding:2px 8px;' }, it.ph ? el('span', { text: it.ph }) : el('span', { class: 'muted', text: '(空)' })),
+      el('td', { style: 'padding:2px 8px;' }, badge(it.severity, it.label), it.detail ? el('span', { class: 'muted', text: ` ${it.detail}` }) : null),
+      el('td', { style: 'padding:2px 0;' }, act && it.put && it.state !== 'match' && it.state !== 'not_comparable' ? act : null));
+    tr.setAttribute('data-label-item', name);
+    tr.setAttribute('data-state', it.state || '');
+    return tr;
+  };
+  const head = () => el('tr', {}, ...['項目', '商品マスタ', 'この画面', '印', ''].map((t) => el('th', { style: 'text-align:left; padding:2px 8px 2px 0; font-weight:600; color:#6b7280;', text: t })));
+  function render(j) {
+    body.replaceChildren(); note.textContent = ''; summary.replaceChildren();
+    if (!j || !j.ok || j.readable === false) { box.hidden = false; summary.append(badge('muted', '読めない')); note.textContent = `商品マスタを読めませんでした (${(j && j.reason) || '分からない'})。少し待って開き直してください`; return; }
+    if (j.ready === false || !j.mode) { box.hidden = true; return; }
+    box.hidden = false;
+    if (j.summary && j.summary.label) summary.append(badge(j.summary.severity, j.summary.label));
+    if (j.mode === 'set') {
+      const s = j.set || {};
+      if (s.country) {
+        const it = { master: `${s.country} (構成品が全部同じ・参考)`, ph: '', state: s.state, severity: s.state === 'differs' ? 'warn' : s.state === 'ph_empty' ? 'info' : s.state === 'match' ? 'ok' : 'muted',
+          label: { match: '一致', differs: '構成品の原産国と違う', ph_empty: 'product-hub は空', not_comparable: '比べられない' }[s.state] || '', put: s.put };
+        const t = el('table', { style: 'border-collapse:collapse;' }, head(), row('原産国', it, useBtn('マスタの値を入れる', () => putCountry(s.put), AFTER_PI)));
+        body.append(t);
+      }
+      note.textContent = 'セットは商品マスタに原産国・内容量・型番を持ちません (構成品から)。内容量・型番はセットの数で変わるので、ここでは出しません' + (s.note ? ` · ${s.note}` : '');
+      return;
+    }
+    const I = j.items || {};
+    const t = el('table', { style: 'border-collapse:collapse;' }, head());
+    if (I.country) t.append(row('原産国', I.country, useBtn('マスタの値を入れる', () => putCountry(I.country.put), AFTER_PI)));
+    if (I.net) t.append(row('内容量', I.net, useBtn('マスタの値を入れる', () => put('pi-volume', I.net.put), AFTER_PI)));
+    if (I.model) t.append(row('メーカー型番', I.model, useBtn('マスタの値を入れる', () => put('rk-article', I.model.put), AFTER_RK)));
+    if (I.shelf) t.append(row('消費期限の目安', { master: `${I.shelf.value} 日`, masterWords: I.shelf.words, ph: '', state: 'info', severity: 'none', label: '', detail: 'product-hub に欄はありません (参考・製造 (入荷) からの日数)' }, null));
+    body.append(t);
+    if (j.kids && j.kids.length) {
+      const ul = el('ul', { style: 'margin:4px 0 0; padding-left:18px;' });
+      for (const k of j.kids) {
+        const parts = [k.country ? k.country.value : '原産国 —', k.net ? k.net.text : '内容量 —', k.model ? `型番 ${k.model.value}` : '型番 —'];
+        ul.append(el('li', {}, el('span', { class: 'mono', text: k.code }), el('span', { text: ` : ${k.missing ? '商品マスタに無い' : parts.join(' · ')}` })));
+      }
+      body.append(el('div', { class: 'muted', style: 'font-size:12px; margin-top:4px;', text: 'まとまりの子ごとの商品マスタの値 (原産国・内容量は全部の子で同じときだけ「入れる」を出します · 型番は SKU ごとの表で)' }), ul);
+    }
+  }
+  let running = null;
+  async function load() {
+    if (running) return running;
+    running = (async () => {
+      try {
+        const r = await fetch(URL_, { headers: { Accept: 'application/json' } });
+        render(r.ok ? await r.json() : { ok: false, reason: `HTTP ${r.status}` });
+      } catch (e) { render({ ok: false, reason: '通信できませんでした' }); }
+    })().finally(() => { running = null; });
+    return running;
+  }
+  load();
+})();
+</script>

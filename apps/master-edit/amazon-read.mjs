@@ -622,9 +622,12 @@ const HIRA_CLASS = `[${HIRA_CHARS}]`;
  *     名前のかなの同一視は search-fold.mjs の foldSql と同じ答え (NFKC・小文字・ひらがな → カタカナ) を、1 行に 1 回だけ作る (言葉が増えても作り直さない)。
  *     translate (ひらがな → カタカナ) は重い (本物の PG・8,000 件で 1 回 70ms ほど) = ひらがなを含む名前だけにかける (含まなければ translate しても同じ = 答えは変わらない)
  * stock = readWarehouseStock() の結果 (読めない = null)。単品・例外だけ在庫 (ロジザード) を付ける (セットは null)
+ * 🆕 2026-10-21 forSet = 新商品の登録 (セット) の構成品の候補。決まりは保存の確かめ (lib/master-register.mjs resolveNewComponents) と同じ =
+ *   単品だけ・登録をやめた (cancelled)・要確認 (quarantined) の商品は出さない (コードをぴったり打っても。打ったコードは画面の引き当て /api/lookup が理由を出す)。
+ *   登録の状態が無い (切替の前の) 単品は使える = 出す。出す物は全部 usable
  * 戻り値 { items: [{ code, name, kind, kind_label, reg_state, handling, usable, why, stock }], more, short }
  */
-export async function searchMapComponents(db, q, { limit = COMPONENT_SEARCH_LIMIT, stock = null } = {}) {
+export async function searchMapComponents(db, q, { limit = COMPONENT_SEARCH_LIMIT, stock = null, forSet = false } = {}) {
   const text = String(q ?? '').trim();
   if ([...text].length < COMPONENT_SEARCH_MIN) return { items: [], more: false, short: true };
   if (text.length > COMPONENT_SEARCH_Q_MAX) return { items: [], more: false, short: false, too_long: true };   // 入口 (router) でも 400。黙って切らない
@@ -658,7 +661,7 @@ export async function searchMapComponents(db, q, { limit = COMPONENT_SEARCH_LIMI
       select b.code, b.code_norm, b.name, b.sku_kind, b.handling, r.state as reg_state, coalesce(b.product_id in (select entity_id from jan), false) as jan_hit
         from b left join ops.master_registrations r on r.sku_id = b.sku_id
        where ((${conds.join(' and ')}) or b.product_id in (select entity_id from jan))
-         and (r.state is distinct from 'cancelled' or b.code_norm = $${exact}))
+         and ${forSet ? "b.sku_kind = 'single' and (r.state is null or r.state not in ('cancelled', 'quarantined'))" : `(r.state is distinct from 'cancelled' or b.code_norm = $${exact})`})
     select code, code_norm, name, sku_kind, handling, reg_state from hit
      order by case when code_norm = $${exact} then 0 when code_norm like $${pre} then 1 when jan_hit then 2 when code_norm like $${any} then 3 else 4 end,
               case when sku_kind = any($${kinds}::text[]) and reg_state = any($${states}::text[]) then 0 else 1 end,
@@ -666,7 +669,7 @@ export async function searchMapComponents(db, q, { limit = COMPONENT_SEARCH_LIMI
      limit $${lim}`, params)).rows;
   const more = rows.length > max;
   const items = rows.slice(0, max).map((r) => {
-    const why = componentUnusableWhy(r.sku_kind, r.reg_state);
+    const why = forSet ? null : componentUnusableWhy(r.sku_kind, r.reg_state);
     return { code: r.code, name: r.name, kind: r.sku_kind, kind_label: KIND_WORDS[r.sku_kind] || r.sku_kind, reg_state: r.reg_state ?? null, handling: r.handling,
       usable: !why, why, not_in_ne: NOT_IN_NE_REG_STATES.includes(r.reg_state), ne_direct: r.reg_state === 'quarantined', stock: r.sku_kind === 'set' ? null : stockOf(stock, r.code_norm) };
   });

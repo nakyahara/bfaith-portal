@@ -150,7 +150,7 @@
      TOP は工程を廃止した (2026-08-31) ので、出品ゲートと同じ「枠1 (_top) が登録されているか」で見る */
   .kb-imgtracks { margin-top: 6px; display: flex; flex-direction: column; gap: 3px; font-size: 11px; }
   .kb-krow { display: flex; align-items: center; gap: 5px; color: #64748b; }
-  .kb-krow .kb-kname { flex: 0 0 62px; font-weight: 700; color: #475569; }   /* 「トップ画像」「撮影指示書」(全角5文字) が折り返さない幅 */
+  .kb-krow .kb-kname { flex: 0 0 62px; font-weight: 700; color: #475569; }   /* 「トップ画像」(全角5文字) が折り返さない幅 */
   .kb-state { flex: 0 0 auto; font-weight: 700; border-radius: 4px; padding: 1px 7px; border: 1px solid; }
   .kb-state.done { background: #dcfce7; color: #166534; border-color: #86efac; }
   .kb-state.todo { background: #fff7ed; color: #b45309; border-color: #fdba74; }
@@ -204,6 +204,14 @@
 </style>
 <%- include('_board-theme') %>
 
+<%
+  // 重要度セレクトの色 (背景が黒 / 白で塗り方が違う)。黒 = 地と文字を入れ替えて暗い背景で読めるように (#1718)、
+  // 白 = 10/13 より前の塗り方。変更後・切り替え後は画面の kbPaintPriority が同じ塗り方をする
+  const kbDarkTheme = (locals.boardTheme || 'dark') !== 'light';
+  const priorityStyle = (p) => !p ? ''
+    : kbDarkTheme ? `background:${p.fg}40; color:${p.bg}; border-color:${p.bg}88; font-weight:600;`
+    : `background:${p.bg}; color:${p.fg}; border-color:${p.fg}33; font-weight:600;`;
+%>
 <%
   // フィルタとタブの URL。切り替えても他の条件 (担当者・未割り当て・ビュー・種別) を失わない
   const boardUrl = (over = {}) => {
@@ -297,6 +305,10 @@
     <%# 🆕 JAN を Company DB と比べた結果の一言 (Company DB構想 21 B1)。ボードを開いた後に画面が読む %>
     <span id="kb-jan-status" class="kb-jan-status muted" hidden></span>
     <span class="muted"><%= board.total %> 件<%= board.truncated ? ' (上限まで表示)' : '' %></span>
+    <%# 背景の切り替え (2026-10-19 中原さん要望・人ごとに覚える)。ボタンの文字 = 押すとなる方 %>
+    <button type="button" class="btn btn-sm" id="kb-theme-toggle" title="ボードの背景を切り替える (自分のアカウントだけに効きます)">
+      <%= kbDarkTheme ? '☀ 白背景にする' : '🌙 黒背景にする' %>
+    </button>
     <a class="btn btn-sm" href="/apps/product-hub/list">一覧で見る</a>
   </div>
 
@@ -325,21 +337,8 @@
           : (t.done || t.made) ? { state: 'done', text: '済', note: t.current ? t.current.label : '' }
             : { state: 'todo', text: 'まだ', note: t.current ? t.current.label : '', stalledDays: t.stalledDays };
       const topDone = !!(c.image && c.image.top && c.image.top.registered);
-      // 本番の構成 (2026-09-13 スタッフ要望)。縦列「仮構成」とは別の印なので、素材待ちなど
-      // 別の列にいても 済/まだ が読める。印が無くても ④AI制作が済んでいれば 済 (composeStateOf)
-      const cp = (c.image && c.image.compose) || null;
-      const compose = !cp ? { state: 'off', text: '—' }
-        : cp.excluded ? { state: 'off', text: '対象外' }
-          : cp.done ? { state: 'done', text: '済' } : { state: 'todo', text: 'まだ' };
-      // 撮影指示書 (2026-10-01 スタッフ要望)。「商品を発送していても指示書ができていない場合がある」
-      // ので、撮影・素材ステータス (商品が届いたか) とは別の行で 済/まだ を出す。
-      // 済 = 画像制作の「カメラ撮影指示URL」が入っている / 撮影不要の商品は作らないので対象外
-      const ci = (c.image && c.image.cameraInstruction) || null;
-      // 🚨 撮影不要を**先に**見る: Notion 取り込みは撮影・素材と撮影指示URL を別々に埋めるので、
-      // 「撮影依頼不要 + 古い撮影指示URL あり」が作れてしまう。URL を先に見ると「済」に出る
-      const camera = !ci ? { state: 'off', text: '—' }
-        : ci.notRequired ? { state: 'off', text: '対象外' }
-          : ci.registered ? { state: 'done', text: '済' } : { state: 'todo', text: 'まだ' };
+      // 「構成」「撮影指示書」の行は 2026-10-21 に外した (スタッフ要望)。縦列 (②仮構成・③素材待ち) と中身が被るうえ、
+      // カードは「次に誰が何をするかが変わったら動かす」運用にしたので要らなくなった。詳細画面の構成・撮影指示書はそのまま
       return [
         {
           name: 'トップ画像',
@@ -347,14 +346,6 @@
           ...(topDone ? { state: 'done', text: '済' } : { state: 'todo', text: 'まだ' }),
         },
         { name: '詳細画像', title: '商品詳細画像 (LP)。楽天登録・A+登録まで来たら「済」', ...detail },
-        { name: '構成', title: '本番の構成ができたか (縦列「仮構成」とは別。詳細画面の画像制作で「構成を済にする」/ ④AI制作が済んで ⑤デザイン修正 に移れば 済)', ...compose },
-        {
-          name: '撮影指示書',
-          title: camera.state === 'done' ? '撮影指示書 (カメラ撮影指示URL) が入っています'
-            : camera.state === 'off' && ci ? '撮影不要の商品なので撮影指示書は作りません'
-              : '撮影指示書 (カメラ撮影指示URL) がまだ入っていません。商品を発送していても指示書ができていないことがあります',
-          ...camera,
-        },
       ];
     };
   %>
@@ -821,7 +812,7 @@
                   同じ商品の TOP カードと詳細カードには同じものが出る (片方を変えると両方に効く) %>
               <% const pr = imagePriorities.find((p) => p.value === c.image_priority) || null; %>
               <select class="kb-priority" data-draft="<%= c.id %>"
-                      style="<%= pr ? `background:${pr.fg}40; color:${pr.bg}; border-color:${pr.bg}88; font-weight:600;` : '' %>">
+                      style="<%= priorityStyle(pr) %>">
                 <option value="">重要度: 未設定</option>
                 <% for (const p of imagePriorities) { %>
                   <option value="<%= p.value %>" <%= c.image_priority === p.value ? 'selected' : '' %>><%= p.value %></option>
@@ -895,7 +886,7 @@
           <% if (boardView === 'image') { %>
             <% const prd = imagePriorities.find((p) => p.value === c.image_priority) || null; %>
             <select class="kb-priority" data-draft="<%= c.id %>"
-                    style="<%= prd ? `background:${prd.fg}40; color:${prd.bg}; border-color:${prd.bg}88; font-weight:600;` : '' %>">
+                    style="<%= priorityStyle(prd) %>">
               <option value="">重要度: 未設定</option>
               <% for (const p of imagePriorities) { %>
                 <option value="<%= p.value %>" <%= c.image_priority === p.value ? 'selected' : '' %>><%= p.value %></option>
@@ -957,6 +948,50 @@
 </div>
 
 <script>
+  // ─── 背景 (黒 / 白) の切り替え (2026-10-19 中原さん要望・人ごと) ───
+  // 黒の <style id="kb-theme-dark"> を media で入り切りする (all / not all) = 再読み込みなしで変わる。
+  // 保存はサーバー (ログインのメールごと)。保存できなければ元の背景に戻して知らせる
+  const KB_PR = <%- JSON.stringify(locals.imagePriorities || []) %>;
+  const kbThemeStyle = document.getElementById('kb-theme-dark');
+  const kbIsDark = function () { return !!kbThemeStyle && kbThemeStyle.media !== 'not all'; };
+  // 重要度セレクトの色。EJS の priorityStyle と同じ塗り方 (黒 = 地と文字を入れ替える / 白 = そのまま)
+  function kbPaintPriority(o) {
+    const p = KB_PR.find(function (x) { return x.value === o.value; });
+    const dark = kbIsDark();
+    o.style.background = p ? (dark ? p.fg + '40' : p.bg) : '';
+    o.style.color = p ? (dark ? p.bg : p.fg) : '';
+    // 枠線も揃える (初期描画は border-color も重要度色。ここを抜くと枠だけ前の色が残る)
+    o.style.borderColor = p ? (dark ? p.bg + '88' : p.fg + '33') : '';
+    o.style.fontWeight = p ? '600' : '';
+  }
+  const kbThemeBtn = document.getElementById('kb-theme-toggle');
+  function kbSetTheme(theme) {
+    if (kbThemeStyle) kbThemeStyle.media = theme === 'light' ? 'not all' : 'all';
+    if (kbThemeBtn) kbThemeBtn.textContent = theme === 'light' ? '🌙 黒背景にする' : '☀ 白背景にする';
+    document.querySelectorAll('.kb-priority').forEach(kbPaintPriority);
+  }
+  if (kbThemeBtn) {
+    kbThemeBtn.addEventListener('click', async function () {
+      const before = kbIsDark() ? 'dark' : 'light';
+      const next = before === 'dark' ? 'light' : 'dark';
+      kbSetTheme(next);
+      kbThemeBtn.disabled = true;
+      try {
+        const res = await fetch('/apps/product-hub/api/board/theme', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ theme: next }),
+        });
+        const j = await res.json().catch(function () { return {}; });
+        if (!res.ok || !j.ok) { kbSetTheme(before); alert(j.error || '背景の設定を保存できませんでした'); }
+      } catch (err) {
+        kbSetTheme(before);
+        alert('通信エラー: ' + err.message);
+      } finally {
+        kbThemeBtn.disabled = false;
+      }
+    });
+  }
+
   const sel = document.getElementById('assignee-select');
   if (sel) {
     sel.addEventListener('change', function () {
@@ -1587,15 +1622,9 @@
         // 色を選択肢に追従させる (再読込なしで見た目だけ更新)。
         // 重要度は**商品単位**なので、同じ商品の別カード (TOP ↔ 商品詳細) も一緒に揃える —
         // 揃えないと画面の中で違う重要度が並んで見え、どちらが本当か分からなくなる
-        const PR = <%- JSON.stringify(imagePriorities) %>;
-        const p = PR.find((x) => x.value === s.value);
         document.querySelectorAll('.kb-priority[data-draft="' + s.dataset.draft + '"]').forEach(function (o) {
           o.value = s.value;
-          o.style.background = p ? p.fg + '40' : '';
-          o.style.color = p ? p.bg : '';
-          // 枠線も揃える (初期描画は border-color も重要度色。ここを抜くと枠だけ前の色が残る)
-          o.style.borderColor = p ? p.bg + '88' : '';
-          o.style.fontWeight = p ? '600' : '';
+          kbPaintPriority(o);
         });
       } catch (err) {
         alert('通信エラー: ' + err.message);

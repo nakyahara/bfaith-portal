@@ -64,6 +64,10 @@ initMirrorDB();   // 本番では server.js が起動時に行う
 const PHDB = await import('../apps/product-hub/db.js');
 const PH = await import('../apps/product-hub/services/cdb-card-intake.js');
 
+/** 🆕 0099 (セットを構成の持ち主 load のまま登録・仮番号 = マージの時に付け替える) の migration のファイル名 */
+const SET_ENTRY_MIG_RE = /^\d{4}_set_entry_on_load\.sql$/;
+/** 🆕 0100 (今あるセットの構成の依頼を持ち主 load のまま・仮番号) の migration のファイル名 */
+const SET_COMP_MIG_RE = /^\d{4}_set_comp_request_on_load\.sql$/;
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
 const quiet = () => {};
@@ -301,7 +305,8 @@ await ta('[S3] NE 登録待ち・NE 確認済みの根拠は 0053 (⑤-2b) の�
   const d = await skuId('tx-1');
   await assert.rejects(() => transition(d, 'ne_pending', { evidence: { export_id: 7, sha256: SHA } }), /caller_evidence/);
   await assert.rejects(() => transition(d, 'ne_pending'), /no_evidence/);
-  await assert.rejects(() => transition(d, 'ne_confirmed', { evidence: { compare_run_id: RUN, matched: true } }), /one_way/);
+  // 🆕 0098: 地図に draft > ne_confirmed (「NE にあるので登録済みにする」の約束の中だけ) = 約束の外は confirm_session_required (0098 の前の DB = one_way)
+  await assert.rejects(() => transition(d, 'ne_confirmed', { evidence: { compare_run_id: RUN, matched: true } }), /one_way|confirm_session_required/);
   await assert.rejects(() => transition(d, 'available', { evidence: { generation: 'g1', acks: ACKS('g1') } }), /one_way/);
   // 持ち主が状態を直接作った (試験だけ) としても、照合の確かめの記録が無い = 進めない
   await forceState(d, 'ne_pending');
@@ -447,10 +452,17 @@ await ta('[R1] 段階 new_open でも、持ち主が load (今の本番の持ち
   await W2.setActiveOwnershipInDb(pg, ALL_COMPANY);
   e = await rejectsWith(reg('single', 'new-a1', single(), {}, { open: false }), 409, 'before_cutover');
   assert.equal(e.extra.open, false);
-  await W2.setActiveOwnershipInDb(pg, { ...ALL_COMPANY, sku_components: 'load' });
+  // 🆕 0099: 構成 (sku_components) が load でもセットは登録できる (構成は依頼だけ・core.sku_components は書かない)。ほかの列が load なら今までどおり 409
+  await W2.setActiveOwnershipInDb(pg, { ...ALL_COMPANY, sku_components: 'load', 'skus.name': 'load' });
   e = await rejectsWith(reg('set', 'new-set-x', { name: 'x', standard_price: '1', shipping_code: 'S01', components: [{ code: 's001', qty: 1 }] }, {}), 409, 'before_cutover');
-  assert.deepEqual(e.extra.load_keys, ['sku_components']);
-  await W2.setActiveOwnershipInDb(pg, ALL_COMPANY);
+  assert.deepEqual(e.extra.load_keys, ['skus.name'], '構成 (依頼だけ) は load でよい = 断る理由に入れない');
+  try {
+    await W2.setActiveOwnershipInDb(pg, { ...ALL_COMPANY, sku_components: 'load' });
+    const rs = await reg('set', 'new-set-load', { name: '構成は NE のまま', standard_price: '1', shipping_code: 'S01', components: [{ code: 's001', qty: 1 }] }, { create: false });
+    assert.equal(rs.ok, true, JSON.stringify(rs));
+    assert.equal((await one('select count(*)::int as n from core.sku_components where parent_sku_id = $1', [rs.sku_id])).n, 0, 'core の構成は書かない');
+    assert.equal((await one(`select count(*)::int as n from ops.sku_component_requests where set_sku_id = $1 and status = 'open'`, [rs.sku_id])).n, 1, '構成の依頼だけ');
+  } finally { await W2.setActiveOwnershipInDb(pg, ALL_COMPANY); }
   assert.equal(await skuId('new-a1'), undefined);
 });
 
@@ -695,6 +707,22 @@ await ta('[R9] 編集の印に登録の状態が入る (状態が変わった = 
   const tokA1 = W.editTokenOf(await W.readCurrent(db, a1, TODAY));
   const r = await asEditor(() => W.saveSku(db, { actor: 'naka@test', requestId: uuid(), code: 'new-a1', reason: null, seen: { token: tokA1 }, values: { reorder_months: '2' } }, { ownership: ALL_COMPANY, open: true, now: NOW }));
   assert.deepEqual(r.changed.map((c) => c.field), ['reorder_months']);
+  // 🆕 0099 (PR-0 Codex R1 Medium): 登録した直後のセット (今の構成が空・構成は依頼だけ) も名前・売価・送料を直せる (依頼の構成で確かめる)。導く値は空の構成で消さない
+  const ns = await skuId('new-set-load');
+  const before = await one('select tax_rate::float8 as t, handling, (select cost_jpy::int from core.sku_costs c where c.sku_id = s.sku_id and c.valid_to is null) as c from core.skus s where s.sku_id = $1', [ns]);
+  const tokS = W.editTokenOf(await W.readCurrent(db, ns, TODAY));
+  const rs = await asEditor(() => W.saveSku(db, { actor: 'naka@test', requestId: uuid(), code: 'new-set-load', reason: null, seen: { token: tokS },
+    values: { name: '構成は NE のまま (直した)', standard_price: '2', handling_own: 'discontinued' } }, { ownership: ALL_COMPANY, open: true, now: NOW }));
+  assert.deepEqual(rs.changed.map((c) => c.field).sort(), ['handling_own', 'name', 'standard_price']);
+  const now1 = await one('select tax_rate::float8 as t, handling, (select cost_jpy::int from core.sku_costs c where c.sku_id = s.sku_id and c.valid_to is null) as c from core.skus s where s.sku_id = $1', [ns]);
+  assert.deepEqual(now1, { ...before, handling: 'discontinued' }, '導く値は依頼の構成で計算し直す (セット自身の中止は保存で効く・税率と原価は空の構成で消さない) = R2 Medium');
+  // 例外原価を付けて、やめる = 依頼の構成の合計に戻る (空の構成で原価を消さない)
+  const sv = async (values) => asEditor(async () => W.saveSku(db, { actor: 'naka@test', requestId: uuid(), code: 'new-set-load', reason: null,
+    seen: { token: W.editTokenOf(await W.readCurrent(db, ns, TODAY)) }, values }, { ownership: ALL_COMPANY, open: true, now: NOW }));
+  await sv({ exception_cost: { jpy: '777', reason: '試験の例外' } });
+  assert.equal((await one('select cost_jpy::int as c, cost_source as s from core.sku_costs where sku_id = $1 and valid_to is null', [ns])).c, 777);
+  await sv({ exception_cost: { clear: true, reason: '例外をやめる' } });
+  assert.deepEqual(await one('select cost_jpy::int as c, cost_source as s from core.sku_costs where sku_id = $1 and valid_to is null', [ns]), { c: before.c, s: 'set_calc' }, '依頼の構成の合計に戻る');
 });
 
 await ta('[R10] 画面のロール (master_edit) で単品・セットを登録でき、カードの知らせも取り込める (状態の表は関数だけが書く)', async () => {
@@ -920,7 +948,7 @@ await ta('[G4] 画面のロールが登録の関数を直接呼んで値を偽�
 await ta('[G-0060] 登録の関数の作り直し (0060): 0058 の本文との違いは「単品の代表の仕入先」「発送方法なし」「気をつけることの 1 行」の 3 か所だけ・権限はそのまま', async () => {
   const MIG = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..', 'db', 'company', 'migrations');
   const fnOf = (file) => { const t = fs.readFileSync(path.join(MIG, file), 'utf8').replace(/\r\n/g, '\n'); const i = t.indexOf('create or replace function ops.register_new_sku('); assert.ok(i >= 0, file); return t.slice(i, t.indexOf('\nend $$;\n', i) + 9); };
-  const later = fs.readdirSync(MIG).filter((x) => /^\d{4}_.*\.sql$/.test(x) && x.slice(0, 4) > '0058' && !['0060', '0061'].includes(x.slice(0, 4)));
+  const later = fs.readdirSync(MIG).filter((x) => /^\d{4}_.*\.sql$/.test(x) && x.slice(0, 4) > '0058' && !['0060', '0061'].includes(x.slice(0, 4)) && !SET_ENTRY_MIG_RE.test(x));   // 🆕 0099 の作り直しは [G-0099] が見る
   for (const file of later) assert.ok(!/function\s+ops\.register_new_sku\s*\(/i.test(fs.readFileSync(path.join(MIG, file), 'utf8')), file + ' も登録の関数を作り直している = 0060 の元にする定義を見直す');
   const a = fnOf('0058_master_widen.sql').split('\n'); const b = fnOf('0060_master_register_required_fields.sql').split('\n');
   // 差 = 0060 で足した行だけ (0058 の行は全部同じ順で残る。変えたのは送料の確かめの if → elsif の 1 行)
@@ -983,7 +1011,7 @@ await ta('[R-0061] 下書きの保存で要る欄 (2026-10-08 中原さん): 単
 await ta('[G-0061] 登録の関数の作り直し (0061): 0060 の本文との違いは「推奨保有月数が要る」「単品の売上分類が要る」の 2 か所 (4 行) だけ・DB を直接呼んでも空は断る・権限はそのまま', async () => {
   const MIG = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..', 'db', 'company', 'migrations');
   const fnOf = (file) => { const t = fs.readFileSync(path.join(MIG, file), 'utf8').replace(/\r\n/g, '\n'); const i = t.indexOf('create or replace function ops.register_new_sku('); assert.ok(i >= 0, file); return t.slice(i, t.indexOf('\nend $$;\n', i) + 9); };
-  const later = fs.readdirSync(MIG).filter((x) => /^\d{4}_.*\.sql$/.test(x) && x.slice(0, 4) > '0061');
+  const later = fs.readdirSync(MIG).filter((x) => /^\d{4}_.*\.sql$/.test(x) && x.slice(0, 4) > '0061' && !SET_ENTRY_MIG_RE.test(x));   // 🆕 0099 の作り直しは [G-0099] が見る
   for (const file of later) assert.ok(!/function\s+ops\.register_new_sku\s*\(/i.test(fs.readFileSync(path.join(MIG, file), 'utf8')), file + ' も登録の関数を作り直している = 0061 の元にする定義を見直す');
   const a = fnOf('0060_master_register_required_fields.sql').split('\n'); const b = fnOf('0061_master_register_require_class_months.sql').split('\n');
   const added = []; let i = 0;
@@ -1014,6 +1042,66 @@ await ta('[G-0061] 登録の関数の作り直し (0061): 0060 の本文との�
      from pg_proc where oid = 'ops.register_new_sku(uuid, text, text, jsonb, text, jsonb)'::regprocedure`), { pub: false, me: true, d: true });
 });
 
+await ta('[G-0099] 🆕 0099 (セットを構成の持ち主 load のまま登録): 登録の関数は 0061 との違いが「セットも許可」の 1 行だけ・書き込みの守りは 0051 との違いが continue の 3 行だけ・権限はそのまま', async () => {
+  const MIG = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..', 'db', 'company', 'migrations');
+  const files = fs.readdirSync(MIG).filter((x) => /^\d{4}_.*\.sql$/.test(x));
+  const f0099 = files.find((x) => SET_ENTRY_MIG_RE.test(x));
+  assert.ok(f0099, '0099 (セットの登録) の migration が無い');
+  const fnOf = (file, head) => { const t = fs.readFileSync(path.join(MIG, file), 'utf8').replace(/\r\n/g, '\n'); const i = t.indexOf(head); assert.ok(i >= 0, `${file}: ${head}`); return t.slice(i, t.indexOf('\nend $$;\n', i) + 9); };
+  for (const [re, label, skip] of [[/function\s+ops\.register_new_sku\s*\(/i, '登録の関数', null], [/function\s+ops\.guard_master_edit_write\s*\(/i, '書き込みの守り', SET_COMP_MIG_RE]]) {
+    for (const file of files.filter((x) => x > f0099 && !(skip && skip.test(x)))) assert.ok(!re.test(fs.readFileSync(path.join(MIG, file), 'utf8')), `${file} も${label}を作り直している = [G-0099] を見直す`);
+  }
+  const diffOf = (a, b) => { const out = []; let i = 0; for (const line of b) { if (i < a.length && line === a[i]) i++; else out.push(line); } return { i, out }; };
+  // 登録の関数: 0061 の 1 行 (単品だけ許可) を「種類の許可」に置き換えただけ
+  const r61 = fnOf('0061_master_register_require_class_months.sql', 'create or replace function ops.register_new_sku(').split('\n');
+  const r100 = fnOf(f0099, 'create or replace function ops.register_new_sku(').split('\n');
+  // 0061 から外した行 = 単品だけの許可・このあと (ne_steps) の 2 行
+  const gone = ["  if v_kind = 'single' then perform ops._require_new_entry_lease('single'); end if;", "        '下書きで登録しました。NE・ロジザードへの登録 (新規登録の CSV) はまだです",
+    "        case when v_kind = 'set' then 'セットの構成は「構成の依頼」として持っています。NE に登録して"];
+  const keep = r61.filter((l) => !gone.some((g) => l.startsWith(g)));
+  assert.equal(keep.length, r61.length - gone.length);
+  const d1 = diffOf(keep, r100);
+  assert.equal(d1.i, keep.length, '0061 のほかの行が 0099 に同じ順で残っていない');
+  assert.equal(d1.out.length, 4, JSON.stringify(d1.out));
+  assert.ok(d1.out[0].trim().startsWith('perform ops._require_new_entry_lease(v_kind);'));
+  assert.ok(d1.out[1].trim().startsWith("case when v_kind = 'set' then '下書きで登録しました。次は「NE 登録の CSV」"));
+  assert.ok(d1.out[2].trim().startsWith("else '下書きで登録しました。NE・ロジザードへの登録 (新規登録の CSV) はまだです"), '単品の文は前と同じ');
+  assert.ok(d1.out[3].trim().startsWith("case when v_kind = 'set' then 'セットの構成は「構成の依頼」として持っています。NE に取り込んで"));
+  // 書き込みの守り: 0051 の本文 (create → create or replace) + continue の 3 行
+  const g51 = fnOf('0051_master_edit.sql', 'create function ops.guard_master_edit_write()').replace('create function ops.guard_master_edit_write()', 'create or replace function ops.guard_master_edit_write()').split('\n');
+  const g100 = fnOf(f0099, 'create or replace function ops.guard_master_edit_write()').split('\n');
+  const d2 = diffOf(g51, g100);
+  assert.equal(d2.i, g51.length, '0051 の守りの行が 0099 に同じ順で残っていない');
+  assert.equal(d2.out.length, 3, JSON.stringify(d2.out));
+  assert.ok(d2.out[0].trim().startsWith('-- 🆕 0099: 新商品の登録') && d2.out[1].trim().startsWith('--   (依頼は「NE に入れてほしい中身」') && d2.out[2].trim().startsWith("continue when k = 'sku_components'"), JSON.stringify(d2.out));
+  assert.ok(d2.out[2].includes("v_sess.operation = 'sku_create'") && d2.out[2].includes("tg_op = 'INSERT'") && d2.out[2].includes("v_tbl = 'ops.sku_component_requests'"));
+  for (const sig of ['ops.register_new_sku(uuid, text, text, jsonb, text, jsonb)', 'ops.guard_master_edit_write()']) {
+    const p = await one(`select has_function_privilege('public', oid, 'execute') as pub, prosecdef as d from pg_proc where oid = $1::regprocedure`, [sig]);
+    assert.deepEqual(p, { pub: false, d: true }, sig);
+  }
+});
+
+await ta('[G-0100] 🆕 0100 (今あるセットの構成の依頼を持ち主 load のまま): 書き込みの守りは 0099 との違いが continue のかたまり (3 行 → 4 行) だけ・依頼と食い違いの表だけ・権限はそのまま', async () => {
+  const MIG = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..', 'db', 'company', 'migrations');
+  const files = fs.readdirSync(MIG).filter((x) => /^\d{4}_.*\.sql$/.test(x));
+  const f0099 = files.find((x) => SET_ENTRY_MIG_RE.test(x)); const f0100 = files.find((x) => SET_COMP_MIG_RE.test(x));
+  assert.ok(f0099 && f0100 && f0100 > f0099, '0099 の後に 0100');
+  for (const file of files.filter((x) => x > f0100)) assert.ok(!/function\s+ops\.guard_master_edit_write\s*\(/i.test(fs.readFileSync(path.join(MIG, file), 'utf8')), `${file} も書き込みの守りを作り直している = [G-0100] を見直す`);
+  const fnOf = (file) => { const t = fs.readFileSync(path.join(MIG, file), 'utf8').replace(/\r\n/g, '\n'); const h = 'create or replace function ops.guard_master_edit_write()'; const i = t.indexOf(h); assert.ok(i >= 0, file); return t.slice(i, t.indexOf('\nend $$;\n', i) + 9).split('\n'); };
+  const a = fnOf(f0099); const b = fnOf(f0100);
+  const gone = a.filter((l) => l.includes('🆕 0099') || l.startsWith('    --   (依頼は「NE に入れてほしい中身」') || l.includes("v_sess.operation = 'sku_create';"));
+  assert.equal(gone.length, 3, JSON.stringify(gone));
+  const keep = a.filter((l) => !gone.includes(l));
+  const out = []; let i = 0;
+  for (const line of b) { if (i < keep.length && line === keep[i]) i++; else out.push(line); }
+  assert.equal(i, keep.length, '0099 のほかの行が 0100 に同じ順で残っていない');
+  assert.equal(out.length, 4, JSON.stringify(out));
+  assert.ok(out[0].trim().startsWith('-- 🆕 0100:') && out[1].trim().startsWith('--') && out[2].trim().startsWith('--'));
+  assert.equal(out[3].trim(), "continue when k = 'sku_components' and v_tbl in ('ops.sku_component_requests', 'ops.sku_component_breaches');");
+  const p = await one(`select has_function_privilege('public', oid, 'execute') as pub, prosecdef as d from pg_proc where oid = 'ops.guard_master_edit_write()'::regprocedure`);
+  assert.deepEqual(p, { pub: false, d: true });
+});
+
 await ta('[G-0064] 大文字のコード (0064): ops.new_sku_code_problem・ops.ne_reg_build の作り直しは 0058 の本文との違いが「形の行」と「🆕 0064 の注記 1 行」だけ・照合の確かめは 0063 の本文 + NE の書き方の確かめの行だけ・権限はそのまま・NE 登録の CSV の品目の ne_code の CHECK は大文字も (小文字にして code_norm)', async () => {
   const MIG = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..', 'db', 'company', 'migrations');
   const fnOf = (file, head) => { const t = fs.readFileSync(path.join(MIG, file), 'utf8').replace(/\r\n/g, '\n'); const i = t.indexOf(head); assert.ok(i >= 0, `${file}: ${head}`); return t.slice(i, t.indexOf('\nend $$;\n', i) + 9); };
@@ -1031,8 +1119,10 @@ await ta('[G-0064] 大文字のコード (0064): ops.new_sku_code_problem・ops.
     // 元にする版 = 0058 (0058 の後に作り直したのは 0064 だけ)。例外は名指しの 1 つだけ: ops.ne_reg_build の 0065 (#1664) = 0064 の版から写す = その中身は
     //   test-master-reg-csv.mjs の [V2] が 0064 との差で確かめる。ops.new_sku_code_problem は例外なし (後の作り直しは全部拒む)
     //   🆕 0067 (PR-5) も名指しで ops.ne_reg_build を 0065 の版から写す = その中身は scripts/test-master-variation.mjs の [S2] が 0065 との差で確かめる
+    //   🆕 10/20 (0097 仮番号・reg_csv_one_file) も名指しで ops.ne_reg_build を 0067 の版から写す = その中身は scripts/test-master-variation.mjs の [S4] が 0067 との差で確かめる
     const allowLater = head === 'create or replace function ops.ne_reg_build(' ? ['0065_ne_reg_csv_versions.sql', '0067_variation_groups.sql'] : [];
-    for (const file of files.filter((x) => x.slice(0, 4) > '0058' && x.slice(0, 4) !== '0064' && !allowLater.includes(x))) {
+    const oneFile = (x) => head === 'create or replace function ops.ne_reg_build(' && /^\d{4}_reg_csv_one_file\.sql$/.test(x);
+    for (const file of files.filter((x) => x.slice(0, 4) > '0058' && x.slice(0, 4) !== '0064' && !allowLater.includes(x) && !oneFile(x))) {
       assert.ok(!re.test(fs.readFileSync(path.join(MIG, file), 'utf8')), `${file} も ${head} を作り直している = 0064 の元にする定義を見直す`);
     }
     const a = fnOf('0058_master_widen.sql', head).split('\n'); const b = fnOf('0064_uppercase_new_codes.sql', head).split('\n');
@@ -1581,7 +1671,11 @@ await ta('[H1] 新商品の画面 (単品・セット): 描画・画面の JS・
   process.env.MASTER_EDIT_OPEN = '1';
   // 広げる道 PR-2: 画面も DB の active を読む (配った config ではない)
   await W2.setActiveOwnershipInDb(pg, { ...ALL_COMPANY, sku_components: 'load' });
-  assert.match((await call('GET', '/apps/master-edit/new?kind=set')).text, /切替前です/);   // セットは構成の持ち主も
+  // 🆕 0099: セットも構成の持ち主 load のまま開く (構成は依頼だけ)。区分などほかの列が load なら今までどおり閉じる
+  { const p = (await call('GET', '/apps/master-edit/new?kind=set')).text; assert.ok(!/切替前です/.test(p), 'セットは構成 (依頼だけ) が load でも開く'); assert.match(p, /data-can-save="1"/); }
+  await W2.setActiveOwnershipInDb(pg, { ...ALL_COMPANY, sku_components: 'load', 'skus.sku_kind': 'load' });
+  assert.match((await call('GET', '/apps/master-edit/new?kind=set')).text, /切替前です/);
+  await W2.setActiveOwnershipInDb(pg, { ...ALL_COMPANY, sku_components: 'load' });
   assert.ok(!/切替前です/.test((await call('GET', '/apps/master-edit/new?kind=single')).text), '単品は構成を書かない = 開いたまま');
   // DB の active が段階の記録と違う = 単品も閉じる (⑤-1 の門)
   await W2.setActiveMapOnly(pg, ALL_COMPANY);
@@ -1792,7 +1886,7 @@ await ta('[PO1] 新商品の画面: 発注の設定の欄 (発注ロット・発
   assert.ok(!r.text.includes('id="sec-order"') && !r.text.includes('me-order.js'));
   // つかいかた (同じ PR で)
   const m = await call('GET', '/apps/master-edit/manual');
-  for (const w of ['<h2 id="order">発注の設定 (発注アプリに保存)</h2>', '発注の設定を保存', 'NE 登録待ち', '名簿の人で、発注アプリの権限もある人', '発注の設定だけ保存できませんでした', 'すすめる数が出ません']) {
+  for (const w of ['<h3 id="order">発注の設定 (発注アプリに保存)</h3>', '発注の設定を保存', 'NE 登録待ち', '名簿の人で、発注アプリの権限もある人', '発注の設定だけ保存できませんでした', 'すすめる数が出ません']) {
     assert.ok(m.text.includes(w), `つかいかたに「${w}」が無い`);
   }
 });
@@ -2003,7 +2097,7 @@ await ta('[PO6] 🆕 0075 届け待ち: 上の帯の件数 (発注アプリの�
   // 届け待ち (pending) は閉じない (= 届け直しに任せる)
   // つかいかた (同じ PR で)
   const m = await call('GET', '/apps/master-edit/manual');
-  for (const w of ['<h2 id="order-outbox">発注の設定の届け待ち', 'もう一度届ける', '要確認', '24 時間たっても届いていない', 'すすめる発注数は止めません', '毎晩 2 時']) {
+  for (const w of ['<h3 id="order-outbox">発注の設定の届け待ち', 'もう一度届ける', '要確認', '24 時間たっても届いていない', 'すすめる発注数は止めません', '毎晩 2 時']) {
     assert.ok(m.text.includes(w), `つかいかたに「${w}」が無い`);
   }
 });
@@ -2050,6 +2144,134 @@ await ta('[PO8] 🆕 0075 Render の外 (miniPC) = 登録の直後に届けな�
   OSO.__resetOrderOutboxCacheForTest();
   await call('GET', '/apps/master-edit/api/order-settings-outbox', { session: 'po-editor' });
   assert.deepEqual([(await poOutboxOf('po-web-8')).status, attrsOf('po-web-8').order_lot], ['done', 4]);
+});
+
+// ── 🆕 ⑤ 先方品番・入数 (CompanyDB構想 27 §2.4・apps/purchase-orders/vendor-codes.js・発注アプリの po_vendor_code_map) ──
+const NSK = await import('../apps/purchase-orders/new-skus.js');
+const vmapOf = (sup, code) => podb.prepare('SELECT * FROM po_vendor_code_map WHERE supplier_code = ? AND product_key = ?').get(sup, String(code).toLowerCase()) || null;
+{ const t0 = new Date().toISOString(); podb.prepare('INSERT OR IGNORE INTO po_suppliers (supplier_code, name, created_at, updated_at) VALUES (?,?,?,?)').run('1', 'アメージングクラフト', t0, t0); podb.prepare('INSERT OR IGNORE INTO po_suppliers (supplier_code, name, created_at, updated_at) VALUES (?,?,?,?)').run('3', 'ほかの仕入先', t0, t0); podb.prepare('UPDATE po_suppliers SET lead_days = 21 WHERE supplier_code = ?').run('1'); }
+const emptyPatch = { order_lot: '', condition_id: '', material_group_id: '', capacity_per_unit: '', case_group: '', case_lot: '' };
+
+await ta('[PO9] ⑤-2 新商品の登録の先方品番・入数 = 知らせ v2 (0089) → 発注アプリの対応表 (代表の仕入先・記録 via master-edit:new)・先方品番だけでも積む・入数だけ = 400・まとまり = 400・行がもうある = 409 (何も書かない)・v2 の印が無い DB = 400 (何も書かない)・届ける前に人が足して消した = 要確認 (戻さない)', async () => {
+  // 画面: 単品の新商品の登録には 2 つの欄 (未保存に数える)・まとまりの登録には無い
+  let page = await call('GET', '/apps/master-edit/new?kind=single', { session: 'po-editor' });
+  assert.ok(page.text.includes('id="po-vendor_code"') && page.text.includes('id="po-qty_per_unit"') && page.text.includes('data-dirty-field="po_vendor_code"'), '新商品の画面に先方品番の欄が無い');
+  assert.match(page.text, /先方 1 単位 = 弊社/);
+  page = await call('GET', '/apps/master-edit/new?kind=variation', { session: 'po-editor' });
+  assert.ok(!page.text.includes('id="po-vendor_code"'), 'まとまりの登録に先方品番の欄を出した');
+  // 先方品番だけ (6 つの項目は空) = v2 の知らせ → 対応表に書く (発注の設定の行は作らない)
+  const body = orderBody('po-web-9', { ...emptyPatch, vendor_code: ' AC-9 ', qty_per_unit: '２４' });
+  const r = await call('POST', '/apps/master-edit/api/new', { body, session: 'po-editor' });
+  assert.equal(r.status, 200, r.text);
+  assert.deepEqual([r.j.order_settings.ok, r.j.order_settings.status], [true, 'done'], r.text);
+  const ob = await poOutboxOf('po-web-9');
+  assert.deepEqual([ob.status, ob.payload.schema, ob.payload.vendor], ['done', 'po-settings-v2', { vendor_code: 'AC-9', qty_per_unit: '24' }]);
+  assert.deepEqual([vmapOf('1', 'po-web-9').vendor_code, vmapOf('1', 'po-web-9').qty_per_unit, vmapOf('1', 'po-web-9').product_code], ['AC-9', 24, 'po-web-9']);
+  assert.equal(attrsOf('po-web-9'), null, '先方品番だけの登録で発注の設定の行を作った');
+  const au = poAudit('supplier:1').at(-1);
+  assert.deepEqual([au.action, au.actor, au.request_id, au.detail.via, au.detail.product_key], ['vendor_map_entry_upsert', 'naka@test', body.request_id, 'master-edit:new', 'po-web-9']);
+  // 押し直し = 前の答え (書き直さない)
+  const again = await call('POST', '/apps/master-edit/api/new', { body, session: 'po-editor' });
+  assert.deepEqual([again.status, again.j.replayed, again.j.order_settings.ok], [200, true, true], again.text);
+  // 入数だけ = 400 (何も書かない)
+  const qOnly = await call('POST', '/apps/master-edit/api/new', { body: orderBody('po-web-9q', { ...emptyPatch, vendor_code: '', qty_per_unit: '3' }), session: 'po-editor' });
+  assert.deepEqual([qOnly.status, qOnly.j.field], [400, 'order_settings.vendor_code'], qOnly.text);
+  assert.equal(await skuId('po-web-9q'), undefined);
+  // まとまりの登録 = 400 (子ごとに番号が違う)
+  const vr = await call('POST', '/apps/master-edit/api/new/variation', { body: { request_id: uuid(), group: { name: 'x' }, options: [], children: [], values: {}, order_settings: { vendor_code: 'X' } }, session: 'po-editor' });
+  assert.equal(vr.status, 400, vr.text);
+  // 対応表にこの商品コードの行がもうある = 登録の前に 409 (Company DB にも書かない)
+  podb.prepare("INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at) VALUES ('1', 'po-web-9x', 'po-web-9x', 'HUMAN', ?)").run(new Date().toISOString());
+  const taken = await call('POST', '/apps/master-edit/api/new', { body: orderBody('po-web-9x', { ...emptyPatch, vendor_code: 'AC-9X' }), session: 'po-editor' });
+  assert.deepEqual([taken.status, taken.j.field], [409, 'order_settings.vendor_code'], taken.text);
+  assert.equal(await skuId('po-web-9x'), undefined, '断ったのに Company DB に登録した');
+  // 行は無いが記録がある (前に足して消した) = 登録の前に 409 (Codex R1 M2)
+  podb.prepare("DELETE FROM po_vendor_code_map WHERE supplier_code = '1' AND product_key = 'po-web-9x'").run();
+  podb.prepare("INSERT INTO po_audit_log (occurred_at, actor_type, actor, action, resource, detail_json) VALUES (?, 'user', 'x', 'vendor_map_entry_delete', 'supplier:1', ?)").run(new Date().toISOString(), JSON.stringify({ productCode: 'po-web-9x', vendorCode: 'HUMAN', product_key: 'po-web-9x' }));
+  const hist = await call('POST', '/apps/master-edit/api/new', { body: orderBody('po-web-9x', { ...emptyPatch, vendor_code: 'AC-9X' }), session: 'po-editor' });
+  assert.deepEqual([hist.status, hist.j.reason, await skuId('po-web-9x')], [409, 'stale', undefined], hist.text);
+  // v2 の印の関数が無い DB (0089 の前) = 400 vendor_not_ready (何も書かない)・先方品番が無い登録は通る
+  await pg.query('alter function ops.order_settings_payload_versions() rename to order_settings_payload_versions_hidden');
+  try {
+    const nr = await call('POST', '/apps/master-edit/api/new', { body: orderBody('po-web-9n', { ...emptyPatch, vendor_code: 'AC-9N' }), session: 'po-editor' });
+    assert.deepEqual([nr.status, nr.j.reason], [400, 'vendor_not_ready'], nr.text);
+    assert.equal(await skuId('po-web-9n'), undefined);
+    const plain = await call('POST', '/apps/master-edit/api/new', { body: orderBody('po-web-9p', { ...emptyPatch, order_lot: '2' }), session: 'po-editor' });
+    assert.deepEqual([plain.status, (await poOutboxOf('po-web-9p')).payload.schema], [200, 'po-settings-v1'], plain.text);
+  } finally { await pg.query('alter function ops.order_settings_payload_versions_hidden() rename to order_settings_payload_versions'); }
+  // 届ける前 (Render の外 = すぐは届けない) に人が対応表で足して消した = 届けても戻さない (要確認)
+  OSO.__setOrderDeliveryEnabledForTest(false);
+  try {
+    var lateBody = orderBody('po-web-9d', { ...emptyPatch, vendor_code: 'AC-9D' });
+    const late = await call('POST', '/apps/master-edit/api/new', { body: lateBody, session: 'po-editor' });
+    assert.equal(late.status, 200, late.text);
+  } finally { OSO.__setOrderDeliveryEnabledForTest(true); }
+  const VCM = await import('../apps/purchase-orders/vendor-codes.js');
+  VCM.upsertVendorCode({ supplierCode: '1', productCode: 'po-web-9d', vendorCode: 'HUMAN-9D', baseUpdatedAt: null, prod: { prodSup: '1', error: null }, actor: 'other@test', via: 'po-admin' });
+  // 届け待ちの間に人が対応表に行を足した後の押し直し = 前の答え (先方品番の確かめで 409 にしない・統合の Codex P2)
+  OSO.__setOrderDeliveryEnabledForTest(false);
+  try {
+    const lateAgain = await call('POST', '/apps/master-edit/api/new', { body: lateBody, session: 'po-editor' });
+    assert.deepEqual([lateAgain.status, lateAgain.j.replayed], [200, true], lateAgain.text);
+  } finally { OSO.__setOrderDeliveryEnabledForTest(true); }
+  VCM.deleteVendorCode({ supplierCode: '1', productCode: 'po-web-9d', base: vmapOf('1', 'po-web-9d').updated_at, actor: 'other@test', via: 'po-admin' });
+  OSO.__resetOrderOutboxCacheForTest();
+  await call('GET', '/apps/master-edit/api/order-settings-outbox', { session: 'po-editor' });
+  assert.deepEqual([(await poOutboxOf('po-web-9d')).status, vmapOf('1', 'po-web-9d')], ['conflict', null], '人が消した先方品番を届けて戻した');
+});
+
+await ta('[PO10] ⑤-1 商品の画面の先方品番・入数: 正本 (発注アプリの対応表) を出す・1 行ずつ保存 (版が要る 428・違う 409)・直せるのは仕入先一致の 1 社 (ほかの仕入先は消すだけ)・権限・単品だけ・「仕入先」欄の先方品番も正本・入数の名前を分ける', async () => {
+  NSK.setNewSkuReaderForTest(async () => ({ ok: true, map: new Map([['po-web-9', { code: 'po-web-9', name: 'x', state: 'draft', supplier: '1' }]]) }));
+  try {
+    // 写し (Company DB) と違う値にしておく = 画面は正本を出す
+    podb.prepare("INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, qty_per_unit, updated_at) VALUES ('3', 'po-web-9', 'po-web-9', 'OLD-3', 1.5, ?)").run(new Date().toISOString());
+    let page = await call('GET', '/apps/master-edit/sku/po-web-9', { session: 'po-editor' });
+    assert.equal(page.status, 200, page.text.slice(0, 300));
+    assert.ok(page.text.includes('id="po-vendor"'), '商品の画面に先方品番の段が無い');
+    assert.match(page.text, /class="f po-vrow" data-sup="1" data-base="[^"]+" data-mine="1"/);
+    assert.match(page.text, /class="f po-vrow" data-sup="3" data-base="[^"]+" data-mine=""/);
+    assert.match(page.text, /value="AC-9"/); assert.match(page.text, /value="24"/);
+    assert.match(page.text, /標準リードタイム 21 日/);
+    assert.match(page.text, /この商品の仕入先 \(発注アプリの決まり\) ではないので直せません/);
+    assert.match(page.text, /先方品番は 下の「発注の設定」で/);
+    assert.match(page.text, /発注の計算に使う弊社の個数/, 'ケースロットの説明 (入数の意味を分ける) が無い');
+    const sc = await checkScripts(page.text, 0);
+    assert.ok((sc.find((x) => x.includes('me-order.js — 「発注の設定」の欄の動き')) || '').includes("'/vendor-code'"), 'me-order.js が先方品番を保存しない');
+    // 発注アプリの権限が無い = 段を出さない (写しの値は今までどおり)
+    page = await call('GET', '/apps/master-edit/sku/po-web-9', { session: 'editor' });
+    assert.ok(!page.text.includes('class="f po-vrow"'));
+    const url = '/apps/master-edit/api/sku/po-web-9/vendor-code';
+    const cur = vmapOf('1', 'po-web-9');
+    // 版が無い = 428・権限 = 403・セット = 400・仕入先一致でない = 400・古い版 = 409・合う版 = 直す (記録 via master-edit:sku)
+    assert.equal((await call('POST', url, { session: 'po-editor', body: { supplier_code: '1', vendor_code: 'AC-9B' } })).status, 428);
+    assert.equal((await call('POST', url, { session: 'editor', body: { supplier_code: '1', vendor_code: 'AC-9B', base_updated_at: cur.updated_at } })).j.reason, 'no_po_access');
+    assert.equal((await call('POST', url, { session: 'po-viewer', body: { supplier_code: '1', vendor_code: 'AC-9B', base_updated_at: cur.updated_at } })).status, 403);
+    assert.equal((await call('POST', '/apps/master-edit/api/sku/new-set-1/vendor-code', { session: 'po-editor', body: { supplier_code: '1', vendor_code: 'X', base_updated_at: null } })).j.reason, 'vendor_code_set');
+    const other = await call('POST', url, { session: 'po-editor', body: { supplier_code: '3', vendor_code: 'NEW-3', base_updated_at: vmapOf('3', 'po-web-9').updated_at } });
+    assert.equal(other.status, 400, other.text); assert.match(other.j.error, /この商品の仕入先は 1 です/);
+    const stale = await call('POST', url, { session: 'po-editor', body: { supplier_code: '1', vendor_code: 'AC-9B', base_updated_at: '2020-01-01T00:00:00.000Z' } });
+    assert.deepEqual([stale.status, stale.j.conflict, vmapOf('1', 'po-web-9').vendor_code], [409, true, 'AC-9']);
+    const okr = await call('POST', url, { session: 'po-editor', body: { supplier_code: '0001', vendor_code: 'AC-9B', qty_per_unit: '１２', base_updated_at: cur.updated_at, request_id: 'rid-vc' } });
+    assert.deepEqual([okr.status, okr.j.ok, okr.j.updated, okr.j.row.vendor_code, okr.j.row.qty_per_unit], [200, true, true, 'AC-9B', 12], okr.text);
+    assert.ok(okr.j.row.updated_at > cur.updated_at);
+    const au = poAudit('supplier:1').at(-1);
+    assert.deepEqual([au.action, au.request_id, au.detail.via, au.detail.oldVendorCode], ['vendor_map_entry_upsert', 'rid-vc', 'master-edit:sku', 'AC-9']);
+    // 入数だけ = 400・空の先方品番 = 400
+    assert.equal((await call('POST', url, { session: 'po-editor', body: { supplier_code: '1', vendor_code: '', qty_per_unit: '3', base_updated_at: okr.j.row.updated_at } })).status, 400);
+    // 消す: 版が要る (null も断る)・違う = 409・ほかの仕入先の古い行も消せる
+    const del = '/apps/master-edit/api/sku/po-web-9/vendor-code/delete';
+    assert.equal((await call('POST', del, { session: 'po-editor', body: { supplier_code: '3', base_updated_at: null } })).status, 428);
+    assert.equal((await call('POST', del, { session: 'po-editor', body: { supplier_code: '3', base_updated_at: '2020-01-01' } })).status, 409);
+    const d = await call('POST', del, { session: 'po-editor', body: { supplier_code: '3', base_updated_at: vmapOf('3', 'po-web-9').updated_at } });
+    assert.deepEqual([d.status, vmapOf('3', 'po-web-9')], [200, null], d.text);
+    assert.deepEqual([poAudit('supplier:3').at(-1).action, poAudit('supplier:3').at(-1).detail.via], ['vendor_map_entry_delete', 'master-edit:sku']);
+    // 「仕入先」欄の先方品番 = 正本の値 (発注アプリの権限がある人)
+    page = await call('GET', '/apps/master-edit/sku/po-web-9', { session: 'po-editor' });
+    assert.match(page.text, /先方品番 AC-9B/);
+    // 発注の設定の保存は先方品番を受けない (別の保存)
+    const os = await call('POST', '/apps/master-edit/api/sku/po-web-9/order-settings', { session: 'po-editor', body: { seen: { updated_at: null }, values: { order_lot: '2', vendor_code: 'X' } } });
+    assert.equal(os.status, 400, os.text);
+  } finally { NSK.setNewSkuReaderForTest(null); }
 });
 
 console.log('\nproduct-hub (新規作成の入口・ボード)');
@@ -2233,7 +2455,7 @@ await ta('[W1] 今の本番と同じ DB (active = 13 キー・許可なし。con
     let e = await rejectsWith(reg('single', 'w1-single', single()), 409, 'before_cutover');
     assert.deepEqual(e.extra.load_keys, ['skus.sku_kind']);
     e = await rejectsWith(reg('set', 'w1-set', { name: 'x', standard_price: '1', shipping_code: 'S01', components: [{ code: 's001', qty: 1 }] }), 409, 'before_cutover');
-    assert.deepEqual(e.extra.load_keys.sort(), ['sku_components', 'skus.sku_kind']);
+    assert.deepEqual(e.extra.load_keys.sort(), ['skus.sku_kind'], '🆕 0099: 構成 (依頼だけ) は断る理由に入れない');
     // 許可があっても区分が load = 閉じたまま (許可は 2 層目 = 区分の門を開けない)
     await W2.setTestLease(pg, 'single', true);
     e = await rejectsWith(reg('single', 'w1-single', single()), 409, 'before_cutover');
@@ -2273,10 +2495,13 @@ await ta('[W2] DB の active に skus.sku_kind が入る (区分の widen の後
     const ok = await reg('single', 'w2-a', single({ name: 'W2 単品' }));
     assert.equal(ok.ok, true, JSON.stringify(ok));
     assert.equal((await one("select sku_kind from core.skus where code = 'w2-a'")).sku_kind, 'single');
-    // セットは構成 (sku_components) が load = 閉じたまま (許可があっても)
-    await W2.setTestLease(pg, 'set', true, { futureSetLease: true });   // 将来の形 (本物の 0058 はまだセットの許可を出さない)
-    e = await rejectsWith(reg('set', 'w2-set', { name: 'x', standard_price: '1', shipping_code: 'S01', components: [{ code: 's001', qty: 1 }] }), 409, 'before_cutover');
-    assert.deepEqual(e.extra.load_keys, ['sku_components']);
+    // 🆕 0099: セットは構成 (sku_components) が load でも開く (構成は依頼だけ)。セットの許可が無い = 409 new_entry_closed / ある = 登録できる (core の構成は書かない)
+    await W2.setTestLease(pg, 'set', false);
+    e = await rejectsWith(reg('set', 'w2-set', { name: 'x', standard_price: '1', shipping_code: 'S01', components: [{ code: 's001', qty: 1 }] }), 409, 'new_entry_closed');
+    await W2.setTestLease(pg, 'set', true, { futureSetLease: true });
+    const okSet = await reg('set', 'w2-set', { name: 'W2 セット', standard_price: '1', shipping_code: 'S01', components: [{ code: 's001', qty: 1 }] }, { create: false });
+    assert.equal(okSet.ok, true, JSON.stringify(okSet));
+    assert.equal((await one('select count(*)::int as n from core.sku_components where parent_sku_id = $1', [okSet.sku_id])).n, 0);
     // 非常の止め (env MASTER_NEW_ENTRY_STOP=1) = 許可があっても閉じる・画面も
     process.env.MASTER_NEW_ENTRY_STOP = '1';
     try {
@@ -3115,6 +3340,295 @@ await ta('[SP8] Codex R1: 断られた押し直しの作るセットは通った
   assert.equal(retryNew.status, 200, retryNew.text);
   assert.equal(SPS.readSetPlan(bUnk.request_id).state, 'dropped');
   assert.deepEqual(setsOf(draftOf('sp-unknown').id).map((x) => x.ne_code), ['sp-unknown-2']);
+});
+
+console.log('\nセットの登録が作るセットの下書きを引き継ぐ (2026-10-21 スタッフ「calypso-2-pb が product-hub のセットのカード (下書き) (#252) が使っています」)');
+/** セットの登録の本文 (カードを作る) */
+const setRegBody = (code, components, over = {}) => ({ request_id: uuid(), kind: 'set', code, values: { name: `${code} のセット`, standard_price: '2500', reorder_months: '1', components }, card: { create: true }, ...over });
+/** 作るセットつきで単品を登録して、できたセットの下書き (カード) を返す */
+async function plannedSet(single, setCode, qty = 2) {
+  const b = spBody(single, [{ qty, code: setCode, name: `${single} ${qty}個セット` }]);
+  b.values.cost = { jpy: '600' };   // 原価がある単品 (セットの原価を構成品から合計できる)
+  const r = await call('POST', '/apps/master-edit/api/new', { body: b });
+  assert.equal(r.status, 200, r.text);
+  const d = draftOf(setCode.toLowerCase());
+  assert.ok(d && d.parent_draft_id && d.provisional_code === 1, `セットの下書きが無い: ${setCode}`);
+  return d;
+}
+const cardsOf = (code) => ph.prepare('SELECT * FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ? ORDER BY id').all(String(code).toLowerCase());
+
+await ta('[TK1] 同じコード・同じ構成のセットの登録 = 断らない・カードの取り込みがその下書きを引き継ぐ (新しいカードは作らない・Company DB の SKU に結ぶ・仮コードのまま)・押し直し / 届け直しでも 1 枚・product-hub でコードを変えさせない', async () => {
+  const planned = await plannedSet('sp-take', 'sp-take-2');
+  // その場の確かめ (単品の画面の作るセットの確かめ) は、今までどおり「カードが使っている」
+  assert.equal((await call('GET', '/apps/master-edit/api/set-code-check?code=sp-take-2&parent=sp-x')).j.reason, 'ph_draft');
+  const body = setRegBody('sp-take-2', [{ code: 'SP-TAKE', qty: 2 }]);   // 構成品のコードは大文字小文字を同じと見る
+  const r = await call('POST', '/apps/master-edit/api/new', { body });
+  assert.equal(r.status, 200, r.text);
+  assert.deepEqual([r.j.card.status, r.j.card.draft_id, r.j.card.taken_over], ['done', planned.id, true], JSON.stringify(r.j.card));
+  const after = cardsOf('sp-take-2');
+  assert.equal(after.length, 1, '新しいカードを作らない');
+  assert.deepEqual([after[0].id, String(after[0].cdb_sku_id), after[0].provisional_code, after[0].parent_draft_id], [planned.id, String(r.j.sku_id), 1, planned.parent_draft_id]);
+  // 発送方法 (楽天の配送方法) は空だったので埋めた・売価はカードの値のまま (変えなかった欄として返す)
+  assert.ok(r.j.card.not_applied.some((x) => x.field === 'price'), JSON.stringify(r.j.card.not_applied));
+  assert.ok(!r.j.card.not_applied.some((x) => x.field === 'set_members'), '同じ構成は「変えなかった欄」に出さない');
+  assert.ok(ph.prepare("SELECT 1 FROM draft_events WHERE draft_id = ? AND event = 'cdb_card_taken_over'").get(planned.id), '引き継いだ記録');
+  const evRow = ph.prepare('SELECT outcome, draft_id FROM ph_cdb_card_events WHERE cdb_sku_id = ?').get(Number(r.j.sku_id));
+  assert.deepEqual([evRow.outcome, evRow.draft_id], ['linked', planned.id]);
+  // 登録の前に予約 (request_id → カード) → 登録できた → 取り込みで結んだ = applied
+  assert.deepEqual(ph.prepare('SELECT draft_id, state, cdb_sku_id FROM ph_set_card_takeovers WHERE request_id = ?').get(body.request_id), { draft_id: planned.id, state: 'applied', cdb_sku_id: Number(r.j.sku_id) });
+  // Company DB の知らせは done (結果 = linked)
+  const ob = await one('select status, result from ops.product_hub_outbox where sku_id = $1', [r.j.sku_id]);
+  assert.deepEqual([ob.status, ob.result.outcome, ob.result.taken_over], ['done', 'linked', true]);
+  // 押し直し (同じ request_id) = 前の結果・届け直し (別の知らせの番号) = 結んであった
+  const again = await call('POST', '/apps/master-edit/api/new', { body });
+  assert.deepEqual([again.status, again.j.replayed], [200, true], again.text);
+  const ev = await evOf(r.j.sku_id);
+  assert.equal(PH.applyCdbCardEvent({ event_id: ev.event_id, sku_id: ev.sku_id, schema_version: 'ph-card-v1', payload: ev.payload, request_id: ev.request_id, request_hash: ev.request_hash }).replayed, true);
+  assert.equal(PH.applyCdbCardEvent({ event_id: uuid(), sku_id: ev.sku_id, schema_version: 'ph-card-v1', payload: ev.payload, request_id: ev.request_id, request_hash: ev.request_hash }).outcome, 'linked');
+  assert.equal(cardsOf('sp-take-2').length, 1);
+  // 結んだカードのコードは product-hub の「本コードを入力」で変えさせない (Company DB とずれる)
+  const sc = await call('POST', `/apps/product-hub/api/drafts/${planned.id}/set-code`, { body: { ne_code: 'sp-take-9' } });
+  assert.equal(sc.status, 400, sc.text);
+  assert.match(sc.j.error, /マスタの入力で登録した商品に結んである/);
+  assert.equal(cardsOf('sp-take-2').length, 1);
+  // 同じコードでもう一度 (別の登録) = 断る (カードはもう Company DB の商品に結んである = 2 つ目の SKU に結ばない)
+  const dup = await call('POST', '/apps/master-edit/api/new', { body: setRegBody('sp-take-2', [{ code: 'sp-take', qty: 2 }]) });
+  assert.deepEqual([dup.status, dup.j.reason], [409, 'set_code_reserved'], dup.text);
+  assert.match(dup.j.error, /もう Company DB の商品に結んであります/);
+});
+
+await ta('[TK2] 引き継がない = 断る (どのカードか・なぜか・何をするかの 1 行・カードを開く URL)・何も保存しない: 構成が違う / 「出品カードを作る」を外した / 除外したカード / 単品の登録', async () => {
+  const planned = await plannedSet('sp-nt', 'sp-nt-2');
+  const url = `/apps/product-hub/detail/${planned.id}`;
+  const refuse = async (body, reason, re) => {
+    const r = await call('POST', '/apps/master-edit/api/new', { body });
+    assert.deepEqual([r.status, r.j.reason, r.j.field, r.j.card_url, r.j.draft_id], [409, reason, 'code', url, planned.id], r.text);
+    assert.match(r.j.error, re);
+    assert.match(r.j.error, /何も保存していません$/);
+    assert.equal(await skuId(body.code), undefined);
+    return r;
+  };
+  await refuse(setRegBody('sp-nt-2', [{ code: 'sp-nt', qty: 3 }]), 'set_code_reserved', new RegExp(`\\(#${planned.id}\\) が使っています \\(カードの構成 \\(sp-nt×2\\) と入れた構成 \\(sp-nt×3\\) がちがいます\\)。構成をカードと同じにするか、別のコードにしてください`));
+  await refuse(setRegBody('sp-nt-2', [{ code: 'sp-nt', qty: 2 }, { code: 's001', qty: 1 }]), 'set_code_reserved', /がちがいます/);
+  await refuse(setRegBody('sp-nt-2', [{ code: 'sp-nt', qty: 2 }], { card: { create: false } }), 'set_card_needed', /「出品カードを作る」を外さずに登録してください/);
+  await refuse({ request_id: uuid(), kind: 'single', code: 'sp-nt-2', values: withReq('single', single()), card: { create: false } }, 'set_code_reserved', /セットのカード \(下書き\) \(#\d+\) が使っています。別のコードにするか、product-hub でカードを確かめてください/);
+  ph.prepare(`UPDATE product_drafts SET status = 'excluded' WHERE id = ?`).run(planned.id);
+  await refuse(setRegBody('sp-nt-2', [{ code: 'sp-nt', qty: 2 }]), 'set_code_reserved', /\(除外にしてあります\)/);
+  ph.prepare(`UPDATE product_drafts SET status = 'draft' WHERE id = ?`).run(planned.id);
+  // 画面の JS: 断った文の下にカードを開くリンク (同じポータルの URL だけ)
+  const page = await call('GET', '/apps/master-edit/new?kind=set');
+  const js = (await checkScripts(page.text, 0)).find((x) => x.includes('me-new.js — 新商品の登録の画面')) || '';
+  assert.ok(js.includes("/^\\/apps\\/product-hub\\/detail\\/\\d+$/.test(String(j.card_url))"), '画面がカードのリンクを出さない');
+  assert.ok(js.includes('を、このセットの出品カードとして引き継ぎました'), '画面が引き継いだことを知らせない');
+});
+
+await ta('[TK3] 確かめた後にカードが変わった (構成を直した) = 結ばずに衝突 (人が決める)・直したら「もう一度作る」で引き継ぐ・登録の取引の中でももう一度確かめる', async () => {
+  const planned = await plannedSet('sp-race', 'sp-race-2');
+  applierMode = 'boom';   // 登録の直後のカードの取り込みは落ちる (Company DB の登録と知らせは残る)
+  const r = await call('POST', '/apps/master-edit/api/new', { body: setRegBody('sp-race-2', [{ code: 'sp-race', qty: 2 }]) });
+  applierMode = 'real';
+  assert.deepEqual([r.status, r.j.card.status], [200, 'failed'], r.text);
+  ph.prepare('UPDATE draft_set_members SET qty = 3 WHERE set_draft_id = ?').run(planned.id);
+  let retry = await call('POST', '/apps/master-edit/api/sku/sp-race-2/card-retry', { body: {} });
+  assert.deepEqual([retry.status, retry.j.status], [200, 'conflict'], retry.text);
+  assert.equal(cardsOf('sp-race-2').length, 1);
+  assert.equal(cardsOf('sp-race-2')[0].cdb_sku_id, null, '構成の違うカードに結ばない');
+  ph.prepare('UPDATE draft_set_members SET qty = 2 WHERE set_draft_id = ?').run(planned.id);
+  retry = await call('POST', '/apps/master-edit/api/sku/sp-race-2/card-retry', { body: {} });
+  assert.deepEqual([retry.status, retry.j.status], [200, 'done'], retry.text);
+  assert.deepEqual([cardsOf('sp-race-2').length, String(cardsOf('sp-race-2')[0].cdb_sku_id)], [1, String(r.j.sku_id)]);
+  // 登録の取引の中 (コードの鍵の後) の確かめでも、引き継げないカードなら断る (codeReserved = 入口と同じ)
+  const planned2 = await plannedSet('sp-race3', 'sp-race3-2');
+  ph.prepare(`UPDATE product_drafts SET status = 'excluded' WHERE id = ?`).run(planned2.id);
+  const e = await rejectsWith(asEditor(() => R.registerNewSku(db, { actor: 'naka@test', requestId: uuid(), kind: 'set', code: 'sp-race3-2', values: { name: 'x', standard_price: '2400', reorder_months: '1', components: [{ code: 'sp-race3', qty: 2 }] }, card: { create: true } },
+    { open: true, now: NOW, shippingRates: RATES, codeReserved: async () => ({ status: 409, reason: 'set_code_reserved', message: '商品コード sp-race3-2 は product-hub のセットのカード (下書き) が使っています', card_url: `/apps/product-hub/detail/${planned2.id}`, draft_id: planned2.id }) })), 409, 'set_code_reserved');
+  assert.equal(e.extra.card_url, `/apps/product-hub/detail/${planned2.id}`);
+  assert.equal(await skuId('sp-race3-2'), undefined);
+});
+
+await ta('[TK5] Codex R1 Medium: 登録の後 (取り込みの前) にカードのコードを変えた = 新しいカードを作らずに衝突 (予約したカードにだけ結ぶ)・取り込み待ちの間は product-hub でコードを変えさせない・除外したら新しいカード・断られた登録の予約は外す', async () => {
+  const planned = await plannedSet('sp-rn', 'sp-rn-2');
+  applierMode = 'boom';
+  const b = setRegBody('sp-rn-2', [{ code: 'sp-rn', qty: 2 }]);
+  const r = await call('POST', '/apps/master-edit/api/new', { body: b });
+  applierMode = 'real';
+  assert.deepEqual([r.status, r.j.card.status], [200, 'failed'], r.text);
+  assert.deepEqual(ph.prepare('SELECT draft_id, state, cdb_sku_id FROM ph_set_card_takeovers WHERE request_id = ?').get(b.request_id), { draft_id: planned.id, state: 'registered', cdb_sku_id: Number(r.j.sku_id) });
+  // 取り込み待ちの間 = product-hub の「本コードを入力」で変えさせない
+  const sc = await call('POST', `/apps/product-hub/api/drafts/${planned.id}/set-code`, { body: { ne_code: 'sp-rn-9' } });
+  assert.equal(sc.status, 409, sc.text);
+  assert.match(sc.j.error, /引き継ぐセットの登録をしているところ/);
+  // それでもコードが変わった (別の道) = 取り込みは新しいカードを作らない (衝突・予約したカードを見せる)
+  ph.prepare(`UPDATE product_drafts SET ne_code = 'sp-rn-9' WHERE id = ?`).run(planned.id);
+  let retry = await call('POST', '/apps/master-edit/api/sku/sp-rn-2/card-retry', { body: {} });
+  assert.deepEqual([retry.status, retry.j.status], [200, 'conflict'], retry.text);
+  assert.equal(cardsOf('sp-rn-2').length, 0, '新しいカードを作らない');
+  assert.match(retry.j.error || JSON.stringify(retry.j), /引き継ぐはずの product-hub のカード \(#\d+\) が、登録の後に変わりました \(カードのコードが sp-rn-9 に変わりました\)/);
+  // コードがもう予約のときと違う = 差し替えを止めない (直す操作を止めない・Codex R2 Medium 2)
+  assert.equal(SPS.liveTakeoverOf(planned.id), null);
+  // コードを戻せば引き継ぐ
+  ph.prepare(`UPDATE product_drafts SET ne_code = 'sp-rn-2' WHERE id = ?`).run(planned.id);
+  assert.ok(SPS.liveTakeoverOf(planned.id), 'コードを戻した = また止める');
+  retry = await call('POST', '/apps/master-edit/api/sku/sp-rn-2/card-retry', { body: {} });
+  assert.deepEqual([retry.status, retry.j.status], [200, 'done'], retry.text);
+  assert.deepEqual([cardsOf('sp-rn-2').length, cardsOf('sp-rn-2')[0].id], [1, planned.id]);
+  // 人が予約したカードを除外した (使わない) = 予約は使わない = 今までどおり (同じコードの除外したカードがある = 衝突 / 片付けてコードも変えた = 新しいカード)
+  const p2 = await plannedSet('sp-ex', 'sp-ex-2');
+  applierMode = 'boom';
+  const r2 = await call('POST', '/apps/master-edit/api/new', { body: setRegBody('sp-ex-2', [{ code: 'sp-ex', qty: 2 }]) });
+  applierMode = 'real';
+  assert.equal(r2.status, 200, r2.text);
+  ph.prepare(`UPDATE product_drafts SET status = 'excluded' WHERE id = ?`).run(p2.id);
+  assert.equal(SPS.liveTakeoverOf(p2.id), null, '除外したカード = 差し替えを止めない (片付けられる・Codex R2 Medium 2)');
+  ph.prepare(`UPDATE product_drafts SET ne_code = 'sp-ex-2-old' WHERE id = ?`).run(p2.id);
+  retry = await call('POST', '/apps/master-edit/api/sku/sp-ex-2/card-retry', { body: {} });
+  assert.deepEqual([retry.status, retry.j.status], [200, 'done'], retry.text);
+  assert.equal(cardsOf('sp-ex-2').length, 1);
+  assert.notEqual(cardsOf('sp-ex-2')[0].id, p2.id, '除外したカードには結ばない');
+  // 断られた登録 (Company DB の決まり) = 予約は dropped (コードの差し替えを止めない)
+  const p3 = await plannedSet('sp-dr', 'sp-dr-2');
+  const b3 = setRegBody('sp-dr-2', [{ code: 'sp-dr', qty: 2 }], { values: { name: 'x', standard_price: '2500', reorder_months: '1', components: [{ code: 'sp-dr', qty: 2 }], set_sales_class_override: '3' } });
+  const r3 = await call('POST', '/apps/master-edit/api/new', { body: b3 });
+  assert.equal(r3.status, 400, r3.text);
+  assert.equal(ph.prepare('SELECT state FROM ph_set_card_takeovers WHERE request_id = ?').get(b3.request_id).state, 'dropped');
+  assert.equal(SPS.liveTakeoverOf(p3.id), null);
+});
+
+await ta('[TK6] Codex R2 Medium 1: 入口の確かめの後に、引き継げるカードが初めて現れた (予約していない) = 登録の取引の中の確かめで断る (予約の無いカードには結ばない)・何も保存しない', async () => {
+  const planned = await plannedSet('sp-late', 'sp-late-x');
+  // 入口の確かめのときは product-hub にこのコードのカードが無かった = 1 回目の held だけ「無い」と答える (その後に誰かがカードのコードを変えた、と同じ)
+  const real = { held: (c, o) => SPS.setCodeHeld(c, o), planned: (c, o) => SPS.plannedSetCardCheck(c, o || {}), reserveTake: (x) => SPS.reserveSetCardTakeover(x), markTake: (rid, x) => SPS.markSetCardTakeover(rid, x),
+    write: (x) => SPS.writeSetPlan(x), mark: (rid, x) => SPS.markSetPlan(rid, x), stale: (codes, o) => SPS.staleWaitingPlansFor(codes, o || {}) };
+  let n = 0;
+  MR.__setSetPlanStore({ ...real, held: (c, o) => (n++ === 0 ? null : real.held(c, o)) });
+  try {
+    ph.prepare(`UPDATE product_drafts SET ne_code = 'sp-late-2' WHERE id = ?`).run(planned.id);
+    const b = setRegBody('sp-late-2', [{ code: 'sp-late', qty: 2 }]);
+    const r = await call('POST', '/apps/master-edit/api/new', { body: b });
+    assert.deepEqual([r.status, r.j.reason, r.j.card_url], [409, 'set_card_changed', `/apps/product-hub/detail/${planned.id}`], r.text);
+    assert.match(r.j.error, /引き継ぐカードがちょうど変わりました。画面を開き直してください。何も保存していません/);
+    assert.equal(await skuId('sp-late-2'), undefined);
+    assert.equal(ph.prepare('SELECT COUNT(*) AS c FROM ph_set_card_takeovers WHERE request_id = ?').get(b.request_id).c, 0);
+  } finally { MR.__setSetPlanStore(null); }
+  // ふつうに押し直す (入口で見つかる = 予約する) = 引き継ぐ
+  const again = await call('POST', '/apps/master-edit/api/new', { body: setRegBody('sp-late-2', [{ code: 'sp-late', qty: 2 }]) });
+  assert.equal(again.status, 200, again.text);
+  assert.deepEqual([again.j.card.taken_over, again.j.card.draft_id], [true, planned.id]);
+});
+
+await ta('[TK7] 中原さん 10/21: product-hub の「セット商品を作る」で作って手でコードを入れたセットのカードも、同じ条件で引き継ぐ (予約 → 登録 → 結ぶ・押し直しでも 1 枚)・「下書き」の画面に出す (仮コード SET-… のままは出さない)・構成が違う = 断る', async () => {
+  const sr = await call('POST', '/apps/master-edit/api/new', { body: { request_id: uuid(), kind: 'single', code: 'sp-man', values: withReq('single', single({ cost: { jpy: '600' } })), card: { create: true } } });
+  assert.equal(sr.status, 200, sr.text);
+  const parentId = draftOf('sp-man').id;
+  const mkCard = (code, qty) => {
+    const id = Number(ph.prepare(`INSERT INTO product_drafts (ne_code, name, status, parent_draft_id, provisional_code, created_by) VALUES (?, ?, 'draft', ?, 1, 'x')`).run(code, `手で作ったセット ${code}`, parentId).lastInsertRowid);
+    ph.prepare('INSERT INTO draft_set_members (set_draft_id, member_ne_code, qty, sort) VALUES (?, ?, ?, 0)').run(id, 'sp-man', qty);
+    return id;
+  };
+  const man = mkCard('sp-man-2', 2);
+  const prov = mkCard('SET-sp-man-01', 4);   // 仮コードのまま (まだ登録できるコードが無い)
+  const diff = mkCard('sp-man-3', 3);
+  // 「下書き」の画面: 手で作ったセットのカードも出す・仮コードのままは出さない
+  const list = await call('GET', '/apps/master-edit/drafts');
+  const row = new RegExp(`<tr data-ph-draft="${man}">[\\s\\S]*?</tr>`).exec(list.text);
+  assert.ok(row, '手で作ったセットのカードが出ない');
+  assert.ok(row[0].includes('data-source="manual"') && row[0].includes('product-hub で作った') && row[0].includes('href="/apps/master-edit/sku/sp-man"'), row[0]);
+  assert.ok(row[0].includes(`from_card=${man}"`), 'セットとして登録する');
+  assert.ok(!list.text.includes(`data-ph-draft="${prov}"`), '仮コードのままのカードは出さない');
+  // 入れておく値も同じ
+  const pre = JSON.parse(/<script type="application\/json" id="me-new">([\s\S]*?)<\/script>/.exec((await call('GET', `/apps/master-edit/new?kind=set&from_card=${man}`)).text)[1]).prefill;
+  assert.deepEqual(pre, { code: 'sp-man-2', name: '手で作ったセット sp-man-2', components: [{ code: 'sp-man', qty: 2 }] });
+  // 登録 = 引き継ぐ (予約 → 登録 → 結ぶ)
+  const body = setRegBody('sp-man-2', [{ code: 'sp-man', qty: 2 }]);
+  const r = await call('POST', '/apps/master-edit/api/new', { body });
+  assert.equal(r.status, 200, r.text);
+  assert.deepEqual([r.j.card.status, r.j.card.taken_over, r.j.card.draft_id], ['done', true, man], JSON.stringify(r.j.card));
+  assert.deepEqual(ph.prepare('SELECT draft_id, state FROM ph_set_card_takeovers WHERE request_id = ?').get(body.request_id), { draft_id: man, state: 'applied' });
+  assert.deepEqual([cardsOf('sp-man-2').length, String(cardsOf('sp-man-2')[0].cdb_sku_id), cardsOf('sp-man-2')[0].provisional_code], [1, String(r.j.sku_id), 1]);
+  // 押し直し・届け直し = 1 枚のまま
+  const again = await call('POST', '/apps/master-edit/api/new', { body });
+  assert.deepEqual([again.status, again.j.replayed], [200, true], again.text);
+  const ev = await evOf(r.j.sku_id);
+  assert.equal(PH.applyCdbCardEvent({ event_id: uuid(), sku_id: ev.sku_id, schema_version: 'ph-card-v1', payload: ev.payload, request_id: ev.request_id, request_hash: ev.request_hash }).outcome, 'linked');
+  assert.equal(cardsOf('sp-man-2').length, 1);
+  assert.ok(!(await call('GET', '/apps/master-edit/drafts')).text.includes(`data-ph-draft="${man}"`), '登録したら「下書き」の画面から消える');
+  // 構成が違う = 断る (カードを開くリンク)
+  const no = await call('POST', '/apps/master-edit/api/new', { body: setRegBody('sp-man-3', [{ code: 'sp-man', qty: 2 }]) });
+  assert.deepEqual([no.status, no.j.reason, no.j.card_url], [409, 'set_code_reserved', `/apps/product-hub/detail/${diff}`], no.text);
+  assert.match(no.j.error, /カードの構成 \(sp-man×3\) と入れた構成 \(sp-man×2\) がちがいます/);
+  assert.equal(await skuId('sp-man-3'), undefined);
+});
+
+await ta('[TK4] コードの書き方 (大文字小文字) だけ違う = 引き継いでカードのコードを Company DB の書き方にそろえる', async () => {
+  const planned = await plannedSet('sp-case', 'sp-case-2');
+  const r = await call('POST', '/apps/master-edit/api/new', { body: setRegBody('SP-Case-2', [{ code: 'sp-case', qty: 2 }]) });
+  assert.equal(r.status, 200, r.text);
+  assert.deepEqual([r.j.card.taken_over, r.j.card.draft_id], [true, planned.id]);
+  assert.equal(ph.prepare('SELECT ne_code FROM product_drafts WHERE id = ?').get(planned.id).ne_code, 'SP-Case-2');
+});
+
+await ta('[DR1] 「下書き」の画面: 左の列の入口・product-hub のまだ登録していないセットの下書き (コード・名前・構成・元の単品・開く・セットとして登録する) とマスタの入力の下書き (登録の状態 = 下書き)・引き継いだカードは出さない・一覧の「登録が下書き」から案内', async () => {
+  const planned = await plannedSet('sp-list', 'sp-list-2', 3);
+  const r = await call('GET', '/apps/master-edit/drafts');
+  assert.equal(r.status, 200, r.text.slice(0, 300));
+  await checkScripts(r.text);
+  assert.match(r.text, /<a class="nav on" href="\/apps\/master-edit\/drafts" aria-label="下書き" aria-current="page">/);
+  const phSec = /<section class="panel" id="drafts-ph"[\s\S]*?<\/section>/.exec(r.text)[0];
+  const row = new RegExp(`<tr data-ph-draft="${planned.id}">[\\s\\S]*?</tr>`).exec(phSec);
+  assert.ok(row, 'まだ登録していないセットの下書きが出ない');
+  assert.ok(row[0].includes('sp-list-2') && row[0].includes('sp-list 3個セット') && row[0].includes('sp-list × 3'), row[0]);
+  assert.ok(row[0].includes(`href="/apps/product-hub/detail/${planned.id}"`), 'product-hub で開くリンク');
+  assert.ok(row[0].includes(`href="/apps/master-edit/new?kind=set&amp;from_card=${planned.id}"`), 'セットとして登録する');
+  assert.ok(row[0].includes('href="/apps/master-edit/sku/sp-list"'), '元の単品');
+  assert.ok(!/data-ph-draft="[^"]*"[^>]*>[\s\S]{0,200}sp-take-2/.test(phSec) && !phSec.includes('>sp-take-2<'), '引き継いだ (登録した) カードは出さない');
+  // 除外したカードは出さない
+  const ex = draftOf('sp-nt-2');
+  ph.prepare(`UPDATE product_drafts SET status = 'excluded' WHERE id = ?`).run(ex.id);
+  assert.ok(!(await call('GET', '/apps/master-edit/drafts')).text.includes(`data-ph-draft="${ex.id}"`));
+  ph.prepare(`UPDATE product_drafts SET status = 'draft' WHERE id = ?`).run(ex.id);
+  // マスタの入力の下書き = 登録の状態が下書きの商品 (単品・セット)・商品の画面へ
+  const cdbSec = /<section class="panel" id="drafts-cdb"[\s\S]*?<\/section>/.exec(r.text)[0];
+  for (const code of ['sp-list', 'sp-take-2']) assert.ok(cdbSec.includes(`<tr data-cdb-draft="${code}">`), `マスタの入力の下書きに ${code} が無い`);
+  const n = (await one(`select count(*)::int as n from ops.master_registrations where state = 'draft'`)).n;
+  assert.match(cdbSec, new RegExp(`id="drafts-cdb-n">${n} 件<`));
+  // 見るだけの人: 「セットとして登録する」は出さない (開くのは出す)
+  const v = await call('GET', '/apps/master-edit/drafts', { session: 'viewer' });
+  assert.equal(v.status, 200);
+  assert.ok(v.text.includes(`data-ph-draft="${planned.id}"`) && !v.text.includes('data-take='), '見るだけの人に登録の入口');
+  // product-hub を読めない = その節だけ一言 (画面は出す)
+  MR.__setSetPlanStore({ write: () => 0, mark: () => 0, held: () => null, openCards: () => { throw new Error('SQLite を読めない'); } });
+  try {
+    const e = await call('GET', '/apps/master-edit/drafts');
+    assert.equal(e.status, 200);
+    assert.match(e.text, /product-hub のカードを読めません/);
+    assert.ok(e.text.includes('<tr data-cdb-draft="sp-list">'));
+  } finally { MR.__setSetPlanStore(null); }
+  // 一覧の「登録が下書き」で絞ったとき = 「下書き」の画面へ案内
+  const list = await call('GET', '/apps/master-edit/?reg=draft');
+  assert.match(list.text, /id="drafts-hint"[\s\S]*?href="\/apps\/master-edit\/drafts">下書き<\/a> の画面に出ます/);
+  assert.ok(!(await call('GET', '/apps/master-edit/')).text.includes('id="drafts-hint"'));
+});
+
+await ta('[DR2] 「セットとして登録する」= セットの登録の画面にコード・名前・構成を入れておく (画面の JS が欄に入れる)・引き継げないカード = 理由の帯・押して保存すると引き継ぐ', async () => {
+  const planned = draftOf('sp-list-2');
+  const r = await call('GET', `/apps/master-edit/new?kind=set&from_card=${planned.id}`);
+  assert.equal(r.status, 200);
+  const pageData = JSON.parse(/<script type="application\/json" id="me-new">([\s\S]*?)<\/script>/.exec(r.text)[1]);
+  assert.deepEqual(pageData.prefill, { code: 'sp-list-2', name: 'sp-list 3個セット', components: [{ code: 'sp-list', qty: 3 }] });
+  assert.match(r.text, new RegExp(`id="prefill-note"[\\s\\S]*?セットの下書き #${planned.id} \\(sp-list-2\\) を、このセットのカードとして引き継いで登録します`));
+  const js = (await checkScripts(r.text, 0)).find((x) => x.includes('me-new.js — 新商品の登録の画面')) || '';
+  assert.ok(js.includes('var pf = P.prefill;'), '画面の JS が入れておく値を使わない');
+  // 単品の画面・番号の違うカード・除外したカード
+  assert.equal(JSON.parse(/<script type="application\/json" id="me-new">([\s\S]*?)<\/script>/.exec((await call('GET', `/apps/master-edit/new?kind=single&from_card=${planned.id}`)).text)[1]).prefill, null);
+  const bad = await call('GET', '/apps/master-edit/new?kind=set&from_card=999999');
+  assert.match(bad.text, /id="prefill-note"[\s\S]*?まだ登録していないセットの下書きではありません/);
+  const taken = draftOf('sp-take-2');
+  assert.match((await call('GET', `/apps/master-edit/new?kind=set&from_card=${taken.id}`)).text, /まだ登録していないセットの下書きではありません/);
+  // そのまま登録 = 引き継ぐ
+  const s = await call('POST', '/apps/master-edit/api/new', { body: setRegBody(pageData.prefill.code, pageData.prefill.components) });
+  assert.equal(s.status, 200, s.text);
+  assert.deepEqual([s.j.card.taken_over, s.j.card.draft_id, cardsOf('sp-list-2').length], [true, planned.id, 1]);
+  assert.ok(!(await call('GET', '/apps/master-edit/drafts')).text.includes(`data-ph-draft="${planned.id}"`), '登録したら product-hub の節から消える');
 });
 
 server.close();

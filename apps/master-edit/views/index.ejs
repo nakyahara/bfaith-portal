@@ -37,7 +37,10 @@
     };
     const c = counts || {};
     // 札で出せない絞り込み (状態 = 取扱中・登録の下書き以外・札の無い未入力) のときは「もっと絞る」を開いておく
-    const moreOn = (filters.state && filters.state !== 'discontinued') || (filters.reg && filters.reg !== 'draft') || (filters.missing && !['cost', 'sales', 'tax'].includes(filters.missing));
+    const moreOn = (filters.state && filters.state !== 'discontinued') || (filters.reg && filters.reg !== 'draft') || (filters.missing && !['cost', 'sales', 'tax'].includes(filters.missing))
+      || (filters.life && filters.life !== 'end_soon');   // 🆕 0088: 商品の段階 (札は「終売の予定が近い」だけ)
+    // 🆕 0088: ブランド・商品の段階 (router の brandLifeList = { today, stages, filters, endBadge })。無い = 0088 の前の画面と同じ
+    const BL = locals.brandLifeList || null;
   %>
   <div class="page" id="list-page">
     <div class="ph">
@@ -54,6 +57,8 @@
     <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div></div></div><% } %>
     <% if (closed) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">いまは保存できません (<%= closedWhy %>)</div><div class="hint">この画面は見るだけです。切替日までは商品マスタの正は NE・/register です。</div></div></div><% } %>
     <% if (!canEdit) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= gateMessage %></div></div><% } %>
+    <%# 🆕 2026-10-21: 「登録が下書き」で絞ったとき = product-hub のセットの下書き (まだ登録していない) はここに出ない = 「下書き」の画面へ %>
+    <% if (filters.reg === 'draft') { %><div class="callout info" id="drafts-hint"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">ここに出るのはマスタの入力に登録した下書きだけです。単品の登録で「セット商品を作る」にしたセットの下書き (product-hub) は <a href="<%= base %>/drafts">下書き</a> の画面に出ます。</div></div><% } %>
 
     <div class="panel hud">
       <form method="get" action="" role="search" class="bigsearch" id="list-search">
@@ -84,6 +89,7 @@
           <% if (c.card_waiting != null) { %><%- chip('カード作成待ち', 'card', 'waiting', nOf(c.card_waiting), 'warn') %><% } %>
           <% if (c.card_conflict) { %><%- chip('カードの衝突', 'card', 'conflict', nOf(c.card_conflict), 'err') %><% } %>
           <% if (data.diffAvailable) { %><%- chip('NE との差', 'diff', '1', nOf(c.diff), 'err') %><% } %>
+          <% if (BL && BL.ready) { %><%- chip('終売の予定が近い', 'life', 'end_soon', null, 'warn') %><% } %>
         </div>
         <details class="more filters-more"<%= moreOn ? ' open' : '' %>>
           <summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>もっと絞る (状態・登録・カード・未入力の項目)</summary>
@@ -98,6 +104,7 @@
             <label>カード <select class="in" name="card"><option value="">全部</option><% for (const [k, v] of Object.entries(CARD_FILTERS)) { %><option value="<%= k %>"<%= filters.card === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
             <label>未入力 <select class="in" name="missing"><option value="">—</option><% for (const [k, v] of Object.entries(MISSING)) { %><option value="<%= k %>"<%= filters.missing === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
             <label><input type="checkbox" name="diff" value="1"<%= filters.diff ? ' checked' : '' %><%= data.diffAvailable ? '' : ' disabled' %>> NE との差あり</label>
+            <% if (BL && (BL.ready || filters.life)) { %><label style="max-width:100%">商品の段階 <select class="in" name="life" id="f-life" style="max-width:100%"><option value="">全部</option><% for (const [k, v] of Object.entries(BL.filters)) { %><option value="<%= k %>"<%= filters.life === k ? ' selected' : '' %>><%= v %></option><% } %></select></label><% } %>
             <button class="btn sm" type="submit">この条件で表示</button>
             <% if (Object.keys(keep).length) { %><a class="btn ghost sm" href="./">条件を全部外す</a><% } %>
           </form>
@@ -110,7 +117,7 @@
           <summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>詳細検索 (商品コードを複数・JAN・仕入先・代表・名前・原価・売価・登録日・在庫・注文残)<% if (advOn) { %> <span class="b info">使っている</span><% } %></summary>
           <%# 長い条件 (商品コード 500 件など) は画面の JS が POST api/search で印にして ?s=<印> で開く (GET の URL は HTTP 431 になる)。JS が無いときは今までどおり GET %>
           <form method="get" action="" class="adv-grid" id="adv-form" data-api="api/search">
-            <% for (const k of ['q', 'missing', 'reg', 'card', 'diff', 'sort', 'dir']) { if (filters[k]) { %><input type="hidden" name="<%= k %>" value="<%= filters[k] %>"><% } } %>
+            <% for (const k of ['q', 'missing', 'reg', 'card', 'diff', 'sort', 'dir', 'life']) { if (filters[k]) { %><input type="hidden" name="<%= k %>" value="<%= filters[k] %>"><% } } %>
             <label class="adv-codes"><span class="lab">商品コード (複数)</span>
               <textarea class="in" name="codes" id="adv-codes" rows="5" spellcheck="false" placeholder="Excel の列をそのまま貼り付け&#10;(改行・カンマ・空白・タブで区切る)&#10;ぴったり当てる · 大文字小文字・全角半角は同じ"><%= filters.codes %></textarea>
               <span class="hint"><%= MULTI_MAX %> 件まで · 見つからないコードは一覧の上に出ます</span></label>
@@ -235,6 +242,10 @@
               stock: { sub: stSub, cls: refCls(st), title: stTitle },
               sup: { title: '代表の仕入先 (セットは構成品の仕入先)' },
               maker: { title: 'メーカー (Company DB だけの値・セットは構成品のメーカー)' },
+              pkg: { title: '梱包した状態の 縦×横×高さ (cm)・重さ (g)。人が入れた値、無ければ出どころ (定形外・FBA 納品) の値 (セットは持たない)' },
+              brand: { title: 'ブランド (Company DB だけの値・「自社」= 自社ブランド・セットは構成品から)' },
+              stage: { title: '商品の区分 = 定番・季節・試し (Company DB だけの値・単品だけ)' },
+              end_on: { title: '終売の予定日 (Company DB だけの値・単品だけ)' + (BL ? ' · 「あと N 日」= ' + BL.soonDays + ' 日以内' : '') },
               fba: { sub: fbSub, cls: refCls(fb), title: fbTitle },
               sold: { sub: saSub, cls: refCls(sa), title: saTitle },
               po: { sub: !bo || !bo.ok ? '読めない' : '発注', cls: !bo || !bo.ok ? ' bad' : '', title: !bo || !bo.ok ? '発注アプリの台帳を読めない' : '発注アプリの注文残 (発注したがまだ入庫していない数)' },
@@ -273,9 +284,13 @@
               <% } else if (id === 'stock') { %><td class="n ref" data-col="stock"<%= hide %>><% if (isSet) { %><% if (r.buildable != null) { %><span title="構成品の在庫から作れる数 (参考)"><%= r.buildable.toLocaleString('ja-JP') %></span><span class="fx">作れる</span><% } %><% } else if (r.stock != null) { %><%= r.stock ? r.stock.toLocaleString('ja-JP') : '0' %><% } else { %><span class="muted">—</span><% } %></td>
               <% } else if (id === 'sup') { %><td data-col="sup"<%= hide %>><% if (isSet) { %><span class="muted" title="セットの仕入先は構成品の仕入先">構成品から</span><% } else if (r.primary_supplier) { %><span class="supc mono"><%= r.primary_supplier %></span> <%= r.primary_supplier_name || '' %><% } else { %><span class="muted"<%- r.kind === 'exception' ? '' : ' title="代表の仕入先なし"' %>>—</span><% } %></td>
               <% } else if (id === 'maker') { %><td data-col="maker"<%= hide %>><% if (isSet) { %><span class="muted" title="セットのメーカーは構成品のメーカー">構成品から</span><% } else if (r.maker) { %><%= r.maker %><% } else { %><span class="muted">—</span><% } %></td>
+              <% } else if (id === 'brand') { %><td data-col="brand"<%= hide %>><% if (isSet) { %><span class="muted" title="セットのブランドは構成品のブランド">構成品から</span><% } else if (r.brand) { %><%= r.brand %><% if (r.brand_own) { %> <span class="b ok">自社</span><% } %><% } else { %><span class="muted">—</span><% } %></td>
+              <% } else if (id === 'stage') { %><td data-col="stage"<%= hide %>><% if (!isSet && r.life_stage) { %><%= (BL && BL.stages[r.life_stage]) || r.life_stage %><% } else { %><span class="muted">—</span><% } %></td>
+              <% } else if (id === 'end_on') { %><td data-col="end_on"<%= hide %>><% if (!isSet && r.end_planned_on) { const eb = BL ? BL.endBadge(r.end_planned_on, BL.today) : null; %><%= r.end_planned_on.replace(/-/g, '/') %><% if (eb && eb.text) { %> <span class="b <%= eb.tone %>"><%= eb.text %></span><% } %><% } else { %><span class="muted">—</span><% } %></td>
               <% } else if (id === 'fba') { %><td class="n ref" data-col="fba"<%= hide %>><% if (r.fba != null) { %><%= r.fba.toLocaleString('ja-JP') %><% if (!r.fba_row) { %><span class="fx" title="その日の FBA のレポートに、この SKU 1 個だけの出品の行が無い (販売可能 0 と数える)">出品なし</span><% } %><% } else { %><span class="muted">—</span><% } %></td>
               <% } else if (id === 'sold') { %><td class="n ref" data-col="sales"<%= hide %>><% const sq = r.sales; if (sq && !sq.missing && !isSet) { %><span title="7 日 <%= sq.d7.toLocaleString('ja-JP') %> (FBA <%= sq.d7fba.toLocaleString('ja-JP') %> · FBA 以外 <%= sq.d7other.toLocaleString('ja-JP') %>) / 30 日 <%= sq.d30.toLocaleString('ja-JP') %> (FBA <%= sq.d30fba.toLocaleString('ja-JP') %> · FBA 以外 <%= sq.d30other.toLocaleString('ja-JP') %>)"><%= sq.d7.toLocaleString('ja-JP') %> / <%= sq.d30.toLocaleString('ja-JP') %></span><% } else if (sq && isSet) { %><span class="muted" title="セットで売れた分は構成品の数に入る (商品管理リスト・発注アプリと同じ数え方)">—</span><% } else if (sq) { %><span class="muted" title="商品管理リストに無い商品 (NE にまだ無いなど)">—</span><% } else { %><span class="muted">—</span><% } %></td>
               <% } else if (id === 'po') { %><td class="n ref" data-col="po"<%= hide %>><% if (r.backorder) { %><%= r.backorder.toLocaleString('ja-JP') %><% } else if (r.backorder == null) { %><span class="muted">—</span><% } %></td>
+              <% } else if (id === 'pkg') { const pk = r.pkg; const dimsTxt = pk && [pk.length_mm, pk.width_mm, pk.height_mm].some((x) => x != null) ? [pk.length_mm, pk.width_mm, pk.height_mm].map((x) => (x == null ? '?' : (Math.round(x) / 10).toFixed(1).replace(/\.0$/, ''))).join('×') + ' cm' : ''; %><td data-col="pkg"<%= hide %>><% if (isSet) { %><span class="muted" title="セットの大きさ・重さは持ちません (構成品から)">構成品から</span><% } else if (dimsTxt || (pk && pk.weight_g != null)) { %><span title="梱包した状態 (人の値 → 出どころの値)"><%= dimsTxt %><% if (dimsTxt && pk.weight_g != null) { %> · <% } %><%= pk.weight_g != null ? pk.weight_g.toLocaleString('ja-JP') + ' g' : '' %></span><% } else { %><span class="muted">—</span><% } %></td>
               <% } else if (id === 'flags') { %><td data-col="flags"<%= hide %>><div class="flags"><% for (const f of r.flags) { %><span class="b <%= FLAG_BADGE[f] || 'mute' %>"><%= f %></span><% } %></div></td>
               <% } %>
               <% } %>

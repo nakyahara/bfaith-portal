@@ -50,6 +50,15 @@
  *  76 Amazon SKU の未登録の一覧の「その場で登録」(10/17): 行の下に欄・名前 = Amazon の商品名・構成の原価
  *  77 新商品 (10/17): 「セット商品を作るか = 作る」の作るセットの表 (初めの値・付いていく・重なり / 0 行は ③ で止める・保留で隠す・保存で product-hub にセットの下書き)
  *  78 Amazon SKU を CSV でまとめて登録 (10/17): 試し取込 (Shift_JIS・表・絞る札・だめな理由・何も書かない)・保存 (DB に入る)・結果の CSV (BOM・式の注入の対策)・同じ CSV = 変わらない・390 ではみ出さない
+ *  79 ⑤-1 商品の画面の先方品番・入数 (10/18): 足す → 保存 (発注アプリの対応表)・未保存に数える・直して保存・消す
+ *  80〜82 商品の画面のタブ (10/19): 基本情報 / 販売数のグラフ / 入出庫の履歴・role と aria・開いたタブだけ読む (1 回)・#tab=… (読み込み直す・戻る・# を打つ)・
+ *     ← → Home End・打った値と未保存はそのまま・Ctrl+S は基本情報で保存・前へ / 次へ・セットの構成品へのリンクも同じタブ・
+ *     帯は上に残る (保存の箱と開いた板は帯の下)・基本情報に戻るとスクロールの位置も戻る・スマホ 390 で 44px・はみ出さない
+ *  84〜86 新商品の登録 (セット・10/21 中原さん): ① 構成 → ② コードと名前 の順 (飛び先の帯・番号・右の「あと N つ」・保存のボタンの一言・Tab の順。単品は今までどおり)・
+ *     構成品の名前の「コピー」(クリップボード・使えないときは execCommand)・「名前に使う」(名前が空・数が 2 以上 = 名前 N個セット)・
+ *     構成品の欄を名前で探す (本物の IME (CDP)・変換中は選ばない / 引き当てない・確定の Enter で数の欄へ移らない・↑↓ Enter Esc・単品だけ = セット / やめた / 要確認は出さない・名前の < > は字のまま)
+ *  83 モールの商品ページへのリンク (10/20): 見出しの下の札 (楽天・Amazon・Yahoo!・Qoo10)・新しいタブ (noopener)・×N・組んだ出品は出さない・どのタブでも見える・
+ *     出品が無い = 一言・スマホ 390 で 44px・はみ出さない
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -1391,7 +1400,7 @@ await ta('[37] Amazon SKU (10/5): 新しい対応 = 名前で未保存 1 件 (�
   assert.equal(await p.isDisabled('#save'), true, '作った後は変えた欄が無ければ押せない');
 });
 
-await ta('[38] NE 登録の CSV (10/5): 選んだ数で作る → 配る (ダウンロード) → 申告の書きかけ = 未保存 (離れるときの確認) → 違うファイルは照合で止める → 同じファイルで申告 → 読み直し', async (p, ctx) => {
+await ta('[38] NE 登録の CSV (🆕 10/20 ボタン 1 つ): 「NE 登録の CSV を作る」= 作って配ってその場でダウンロード → 「NE に取り込んだ」1 つで申告 → 前のファイルは「これまでの記録」(たたむ) の中で申告し直せる (書きかけ = 未保存・違うファイルは照合で止める)', async (p, ctx) => {
   process.env.MASTER_DECISION_APPROVERS = 'naka@test';
   // 今日の照合の回と NE の元のコード (前からある商品 = NE にある / ui-new-1 = 無い)
   const run = 'mc_' + new Date().toISOString().replace(/[-:.]/g, '') + '_abcdef';
@@ -1402,22 +1411,29 @@ await ta('[38] NE 登録の CSV (10/5): 選んだ数で作る → 配る (ダウ
   await (await import('./fixtures/master-widen.mjs')).seedNewEntryLease(db, { runId: run, withSet: true });
   try {
     await p.goto(B + '/reg-csv');
-    const pick = p.locator('input.pick[value="ui-new-1"]');
-    assert.equal(await pick.isDisabled(), false, await p.textContent('#cands'));
-    const buildBtn = p.locator('button[data-act="build"][data-kind="products"]');
-    assert.equal(await buildBtn.isDisabled(), true, '0 件は押せない');
-    await pick.check();
-    assert.match(await buildBtn.textContent(), /選んだ単品 1 件/);
-    assert.equal(await dirty(p), 0, '選ぶだけは未保存にしない');
-    await buildBtn.click();
-    await p.waitForSelector('.saved-note:has-text("を作りました")');
-    const card = p.locator('article.exp').first();
-    assert.match(await card.textContent(), /配る \(ダウンロード\)/);
-    const [dl] = await Promise.all([p.waitForEvent('download'), card.locator('button[data-act="issue"]').click()]);
+    assert.match(await p.textContent('#next'), /ui-new-1/);
+    assert.equal(await p.locator('#history').evaluate((d) => d.open), false, '前のファイルはたたんである');
+    const buildBtn = p.locator('button[data-act="build-all"]');
+    assert.equal(await buildBtn.isDisabled(), false);
+    assert.equal(await dirty(p), 0);
+    // ボタン 1 つ = 作る → 配る → ダウンロード (画面は移らない)
+    const [dl] = await Promise.all([p.waitForEvent('download'), buildBtn.click()]);
     const file = path.join(DATA_TMP, 'ui-reg.csv');
     await dl.saveAs(file);
-    await p.waitForSelector('.saved-note:has-text("配りました")');
-    const c2 = p.locator('article.exp').first();
+    assert.match(fs.readFileSync(file, 'utf8'), /ui-new-1/);
+    await p.waitForSelector('.saved-note:has-text("CSV ができました")');
+    assert.ok(/\/reg-csv$/.test(new URL(p.url()).pathname), p.url());
+    // 「NE で取り込む」のカード = 「NE に取り込んだ」1 つ
+    const todo = p.locator('#todo article.todo-card').first();
+    assert.match(await todo.textContent(), /単品 \d+ 件の CSV/);
+    await todo.locator('button[data-act="declare-quick"][data-result="ok"]').click();
+    await p.waitForSelector('.saved-note:has-text("NE に取り込んだ」を記録しました")');
+    const st = (await pg.query("select r.state from ops.master_registrations r join core.skus s on s.sku_id = r.sku_id where s.code_norm = 'ui-new-1'")).rows[0].state;
+    assert.equal(st, 'ne_pending');
+    assert.equal(await p.locator('#todo article.todo-card').count(), 0, '取り込んだファイルのカードは消える');
+    // 「これまでの記録」の中のファイル = 申告し直せる (書きかけ = 未保存・違うファイルは照合で止める)
+    await p.click('#history > summary');
+    const c2 = p.locator('#history article.exp').first();
     await c2.locator('button[data-act="show-declare"]').first().click();
     await c2.locator('input[name="ne_message"]').fill('1件成功しました。');
     assert.equal(await dirty(p), 1, '申告の書きかけ = 未保存');
@@ -1441,22 +1457,23 @@ await ta('[38] NE 登録の CSV (10/5): 選んだ数で作る → 配る (ダウ
     assert.ok(Math.abs(new Date(imp).getTime() - Date.now()) < 5000, imp);
     await c2.locator('button[data-act="declare"]').click();
     await p.waitForSelector('.saved-note:has-text("申告しました")');
-    const st = (await pg.query("select r.state from ops.master_registrations r join core.skus s on s.sku_id = r.sku_id where s.code_norm = 'ui-new-1'")).rows[0].state;
-    assert.equal(st, 'ne_pending');
     const att = (await pg.query('select imported_at, declared_at from ops.ne_reg_attempts order by attempt_id desc limit 1')).rows[0];
     assert.ok(att.imported_at && new Date(att.imported_at) <= new Date(att.declared_at), JSON.stringify(att));
     assert.equal(await dirty(p), 0);
   } finally { delete process.env.MASTER_DECISION_APPROVERS; }
 });
 
-await ta('[60] NE 登録の CSV (10/12 中原さんの画面の写真): 試し用・閉じた・商品が全部 NE で確かめ済みのファイル = 引退した v1 は「この形を実機で確かめた」「問題があった (ng)」と「本番の行数で作れるようになります」を出さず「引退しました … このファイルですることはありません」/ 門の無い v2・まとまりも出さない / セット (門のある版) は出て、押すと記録', async (p) => {
+await ta('[60] NE 登録の CSV (10/12 中原さんの画面の写真): 試し用・閉じた・商品が全部 NE で確かめ済みのファイル = 引退した v1 は「この形を実機で確かめた」「問題があった (ng)」と「本番の行数で作れるようになります」を出さず「引退しました … このファイルですることはありません」/ 門の無い v2・まとまりも出さない / 🆕 0099: セットも v1 は引退・v2 は門なし = どれにもボタンを出さない', async (p) => {
   process.env.MASTER_DECISION_APPROVERS = 'naka@test';
   const { seedTrialDoneExport } = await import('./fixtures/reg-csv-trial-done.mjs');
   const ids = {};
-  for (const [schema, code] of [['ne-reg-single-v1', 's003'], ['ne-reg-set-v1', 'set001'], ['ne-reg-single-v2', 'k004'], ['ne-reg-variation-v1', 'k002']]) ids[schema] = await seedTrialDoneExport(pg, { sessionUser, schema, code });
+  for (const [schema, code] of [['ne-reg-single-v1', 's003'], ['ne-reg-set-v1', 'set001'], ['ne-reg-single-v2', 'k004'], ['ne-reg-variation-v1', 'k002'], ['ne-reg-set-v2', 'set001']]) ids[schema] = await seedTrialDoneExport(pg, { sessionUser, schema, code });
   try {
     await p.goto(B + '/reg-csv');
-    const card = (k) => p.locator(`article.exp[data-id="${ids[k]}"]`);
+    // 🆕 0099: 門のある今の版は無い = 上の「NE で取り込む」に「問題なし (この形で本番にする)」は出ない・前のファイルは「これまでの記録」(たたんである) の中
+    for (const k of ['ne-reg-single-v1', 'ne-reg-single-v2', 'ne-reg-variation-v1', 'ne-reg-set-v1', 'ne-reg-set-v2']) assert.equal(await p.locator(`#todo article[data-id="${ids[k]}"]`).count(), 0, k);
+    await p.click('#history > summary');
+    const card = (k) => p.locator(`#history article.exp[data-id="${ids[k]}"]`);
     const v1 = card('ne-reg-single-v1');
     await v1.waitFor();
     assert.equal(await v1.locator('button[data-act="verified"]').count(), 0, 'v1 = 確かめた / ng のボタンを出さない');
@@ -1465,22 +1482,17 @@ await ta('[60] NE 登録の CSV (10/12 中原さんの画面の写真): 試し�
     assert.match(t1, /この形 \(ne-reg-single-v1\) は引退しました。今の形 \(ne-reg-single-v2\) は実機の確かめが要らず、最初から本番の行数で作れます。このファイルですることはありません/);
     assert.doesNotMatch(t1, /本番の行数で作れるようになります/);
     assert.equal(await v1.locator('[data-verify-none="retired"]').isVisible(), true);
-    for (const k of ['ne-reg-single-v2', 'ne-reg-variation-v1']) {
+    for (const k of ['ne-reg-single-v2', 'ne-reg-variation-v1', 'ne-reg-set-v2']) {
       const c = card(k);
       assert.equal(await c.locator('button[data-act="verified"]').count(), 0, k);
       assert.equal(await c.locator('[data-verify-none="no_gate"]').isVisible(), true, k);
       assert.match(await c.textContent(), /実機の確かめが要(らず|りません).*このファイルですることはありません/, k);
     }
-    // 門のある版 (セット) = 今までどおり。押すと「実機で確かめた」の記録が残る (画面 → API → DB)
+    // 🆕 0099: セットの v1 も引退 = ボタンなし・「引退しました」の一言 (今の形 = ne-reg-set-v2)
     const set = card('ne-reg-set-v1');
-    assert.match(await set.textContent(), /本番の行数で作れるようになります/);
-    const ok = set.locator('button[data-act="verified"][data-result="ok"]');
-    assert.equal(await ok.isVisible(), true);
-    assert.equal(await set.locator('button[data-act="verified"][data-result="ng"]').isVisible(), true);
-    await ok.click();
-    await p.waitForSelector('.saved-note:has-text("この形を「実機で確かめた」にしました")');
-    const rec = (await pg.query(`select converter_version, result, reg_export_id::text as x from ops.ne_csv_verified where col = 'new_registration' and kind = 'sets' order by verified_id desc limit 1`)).rows[0];
-    assert.deepEqual([rec && rec.converter_version, rec && rec.result, rec && rec.x], ['ne-reg-set-v1', 'ok', ids['ne-reg-set-v1']]);
+    assert.equal(await set.locator('button[data-act="verified"]').count(), 0);
+    assert.match(await set.textContent(), /この形 \(ne-reg-set-v1\) は引退しました。今の形 \(ne-reg-set-v2\) は実機の確かめが要らず、最初から本番の行数で作れます/);
+    assert.doesNotMatch(await set.textContent(), /本番の行数で作れるようになります/);
   } finally { delete process.env.MASTER_DECISION_APPROVERS; }
 });
 
@@ -1534,8 +1546,9 @@ await ta('[46] Amazon SKU (#1628 Codex R5 L2): 変わった項目が無い保存
 // MASTER_EDIT_UI_SHOTS_NAME=フォルダ を付けると [47] の写し (1440 幅) を残す
 const SHOTS_NAME = process.env.MASTER_EDIT_UI_SHOTS_NAME || '';
 const shotName = async (p, file) => { if (!SHOTS_NAME) return; await p.evaluate(() => window.scrollTo(0, 0)); await p.waitForTimeout(150); await p.screenshot({ path: `${SHOTS_NAME}/${file}.png` }); };
-await ta('[47] 名前を見出しのところで直す (10/6): 単品・セットとも ✎ で見出しが入力欄になる・名前の欄は 1 つだけ・Esc で戻す・変えた間は閉じない・Ctrl+S → 見出しが新しい名前 / 🔒 (NE に送った値) = 入力欄を出さず理由の印', async (p) => {
-  for (const [code, next, label] of [['k005', 'abc 小袋 改', '単品'], ['set001', 'セット 1 新', 'セット']]) {
+await ta('[47] 名前を見出しのところで直す (10/6): 単品・セットとも ✎ で見出しが入力欄になる・名前の欄は 1 つだけ・Esc で戻す・変えた間は閉じない・Ctrl+S → 見出しが新しい名前 / 🆕 0093 NE 登録の CSV を配った後も直せるの印', async (p) => {
+  // 🆕 0093 (2026-10-19 中原さん): NE 登録の CSV を配って申告した ui-new-1 ([38]) も、ほかの商品と同じように見出しで直せる (🔒 にしない)
+  for (const [code, next, label] of [['k005', 'abc 小袋 改', '単品'], ['set001', 'セット 1 新', 'セット'], ['ui-new-1', 'UI 新商品 1 改', '単品 (NE 登録の CSV を配った後)']]) {
     await p.goto(B + '/sku/' + code);
     assert.equal(await p.locator('[data-field="name"]').count(), 1, label + ': 名前の欄は 1 つだけ (下の「基本」に無い)');
     assert.equal(await p.locator('#p-basic [data-field="name"]').count(), 0);
@@ -1564,12 +1577,9 @@ await ta('[47] 名前を見出しのところで直す (10/6): 単品・セッ�
     assert.equal((await row(code)).name, next);
     assert.equal(await p.isVisible('#f-name'), false, label + ': 読み直した後は見出しに戻る');
   }
-  // 🔒 = NE に送った値 ([38] で CSV を配って申告した ui-new-1)。入力欄を出さず、見出しの横に理由
-  await p.goto(B + '/sku/ui-new-1');
-  assert.equal(await p.locator('#name-edit').count(), 0, '🔒 のときは「名前を直す」を出さない');
-  assert.equal(await p.locator('#f-name').count(), 0, '🔒 のときは入力欄を出さない');
-  assert.match(await p.textContent('.name-lock'), /NE に送った値/);
-  await shotName(p, '単品_🔒_NEに送った値');
+  // 配った後の ui-new-1 に 🔒・案内のカードを出さない (0093)
+  assert.equal(await p.locator('.name-lock').count(), 0);
+  assert.equal(await p.getByText('鍵がかかっています').count(), 0);
   // 🔒 = 保存を開いていない (セット)。入力欄を出さず、見出しの横に理由
   delete process.env.MASTER_EDIT_OPEN;
   try {
@@ -1859,7 +1869,7 @@ await ta('[52] 一覧の列 (10/8 PR1): 列の板 = 出す / 出さない・↑�
   assert.equal((await prefsPost(p, { order: [...LIST_DEFAULT.order], shown: [...LIST_DEFAULT.shown] })).status, 200);   // 前の試験の設定を消す
   await p.goto(B + '/?q=' + encodeURIComponent('単品'));
   assert.deepEqual(await shownHeads(p), LIST_DEFAULT.shown, 'いつもの列 (仕入先は出さない)');
-  assert.equal(await p.textContent('#colcnt'), '17/19');   // 画像の列 (出す)・🆕 0084 メーカーの列 (出さない)
+  assert.equal(await p.textContent('#colcnt'), '17/23');   // 画像の列 (出す)・🆕 0084 メーカー・🆕 0087 大きさ・重さ・🆕 0088 ブランド・段階の 3 列 (出さない)
   assert.equal(await p.isVisible('#list-tbl tbody tr:first-child .sup-sub'), true, '仕入先の列が無い = 名前の下に「仕入先」');
   // 板を開く: コードは外せない・↑↓ も押せない・FBA などは「並べられない」
   await p.click('#colbtn');
@@ -1888,7 +1898,7 @@ await ta('[52] 一覧の列 (10/8 PR1): 列の板 = 出す / 出さない・↑�
   // つまみで動かす (売価を名前の前へ)
   await p.dragAndDrop('#collist li[data-id="price"] .grip', '#collist li[data-id="name"]');
   assert.deepEqual((await shownHeads(p)).slice(0, 5), ['code', 'sup', 'img', 'price', 'name']);
-  assert.equal(await p.textContent('#colcnt'), '17/19');   // 画像の列 (出す)・🆕 0084 メーカーの列 (出さない)
+  assert.equal(await p.textContent('#colcnt'), '17/23');   // 画像の列 (出す)・🆕 0084 メーカー・🆕 0087 大きさ・重さ・🆕 0088 ブランド・段階の 3 列 (出さない)
   if (LIST_SHOTS) await p.waitForTimeout(400), await p.screenshot({ path: `${LIST_SHOTS}/1280_cols.png` });
   // 保存 → 「未保存」が消える・別の窓 (= 別の PC。同じログイン) で開いても同じ列
   await p.click('#cp-save');
@@ -2022,7 +2032,7 @@ await ta('[75] 一覧の画像の列 (10/17 中原さん「楽天の白抜き商
     await p.click('#collist li[data-id="img"] input');
     assert.ok(!(await shownHeads(p)).includes('img'));
     assert.equal(await p.isHidden(cell('s001')), true);
-    assert.equal(await p.textContent('#colcnt'), '16/19');   // 🆕 0084: メーカーの列 (出さない) で全部 19
+    assert.equal(await p.textContent('#colcnt'), '16/23');   // 画像の列 (出す)・🆕 0084 メーカー・🆕 0087 大きさ・重さ・🆕 0088 ブランド・段階の 3 列 (出さない)
     await p.click('#collist li[data-id="img"] input');
     assert.deepEqual((await shownHeads(p)).slice(0, 2), ['code', 'img']);
     assert.match(await p.textContent('#collist li[data-id="img"]'), /画像\s*新/);
@@ -3353,6 +3363,511 @@ await ta('[78] CSV でまとめて登録 (10/17): ファイルを選ぶ → 試�
   await p.waitForFunction(() => /試し取込をしました/.test(document.getElementById('bulk-msg').textContent) && /UTF-8/.test(document.getElementById('bulk-file-info').textContent));
   assert.match(await p.textContent('#bulk-rows tr[data-sku="pr-ui-bulk-1"]'), /変わらない/);
   assert.equal(await p.textContent('#bulk-apply'), '保存する SKU がありません');
+});
+
+await ta('[79] ⑤-1 商品の画面の先方品番・入数 (CompanyDB構想 27 §2.4): 足す → 保存 (発注アプリの対応表に入る)・打った行は未保存に数える・直して保存・古い版 = 409 の文・消す (確かめ) = 空の「足す」行に戻る・ほかの仕入先の行は消すだけ', async (p) => {
+  const NSK = await import('../apps/purchase-orders/new-skus.js');
+  const t0 = new Date().toISOString();
+  mirrorDb.prepare('insert or ignore into po_suppliers (supplier_code, name, created_at, updated_at) values (?,?,?,?)').run('1', 'AMC', t0, t0);
+  mirrorDb.prepare('insert or ignore into po_suppliers (supplier_code, name, created_at, updated_at) values (?,?,?,?)').run('7', 'ほかの仕入先', t0, t0);
+  mirrorDb.prepare("insert into po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, qty_per_unit, updated_at) values ('7', 'k001', 'k001', 'OLD-7', null, ?)").run(t0);
+  const vrow = (sup) => mirrorDb.prepare('select * from po_vendor_code_map where supplier_code = ? and product_key = ?').get(sup, 'k001') || null;
+  NSK.setNewSkuReaderForTest(async () => ({ ok: true, map: new Map([['k001', { code: 'k001', name: 'k001', state: 'available', supplier: '1' }]]) }));
+  try {
+    p.on('dialog', (d) => d.accept());
+    await p.goto(B + '/sku/k001');
+    const r1 = '#po-vendor .po-vrow[data-sup="1"]';
+    await p.waitForSelector(r1);
+    assert.equal(await p.textContent(`${r1} .po-v-save`), '足す');
+    assert.equal(await p.isDisabled(`${r1} .po-v-save`), true, '何も打っていないのに押せる');
+    assert.equal(await p.isDisabled('#po-vendor .po-vrow[data-sup="7"] .po-v-code'), true, 'ほかの仕入先の行を直せる');
+    const d0 = await dirty(p);
+    await p.fill(`${r1} .po-v-code`, 'AC-K1');
+    await p.fill(`${r1} .po-v-qpu`, '２４');
+    assert.equal(await dirty(p), d0 + 1, '打った先方品番の行を未保存に数えない');
+    // 送っている間は欄も閉じる (送っていない値を「保存した」にしない・Codex R1 M1)
+    let release; const gate = new Promise((r) => { release = r; });
+    await p.route('**/vendor-code', async (route) => { await gate; await route.continue(); });
+    await p.click(`${r1} .po-v-save`);
+    await p.waitForFunction((s) => document.querySelector(s + ' .po-v-code').disabled && document.querySelector(s + ' .po-v-qpu').disabled, r1);
+    release();
+    await p.waitForFunction((s) => /保存しました/.test(document.querySelector(s + ' .po-v-msg').textContent), r1);
+    await p.unroute('**/vendor-code');
+    assert.equal(await p.isDisabled(`${r1} .po-v-code`), false, '保存の後に欄が開かない');
+    assert.deepEqual([vrow('1').vendor_code, vrow('1').qty_per_unit], ['AC-K1', 24]);
+    assert.equal(await p.inputValue(`${r1} .po-v-qpu`), '24');
+    assert.equal(await dirty(p), d0, '保存した後も未保存に数えている');
+    assert.equal(await p.textContent(`${r1} .po-v-save`), '保存');
+    // 画面の外で直す → この画面で保存 = 409 の文 (何も書かない)
+    const before = vrow('1');
+    mirrorDb.prepare("update po_vendor_code_map set vendor_code = 'BEHIND', updated_at = ? where supplier_code = '1' and product_key = 'k001'").run(new Date(Date.now() + 5000).toISOString());
+    await p.fill(`${r1} .po-v-code`, 'AC-K2');
+    await p.press(`${r1} .po-v-code`, 'Enter');
+    await p.waitForFunction((s) => /他の画面で変更されています/.test(document.querySelector(s + ' .po-v-msg').textContent), r1);
+    assert.equal(vrow('1').vendor_code, 'BEHIND');
+    mirrorDb.prepare("update po_vendor_code_map set vendor_code = ?, updated_at = ? where supplier_code = '1' and product_key = 'k001'").run(before.vendor_code, before.updated_at);
+    await p.fill(`${r1} .po-v-code`, 'AC-K2');
+    await p.click(`${r1} .po-v-save`);
+    await p.waitForFunction((s) => /保存しました/.test(document.querySelector(s + ' .po-v-msg').textContent), r1);
+    assert.equal(vrow('1').vendor_code, 'AC-K2');
+    // 消す (確かめ) = 空の「足す」行に戻る
+    await p.click(`${r1} .po-v-del`);
+    await p.waitForFunction((s) => /消しました/.test(document.querySelector(s + ' .po-v-msg').textContent), r1);
+    assert.equal(vrow('1'), null);
+    assert.deepEqual([await p.inputValue(`${r1} .po-v-code`), await p.textContent(`${r1} .po-v-save`), await p.$(`${r1} .po-v-del`)], ['', '足す', null]);
+    assert.equal(await p.isDisabled(`${r1} .po-v-code`), false, '消した後に「足す」の欄が開いている (統合の Codex P2)');
+    // ほかの仕入先の古い行 = 消すだけ (行ごと消える)
+    await p.click('#po-vendor .po-vrow[data-sup="7"] .po-v-del');
+    await p.waitForFunction(() => !document.querySelector('#po-vendor .po-vrow[data-sup="7"]'));
+    assert.equal(vrow('7'), null);
+    // 1024 幅 / 390 幅で横にはみ出さない
+    for (const w of [1024, 390]) {
+      await p.setViewportSize({ width: w, height: 800 });
+      assert.ok(await p.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), `${w} 幅で横にはみ出す`);
+    }
+  } finally { NSK.setNewSkuReaderForTest(null); }
+});
+
+// ── 🆕 10/19 中原さん「グラフとか入出庫履歴とか行くときにスクロールしないといけないからボタンかタブにしてほしい」= 商品の画面のタブ (public/me-tabs.js)
+const tabState = (p) => p.evaluate(() => ({
+  hash: location.hash,
+  sel: [...document.querySelectorAll('#sku-tabs [role="tab"]')].filter((t) => t.getAttribute('aria-selected') === 'true').map((t) => t.dataset.tab),
+  shown: [...document.querySelectorAll('[role="tabpanel"]')].filter((x) => !x.hidden).map((x) => x.id),
+}));
+/** 履歴・月別・グラフの API を読んだ回数 (開いたタブだけ読む) */
+function countReads(p) {
+  const n = { moves: 0, monthly: 0, sales: 0 };
+  p.on('request', (r) => {
+    const u = new URL(r.url()).pathname;
+    if (/\/api\/sku\/[^/]+\/movements$/.test(u)) n.moves++;
+    if (/\/api\/sku\/[^/]+\/monthly$/.test(u)) n.monthly++;
+    if (/\/api\/sku\/[^/]+\/sales-chart$/.test(u)) n.sales++;
+  });
+  return n;
+}
+
+await ta('[80] 商品の画面のタブ (10/19): 基本情報 / 販売数のグラフ / 入出庫の履歴・role と aria・開いたタブだけ読む (1 回だけ)・#tab=… に残る (読み込み直す・戻る・# を打つ)・← → Home End・タブを替えても打った値と未保存はそのまま・Ctrl+S は基本情報に戻して保存', async (p) => {
+  const n = countReads(p);
+  await p.goto(B + '/sku/s002');
+  await p.waitForLoadState('networkidle');
+  // 帯と板の印 (tablist・tab・tabpanel・aria-selected・aria-controls ⇔ aria-labelledby)
+  const a11y = await p.evaluate(() => [...document.querySelectorAll('#sku-tabs [role="tab"]')].map((t) => {
+    const tp = document.getElementById(t.getAttribute('aria-controls'));
+    const name = [...t.childNodes].filter((x) => !(x.classList && x.classList.contains('tab-dirty'))).map((x) => x.textContent).join('').trim();   // 未保存の印 (隠れている) は除く
+    return [t.dataset.tab, name, t.getAttribute('aria-selected'), t.tabIndex, tp && tp.getAttribute('role'), tp && tp.getAttribute('aria-labelledby') === t.id];
+  }));
+  assert.equal(await p.getAttribute('#sku-tabs', 'role'), 'tablist');
+  assert.deepEqual(a11y, [['basic', '基本情報', 'true', 0, 'tabpanel', true], ['sales', '販売数のグラフ', 'false', -1, 'tabpanel', true], ['moves', '入出庫の履歴・月別', 'false', -1, 'tabpanel', true]]);
+  assert.deepEqual(await tabState(p), { hash: '', sel: ['basic'], shown: ['tp-basic'] });
+  assert.deepEqual(n, { moves: 0, monthly: 0, sales: 0 }, '開いたとき = 隠れたタブ (グラフ・履歴) は読まない');
+  assert.equal(await p.isVisible('#f'), true);
+  // 打った値・未保存 → グラフのタブ (印は基本情報のタブにも)
+  const before = (await row('s002')).months;
+  await p.fill('#f-reorder_months', String(before + 2));
+  assert.equal(await dirty(p), 1);
+  assert.equal(await p.isVisible('#tab-basic-dirty'), true, '基本情報のタブに未保存の印');
+  await p.click('#tab-sales');
+  assert.deepEqual(await tabState(p), { hash: '#tab=sales', sel: ['sales'], shown: ['tp-sales'] });
+  await p.waitForFunction(() => document.getElementById('sc-sum').textContent !== '読んでいます…');
+  assert.deepEqual(n, { moves: 0, monthly: 0, sales: 1 }, 'グラフのタブを開いた = グラフだけ読む');
+  assert.equal(await p.isHidden('#f'), true);
+  assert.equal(await p.isVisible('#unsaved'), true, '上の帯の「未保存 N 件」は残る');
+  // キー: → = 入出庫の履歴 (フォーカスも)・→ = 先頭に回る・End / Home
+  await p.focus('#tab-sales');
+  await p.keyboard.press('ArrowRight');
+  assert.deepEqual(await tabState(p), { hash: '#tab=moves', sel: ['moves'], shown: ['tp-moves'] });
+  assert.equal(await active(p), 'tab-moves');
+  await p.waitForFunction(() => document.getElementById('mv-head').textContent !== '読んでいます…' && document.getElementById('mo-head').textContent !== '読んでいます…');
+  assert.deepEqual(n, { moves: 1, monthly: 1, sales: 1 }, '履歴のタブ = 履歴と月別を 1 回ずつ');
+  await p.keyboard.press('ArrowRight');
+  assert.deepEqual(await tabState(p), { hash: '', sel: ['basic'], shown: ['tp-basic'] }, '最後の → = 先頭 (基本情報 = # なし)');
+  assert.equal(await active(p), 'tab-basic');
+  await p.keyboard.press('ArrowLeft');
+  assert.deepEqual((await tabState(p)).sel, ['moves'], '先頭の ← = 最後');
+  await p.keyboard.press('Home');
+  assert.deepEqual((await tabState(p)).sel, ['basic']);
+  await p.keyboard.press('End');
+  assert.deepEqual((await tabState(p)).sel, ['moves']);
+  // 打った値・未保存の印はそのまま (隠しただけ)。行き来しても読み直さない
+  await p.click('#tab-basic');
+  assert.equal(await p.inputValue('#f-reorder_months'), String(before + 2));
+  assert.equal(await dirty(p), 1);
+  assert.equal(await p.locator('[data-row="reorder_months"].dirty').count(), 1, '欄の黄色い印も残る');
+  // 未保存のままアドレスの # を打つ (同じ画面の中の移り = 新しい履歴) = 離れるときの確認は出さない・そのタブ (Codex R1 High)
+  await p.evaluate(() => { location.hash = '#tab=moves'; });
+  await p.waitForTimeout(150);
+  assert.deepEqual((await tabState(p)).sel, ['moves']);
+  assert.equal(await p.locator('#leave-bg.on').count(), 0, '# を打っただけ = 聞かない');
+  assert.equal(await dirty(p), 1);
+  // ブラウザの戻る: 見張りの履歴へ戻っただけ = 聞かない (タブは戻る) → もう 1 回 = この画面の前へ = 今までどおり聞く
+  await p.goBack(); await p.waitForTimeout(150);
+  assert.equal(await p.locator('#leave-bg.on').count(), 0, '見張りの履歴へ戻っただけ = 聞かない');
+  assert.deepEqual((await tabState(p)).sel, ['basic']);
+  await p.goBack(); await p.waitForTimeout(200);
+  assert.equal(await p.locator('#leave-bg.on').count(), 1, 'この画面の前へ戻る = 聞く');
+  await p.click('#leave-stay');
+  assert.match(p.url(), /sku\/s002/);
+  assert.equal(await dirty(p), 1, 'ここに残る = 打った値はそのまま');
+  await p.click('#tab-sales'); await p.click('#tab-moves'); await p.click('#tab-basic');
+  await p.waitForTimeout(200);
+  assert.deepEqual(n, { moves: 1, monthly: 1, sales: 1 }, 'もう一度開いても読み直さない');
+  // 履歴のタブで Ctrl+S = 基本情報に戻して保存 (DB に入る)・読み直した後も基本情報
+  await p.click('#tab-moves');
+  await Promise.all([p.waitForNavigation(), p.keyboard.press('Control+s')]);
+  await p.waitForSelector('#saved-note');
+  assert.equal((await row('s002')).months, before + 2, '保存した');
+  assert.deepEqual(await tabState(p), { hash: '', sel: ['basic'], shown: ['tp-basic'] });
+  // # を打つ (同じ画面の #tab リンク) = そのタブ / 読み込み直す = 同じタブ (開いたらすぐ読む・グラフは読まない)
+  await p.goto(B + '/sku/s002#tab=moves');
+  assert.deepEqual(await tabState(p), { hash: '#tab=moves', sel: ['moves'], shown: ['tp-moves'] }, '# だけ変えた (hashchange)');
+  const n2 = countReads(p);
+  await p.reload();
+  await p.waitForLoadState('networkidle');
+  assert.deepEqual(await tabState(p), { hash: '#tab=moves', sel: ['moves'], shown: ['tp-moves'] }, '読み込み直しても同じタブ');
+  assert.deepEqual(n2, { moves: 1, monthly: 1, sales: 0 }, '開いているタブだけ読む');
+  // ほかの画面へ行って戻る = 同じタブ
+  await Promise.all([p.waitForNavigation(), p.click('.crumb a')]);
+  await p.goBack();
+  await p.waitForSelector('#sku-tabs');
+  assert.deepEqual((await tabState(p)).sel, ['moves'], '戻るでも同じタブ');
+  // 知らない名前 = 基本情報 (# を外す)
+  await p.goto(B + '/sku/s001#tab=zzz');
+  assert.deepEqual(await tabState(p), { hash: '', sel: ['basic'], shown: ['tp-basic'] });
+});
+
+await ta('[81] タブと前へ・次へ・セット・狭い画面 (10/19): 前へ・次へにも開いているタブを付ける (替えたら書き直す)・セットの履歴のタブから構成品の履歴のタブへ・帯は上に残り、保存の箱と開いた板の上端は帯の下・基本情報に戻るとスクロールの位置も戻る・スマホ 390 = 帯は 44px で横にはみ出さない', async (p) => {
+  await p.goto(B + '/?q=' + encodeURIComponent('はちみつ'));
+  const codes = await listCodes(p);
+  await Promise.all([p.waitForNavigation(), p.click(`a.rowlink:text-is("${codes[1]}")`)]);
+  await pnState(p);
+  await p.click('#tab-sales');
+  assert.match(await p.getAttribute('#pn-next', 'href'), new RegExp(`/sku/${codes[2]}#tab=sales$`));
+  await Promise.all([p.waitForNavigation(), p.click('#pn-next')]);
+  assert.deepEqual(await tabState(p), { hash: '#tab=sales', sel: ['sales'], shown: ['tp-sales'] }, '次の商品も同じタブ');
+  await pnState(p);
+  assert.match(await p.getAttribute('#pn-prev', 'href'), new RegExp(`/sku/${codes[1]}#tab=sales$`), '描いた時から付いている');
+  await p.click('#tab-basic');
+  assert.match(await p.getAttribute('#pn-prev', 'href'), new RegExp(`/sku/${codes[1]}$`), '基本情報 = # なし');
+  // セット: 履歴のタブ = 構成品へのリンク (構成品の画面も履歴のタブ)
+  await p.goto(B + '/sku/set001#tab=moves');
+  assert.deepEqual((await tabState(p)).sel, ['moves']);
+  assert.equal((await p.textContent('#tab-moves')).trim(), '入出庫の履歴', 'セットは月別なし');
+  await Promise.all([p.waitForNavigation(), p.click('#mv-set a:text-is("s001")')]);
+  assert.deepEqual((await tabState(p)).sel, ['moves']);
+  // 1440: 下へスクロール = 帯は上の帯 (58px) の下に残る・右の保存の箱は帯に隠れない → グラフ = 板の上端は帯の下 → 基本情報 = 元の位置
+  await p.goto(B + '/sku/s003');
+  await p.evaluate(() => window.scrollTo(0, 900));
+  await p.waitForTimeout(200);
+  const g = await p.evaluate(() => ({ field: document.getElementById('f-reorder_months').getBoundingClientRect().top, bar: document.getElementById('sku-top').getBoundingClientRect().toJSON(), side: document.querySelector('#tp-basic .side').getBoundingClientRect().top }));
+  assert.ok(Math.abs(g.bar.top - 58) < 1, `帯が上に残る ${g.bar.top}`);
+  assert.ok(g.side >= g.bar.bottom - 1, `保存の箱が帯に隠れない ${g.side} < ${g.bar.bottom}`);
+  await p.click('#tab-sales');
+  const s = await p.evaluate(() => ({ panel: document.getElementById('tp-sales').getBoundingClientRect().top, bar: document.getElementById('sku-top').getBoundingClientRect().bottom }));
+  assert.ok(s.panel >= s.bar - 1 && s.panel < s.bar + 40, `グラフの板の上端が帯のすぐ下 ${JSON.stringify(s)}`);
+  await p.click('#tab-basic');
+  await p.waitForTimeout(150);   // 小見出しが出る・消える (帯の高さ) の後の合わせ直しまで
+  const back = await p.evaluate(() => document.getElementById('f-reorder_months').getBoundingClientRect().top);
+  assert.ok(Math.abs(back - g.field) <= 2, `基本情報に戻ると同じ欄が同じ所に見える ${back} ≠ ${g.field}`);
+  if (process.env.MASTER_TABS_SHOT) await p.screenshot({ path: process.env.MASTER_TABS_SHOT });
+  // スマホ 390: 帯の中だけで横に送る (ページははみ出さない)・押す所は 44px
+  await p.setViewportSize({ width: 390, height: 844 });
+  await p.goto(B + '/sku/s003#tab=moves');
+  const m = await p.evaluate(() => ({ doc: document.documentElement.scrollWidth, view: innerWidth,
+    tabs: [...document.querySelectorAll('#sku-tabs [role="tab"]')].map((t) => Math.round(t.getBoundingClientRect().height)),
+    bar: document.getElementById('sku-tabs').getBoundingClientRect().right }));
+  assert.ok(m.doc <= m.view, `横にはみ出す ${m.doc} > ${m.view}`);
+  assert.ok(m.bar <= m.view + 0.5, `帯がはみ出す ${m.bar}`);
+  assert.ok(m.tabs.every((h) => h >= 44), `タブの高さ ${m.tabs}`);
+  await p.click('#tab-sales');
+  assert.deepEqual((await tabState(p)).sel, ['sales']);
+  if (process.env.MASTER_TABS_SHOT_SP) await p.screenshot({ path: process.env.MASTER_TABS_SHOT_SP });
+});
+
+await ta('[82] タブと戻るの見張り (10/19・Codex R2 Medium): 未保存 → アドレスに #tab=… を打つ → Ctrl+S で保存 (読み直し) → また直す → ブラウザの戻る = 今までどおり確認が出る', async (p) => {
+  await p.goto(B + '/');
+  await Promise.all([p.waitForNavigation(), p.click('a.rowlink:has-text("s003")')]);
+  const before = (await row('s003')).months;
+  await p.fill('#f-reorder_months', String(before + 1));
+  await p.evaluate(() => { location.hash = '#tab=sales'; });
+  await p.waitForTimeout(150);
+  assert.equal(await p.locator('#leave-bg.on').count(), 0, '# を打っただけ = 聞かない');
+  await Promise.all([p.waitForNavigation(), p.keyboard.press('Control+s')]);
+  await p.waitForSelector('#saved-note');
+  assert.equal((await row('s003')).months, before + 1, '保存した');
+  await p.fill('#f-reorder_months', String(before + 2));
+  assert.equal(await dirty(p), 1);
+  await p.goBack(); await p.waitForTimeout(200);
+  assert.equal(await p.locator('#leave-bg.on').count(), 1, '保存の後にまた直して戻る = 確認が出る');
+  await p.click('#leave-stay');
+  assert.equal(await dirty(p), 1, 'ここに残る = 打った値はそのまま');
+  assert.equal(await p.inputValue('#f-reorder_months'), String(before + 2));
+});
+
+// ── 🆕 10/20 中原さん「商品マスタからそれぞれのモールに飛ぶリンク」= 見出しの下のモールの札 (apps/master-edit/mall-links.mjs) ──
+{
+  const sidOf = async (code) => (await pg.query('select sku_id from core.skus where code = $1', [code])).rows[0].sku_id;
+  const k4 = await sidOf('k004'), k5 = await sidOf('k005');
+  const lst = async (mall, code, comps, { itemId = null, asin = null } = {}) => {
+    const id = (await pg.query(`insert into core.listings (company_id, mall, shop_code, listing_code, mall_item_id, status) values (1, $1, $2, $3, $4, 'active') returning listing_id`,
+      [mall, mall === 'amazon' ? 'main@A1VC38T7YXB528' : 'main', code, itemId])).rows[0].listing_id;
+    let i = 0;
+    for (const [skuId, qty] of comps) await pg.query(`insert into core.listing_components (company_id, listing_id, sku_id, qty, sort_order, resolution, resolved_by_type) values (1, $1, $2, $3, $4, 'exact', 'system')`, [id, skuId, qty, i++]);
+    if (asin) {
+      const ci = (await pg.query(`insert into core.catalog_items (marketplace_id, asin) values ('A1VC38T7YXB528', $1) returning catalog_item_id`, [asin])).rows[0].catalog_item_id;
+      await pg.query('update core.listings set catalog_item_id = $1 where listing_id = $2', [ci, id]);
+    }
+  };
+  await lst('rakuten', 'k004', [[k4, 1]], { itemId: 'k004' });
+  await lst('amazon', 'ml-k004', [[k4, 1]], { asin: 'B0MLK00401' });
+  await lst('amazon', 'ml-k004-2p', [[k4, 2]], { asin: 'B0MLK00402' });
+  await lst('amazon', 'ml-k4k5', [[k4, 1], [k5, 1]], { asin: 'B0MLK00499' });   // ほかの商品と組んだ出品 = どちらの画面にも出さない
+  await lst('yahoo', 'k004', [[k4, 1]]);
+  await lst('qoo10', '1067124910', [[k4, 1]], { itemId: '1067124910' });
+}
+const mallState = (p) => p.evaluate(() => {
+  const box = document.getElementById('sku-malls');
+  const r = box && box.getBoundingClientRect();
+  return {
+    shown: !!box && r.width > 0 && r.height > 0 && !box.closest('[hidden]'),
+    inHead: !!box && !!box.closest('#sku-ph'),
+    links: box ? [...box.querySelectorAll('a.mall')].map((a) => [a.dataset.mall, a.textContent.replace('(新しいタブで開く)', '').trim(), a.getAttribute('href'), a.target, a.rel]) : [],
+    none: box ? (box.querySelector('.malls-none') || {}).textContent || '' : null,
+  };
+});
+await ta('[83] モールの商品ページへのリンク (10/20): 見出しの下に楽天・Amazon・Yahoo!・Qoo10 の札・新しいタブ (noopener)・まとめ売りは ×N・組んだ出品は出さない・どのタブでも見える・出品が無い = 一言・スマホ 390 で 44px・はみ出さない', async (p, ctx) => {
+  await p.goto(B + '/sku/k004');
+  const s = await mallState(p);
+  assert.equal(s.shown, true, 'モールの行が見える');
+  assert.equal(s.inHead, true, '見出しの中 (どのタブでも同じ所)');
+  const NR = 'noopener noreferrer';
+  assert.deepEqual(s.links, [
+    ['rakuten', '楽天', 'https://item.rakuten.co.jp/b-faith/k004/', '_blank', NR],
+    ['amazon', 'AmazonB0MLK00401', 'https://www.amazon.co.jp/dp/B0MLK00401', '_blank', NR],
+    ['amazon', 'Amazon×2', 'https://www.amazon.co.jp/dp/B0MLK00402', '_blank', NR],
+    ['yahoo', 'Yahoo!', 'https://store.shopping.yahoo.co.jp/b-faith01/k004.html', '_blank', NR],
+    ['qoo10', 'Qoo10', 'https://www.qoo10.jp/g/1067124910', '_blank', NR],
+  ]);
+  assert.match(await p.getAttribute('#sku-malls a[data-mall="amazon"] >> nth=1', 'title'), /2 個のまとめ売り/);
+  if (process.env.MASTER_MALLS_SHOT_PC) await p.screenshot({ path: process.env.MASTER_MALLS_SHOT_PC });
+  // どのタブでも見える (見出しはタブの外)
+  for (const tab of ['#tab-sales', '#tab-moves', '#tab-basic']) {
+    await p.click(tab);
+    assert.equal((await mallState(p)).shown, true, `${tab} でも見える`);
+  }
+  // 押すと新しいタブで開く (この画面はそのまま・未保存の確かめも出ない)
+  await ctx.route(/^https:\/\/item\.rakuten\.co\.jp\//, (route) => route.fulfill({ status: 200, contentType: 'text/html', body: '<p>rakuten</p>' }));
+  const [popup] = await Promise.all([ctx.waitForEvent('page'), p.click('#sku-malls a[data-mall="rakuten"]')]);
+  await popup.waitForLoadState();
+  assert.equal(popup.url(), 'https://item.rakuten.co.jp/b-faith/k004/');
+  assert.equal(await popup.evaluate(() => window.opener), null, 'noopener = 開いた先から元の画面を触れない');
+  await popup.close();
+  assert.equal(new URL(p.url()).pathname, '/apps/master-edit/sku/k004');
+  assert.equal(await p.locator('#leave-bg.on').count(), 0);
+  // 組んだ出品しか無い商品・出品が無い商品 = 一言だけ (札は出さない)
+  for (const code of ['k005', 's003']) {
+    await p.goto(B + '/sku/' + code);
+    const n = await mallState(p);
+    assert.deepEqual([n.shown, n.links, n.none], [true, [], '出品が見つかりません'], code);
+  }
+  // スマホ 390: 札は 44px・折り返してはみ出さない
+  await p.setViewportSize({ width: 390, height: 844 });
+  await p.goto(B + '/sku/k004');
+  const m = await p.evaluate(() => ({ doc: document.documentElement.scrollWidth, view: innerWidth,
+    chips: [...document.querySelectorAll('#sku-malls a.mall')].map((a) => { const r = a.getBoundingClientRect(); return [Math.round(r.height), Math.round(r.right)]; }) }));
+  assert.ok(m.doc <= m.view, `横にはみ出す ${m.doc} > ${m.view}`);
+  assert.equal(m.chips.length, 5);
+  assert.ok(m.chips.every(([h, right]) => h >= 44 && right <= m.view), `札 ${JSON.stringify(m.chips)}`);
+  if (process.env.MASTER_MALLS_SHOT) await p.screenshot({ path: process.env.MASTER_MALLS_SHOT });
+});
+
+await ta('[84] 新商品の登録 (セット・10/21 中原さん): ① 構成 → ② コードと名前 の順 (飛び先の帯・区切りの番号・右の「あと N つ」・保存のボタンの一言・Tab の順)。単品は今までどおり ① コードと名前', async (p) => {
+  const order = () => p.evaluate(() => ({
+    jump: [...document.querySelectorAll('#jump a[data-sec]')].map((a) => a.getAttribute('data-sec') + ':' + a.querySelector('.n').textContent.trim()),
+    dom: [...document.querySelectorAll('#f section.panel[id], #f details.panel[id]')].map((s) => s.id),
+    steps: [...document.querySelectorAll('#f .stepno[data-step]')].map((s) => s.getAttribute('data-step') + ':' + s.textContent.trim()),
+    need: [...document.querySelectorAll('#checklist li.need .lbl')].map((x) => x.textContent),
+  }));
+  await p.goto(B + '/new?kind=set');
+  let o = await order();
+  assert.deepEqual(o.jump.slice(0, 3), ['sec-comp:1', 'sec-code:2', 'sec-money:3'], '飛び先の帯 = 構成が 1');
+  assert.deepEqual(o.dom.slice(0, 3), ['sec-comp', 'sec-code', 'sec-money'], '画面の並び = 構成が上');
+  assert.deepEqual(o.steps.slice(0, 2), ['sec-comp:1', 'sec-code:2'], '区切りの番号');
+  assert.deepEqual(o.need.slice(0, 3), ['構成 (1 品以上)', '商品コード', '名前'], '右の「あと N つ」も構成が先');
+  assert.match(await p.textContent('#save'), /あと \d+ つ: 構成 \(1 品以上\)/, '保存のボタンの一言 = いちばん上の残り');
+  // Tab の順: 種類の札の次は構成の 1 行目の欄 (コードと名前より先)
+  await p.focus('a.kindcard[href="?kind=set"]');
+  await p.keyboard.press('Tab');
+  assert.equal(await active(p), '1 行目の構成品のコード', 'Tab = 構成の欄が先');
+  // 右の残りを押す = その欄へ (構成 → コード の順で埋まる)
+  await p.click('#checklist li.need button');
+  assert.equal(await active(p), '1 行目の構成品のコード');
+  const rows = p.locator('#comp-rows tr.comp-row');
+  await rows.nth(0).locator('.c-code').fill('s001');
+  await rows.nth(0).locator('.c-code').press('Tab');
+  await p.waitForFunction(() => /単品 1/.test(document.querySelector('#comp-rows .c-name').textContent));
+  o = await order();
+  assert.deepEqual(o.need.slice(0, 2), ['商品コード', '名前'], '構成を入れたら次はコードと名前');
+  await p.click('#checklist li.need button');
+  assert.equal(await active(p), 'code');
+  // 単品は今までどおり (コードと名前が 1)
+  await p.goto(B + '/new?kind=single');
+  o = await order();
+  assert.deepEqual(o.jump.slice(0, 2), ['sec-code:1', 'sec-money:2']);
+  assert.equal(o.dom[0], 'sec-code');
+  assert.deepEqual(o.need.slice(0, 2), ['商品コード', '名前']);
+  assert.equal(await p.locator('#comp-suggest').count(), 0, '単品の画面に構成の候補の箱は無い');
+});
+
+await ta('[85] 新商品の登録 (セット・10/21 中原さん): 構成品の名前の「コピー」(クリップボード・使えないときは execCommand の写し)・「名前に使う」(名前が空・数が 2 以上 = 名前 N個セット・名前があれば押せない)', async (p) => {
+  await p.goto(B + '/new?kind=set');
+  await p.evaluate(() => {
+    window.__copied = [];
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: (t) => { window.__copied.push(t); return Promise.resolve(); } } });
+  });
+  const row = p.locator('#comp-rows tr.comp-row').first();
+  assert.equal(await row.locator('.c-tools').isHidden(), true, '引き当てる前は出さない');
+  await row.locator('.c-code').fill('k001');
+  await row.locator('.c-code').press('Tab');
+  await p.waitForFunction(() => /国産 はちみつ 500g/.test(document.querySelector('#comp-rows .c-name').textContent));
+  assert.equal(await row.locator('.c-tools').isHidden(), false, '名前が出たら出す');
+  assert.equal(await row.locator('[data-act="copy-name"]').getAttribute('aria-label'), '1 行目 (k001) の名前をコピー');
+  await row.locator('[data-act="copy-name"]').click();
+  await p.waitForFunction(() => window.__copied.length === 1);
+  assert.deepEqual(await p.evaluate(() => window.__copied), ['国産 はちみつ 500g'], '名前だけ (コード・印は付けない)');
+  assert.equal((await row.locator('[data-act="copy-name"]').textContent()).trim(), 'コピーしました');
+  await p.waitForFunction(() => document.querySelector('#comp-rows [data-act="copy-name"]').textContent.trim() === 'コピー', null, { timeout: 4000 });
+  assert.equal(await dirty(p), 1, 'コピーは未保存に数えない (構成の 1 件だけ)');
+  // クリップボードが使えない = 隠した欄から execCommand('copy')
+  await p.evaluate(() => {
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
+    window.__exec = [];
+    document.execCommand = (cmd) => { const ta = document.querySelector('textarea[readonly]'); window.__exec.push([cmd, ta && ta.value]); return true; };
+  });
+  await row.locator('[data-act="copy-name"]').click();
+  await p.waitForFunction(() => window.__exec.length === 1);
+  assert.deepEqual(await p.evaluate(() => window.__exec), [['copy', '国産 はちみつ 500g']]);
+  assert.equal((await row.locator('[data-act="copy-name"]').textContent()).trim(), 'コピーしました');
+  // クリップボードの API が断った (許可がない) = 隠した欄から写す (Codex R1 Medium)
+  await p.evaluate(() => { window.__exec = []; Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: () => Promise.reject(new Error('NotAllowedError')) } }); });
+  await row.locator('[data-act="copy-name"]').click();
+  await p.waitForFunction(() => window.__exec.length === 1);
+  assert.deepEqual(await p.evaluate(() => window.__exec), [['copy', '国産 はちみつ 500g']], '断られたら execCommand で');
+  // 名前に使う: 数が 1 = 押せない → 3 = 押せる → 名前 3個セット (半角の空白 1 つ) → 名前があるので押せない
+  const use = row.locator('[data-act="use-name"]');
+  assert.equal(await use.isDisabled(), true, '数が 1 = 押せない');
+  assert.match(await use.getAttribute('title'), /数が 2〜99/);
+  await row.locator('.c-qty').fill('3');
+  assert.equal(await use.isDisabled(), false);
+  await use.click();
+  assert.equal(await p.inputValue('#f-name'), '国産 はちみつ 500g 3個セット');
+  assert.equal(await dirty(p), 2, '名前を入れた = 未保存に数える');
+  assert.equal(await use.isDisabled(), true, '名前がある = 押せない (上書きしない)');
+  assert.match(await use.getAttribute('title'), /名前が空のときだけ/);
+  await p.fill('#f-name', '');
+  assert.equal(await use.isDisabled(), false, '名前を空にすると押せる');
+  // 打ち直す = 引き当てるまで出さない
+  await row.locator('.c-code').fill('k00');
+  assert.equal(await row.locator('.c-tools').isHidden(), true, '打ち直した = 前の名前のボタンを出さない');
+});
+
+await ta('[86] 新商品の登録 (セット・10/21 中原さん): 構成品の欄を名前で探す = 本物の IME (CDP)・変換中から候補・変換中は引き当てない (「見つかりません」を出さない)・確定の Enter で数の欄へ移らない・↓ Enter で選ぶ = コードが入って引き当てる・Esc・単品だけ (セット・やめた・要確認は出さない)・名前の < > は字のまま', async (p) => {
+  const keep3 = await regUi('k003'), keep6 = await regUi('k006');
+  await setRegUi('k003', 'cancelled');
+  await setRegUi('k006', 'quarantined');
+  const name5 = (await pg.query("select name from core.skus where code = 'k005'")).rows[0].name;
+  await pg.query("update core.skus set name = $1 where code = 'k005'", ['abc 小袋 <img src=x onerror="window.__xss=1">']);
+  try {
+    await p.goto(B + '/new?kind=set');
+    const row = p.locator('#comp-rows tr.comp-row').first();
+    const inp = row.locator('.c-code');
+    assert.equal(await inp.getAttribute('role'), 'combobox');
+    const lookups = [];
+    p.on('request', (rq) => { if (/\/api\/lookup\?/.test(rq.url())) lookups.push(decodeURIComponent(new URL(rq.url()).searchParams.get('code'))); });
+    const cdp = await p.context().newCDPSession(p);
+    const key = (type, k, vk) => cdp.send('Input.dispatchKeyEvent', { type, key: k, code: k === 'Enter' ? 'Enter' : 'KeyA', windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
+    const compose = async (steps) => { for (const s of steps) { await key('rawKeyDown', 'Process', 229); await cdp.send('Input.imeSetComposition', { text: s, selectionStart: s.length, selectionEnd: s.length }); await key('keyUp', 'a', 65); } };
+    await inp.focus();
+    await compose(['は', 'はち', 'はちみ', 'はちみつ']);
+    await sugOpen(p);
+    assert.deepEqual(await sugCodes(p), ['k001', 'k002'], '変換中から候補・単品だけ (やめた k003 は出さない)');
+    assert.equal(await p.textContent('#comp-rows .c-name'), '', '変換中は引き当てない');
+    // 変換中に候補をマウスで押しても選ばない (確定した字が後から欄を書き換える = Codex R1 Medium)
+    await p.click('#comp-suggest .co[data-i="0"]');
+    assert.notEqual(await inp.inputValue(), 'k001', '変換中は選ばない');
+    assert.equal(await active(p), '1 行目の構成品のコード', '数の欄へ移らない');
+    assert.deepEqual(lookups, [], '引き当ても聞かない');
+    // 確定の Enter (Windows の Chrome・Edge = 確定の後に keyCode 13) = 箱も欄もそのまま
+    await cdp.send('Input.insertText', { text: 'はちみつ' });
+    await key('rawKeyDown', 'Enter', 13);
+    await key('keyUp', 'Enter', 13);
+    await p.waitForTimeout(700);
+    assert.equal(await active(p), '1 行目の構成品のコード', '確定の Enter で数の欄へ移らない');
+    assert.equal(await inp.inputValue(), 'はちみつ');
+    assert.equal(await p.textContent('#comp-rows .c-name'), '', '名前を打っている間は「見つかりません」を出さない');
+    assert.deepEqual(lookups, [], '名前では引き当てを聞かない');
+    await sugOpen(p);
+    // ↓ Enter で選ぶ = コードが入る・すぐ引き当てる・数の欄へ
+    await inp.press('ArrowDown');
+    assert.equal(await selCode(p), 'k001');
+    await inp.press('Enter');
+    assert.equal(await inp.inputValue(), 'k001');
+    assert.equal(await p.isHidden('#comp-suggest'), true);
+    assert.equal(await active(p), '1 行目 (k001) の数', '選ぶと数の欄へ');
+    await p.waitForFunction(() => /国産 はちみつ 500g/.test(document.querySelector('#comp-rows .c-name').textContent));
+    assert.deepEqual(lookups, ['k001']);
+    // 2 行目: 1 行目にある品は灰色 (同じ品は 1 行)・Esc で閉じる
+    const inp2 = p.locator('#comp-rows tr.comp-row').nth(1).locator('.c-code');
+    await inp2.focus();
+    await compose(['はちみつ']);
+    await cdp.send('Input.insertText', { text: 'はちみつ' });
+    await sugOpen(p);
+    assert.deepEqual(await sugCodes(p), ['×k001', 'k002'], '1 行目にある品は選べない');
+    await inp2.press('Escape');
+    assert.equal(await p.isHidden('#comp-suggest'), true, 'Esc で閉じる');
+    // セット・要確認は出さない (名前・コードで当たっても)
+    const sugNone = () => p.waitForFunction(() => { const s = document.getElementById('comp-suggest'); return s && !s.hidden && /はありません/.test(s.textContent); });
+    const setName = (await pg.query("select name from core.skus where code = 'set001'")).rows[0].name;   // 前の試験で名前が変わる
+    await inp2.fill(setName);
+    await p.waitForFunction(() => { const s = document.getElementById('comp-suggest'); return s && !s.hidden && !s.classList.contains('stale') && (s.querySelector('.co') || /はありません/.test(s.textContent)); });
+    assert.ok(!(await sugCodes(p)).includes('set001'), 'セット (set001) は名前でも出さない');
+    await inp2.fill('みかん');
+    await sugNone();
+    assert.deepEqual(await sugCodes(p), [], '要確認 (k006) は出さない');
+    assert.match(await p.textContent('#comp-suggest'), /構成品にできる単品はありません/);
+    await inp2.fill('set001');
+    await sugNone();
+    assert.deepEqual(await sugCodes(p), [], 'セットのコードをぴったり打っても候補に出さない');
+    await inp2.press('Tab');
+    await p.waitForFunction(() => /単品でない/.test(document.querySelectorAll('#comp-rows .c-name')[1].textContent), null, { timeout: 5000 });
+    // 名前の < > は字のまま (候補の箱・構成品の名前・コピー)
+    await inp2.fill('abc');
+    await sugOpen(p);
+    assert.equal(await p.locator('#comp-suggest img').count(), 0, '候補の名前の HTML は効かない');
+    assert.match(await p.textContent('#comp-suggest'), /<img src=x onerror="window.__xss=1">/);
+    while ((await selCode(p)) !== 'k005') await inp2.press('ArrowDown');
+    await inp2.press('Enter');
+    await p.waitForFunction(() => /<img/.test(document.querySelectorAll('#comp-rows .c-name')[1].textContent));
+    assert.equal(await p.locator('#comp-rows img').count(), 0);
+    assert.equal(await p.evaluate(() => window.__xss), undefined);
+    // タップでも選べる (スマホ = 押す所は 44px)
+    await p.setViewportSize({ width: 390, height: 844 });
+    await p.click('#comp-add');
+    const inp3 = p.locator('#comp-rows tr.comp-row').nth(2).locator('.c-code');
+    await inp3.fill('レモン');
+    await sugOpen(p);
+    const h = await p.evaluate(() => Math.round(document.querySelector('#comp-suggest .co').getBoundingClientRect().height));
+    assert.ok(h >= 44, '候補の行は 44px ' + h);
+    await p.click('#comp-suggest .co[data-i="0"]');
+    assert.equal(await inp3.inputValue(), 'k002');
+    await p.waitForFunction(() => /ハチミツ レモン/.test(document.querySelectorAll('#comp-rows .c-name')[2].textContent));
+    const m = await p.evaluate(() => ({ doc: document.documentElement.scrollWidth, view: innerWidth, tools: [...document.querySelectorAll('#comp-rows .c-tools:not([hidden]) button')].map((b) => Math.round(b.getBoundingClientRect().height)) }));
+    assert.ok(m.doc <= m.view, `横にはみ出す ${m.doc} > ${m.view}`);
+    assert.ok(m.tools.length >= 2 && m.tools.every((x) => x >= 44), 'コピー・名前に使う は 44px ' + JSON.stringify(m.tools));
+  } finally {
+    await setRegUi('k003', keep3);
+    await setRegUi('k006', keep6);
+    await pg.query("update core.skus set name = $1 where code = 'k005'", [name5]);
+  }
 });
 
 await browser.close();

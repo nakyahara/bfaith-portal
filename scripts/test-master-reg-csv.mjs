@@ -5,7 +5,7 @@
  * 固定する契約:
  *   C 新商品の NE 登録の CSV: 門 (切替の後だけ)・止まる理由 (原価・仕入先・NE にもうあるコード = 止める・構成品が NE 確認済みでない)・
  *     ファイル (見出し・UTF-8・BOM なし・CRLF・sha256・形の版・payload hash・印)・同じ番号 = 同じファイル・試し用の行の上限・
- *     配る前に直す = 自動で使わない / 配った後に NE に送る欄を直す = 409 (ほかの欄は直せる)・申告 (sha256・誰・いつ・draft → ne_pending)・
+ *     配る前に直す = 自動で使わない / 🆕 0093: 配った後も NE に送る欄を直せる (確かめは品目の期待値と比べる = 直した後も verified)・申告 (sha256・誰・いつ・draft → ne_pending)・
  *     翌朝の確かめ (申告の前の取得 = 待ち・違う列 = partial・全部合う = verified + ne_confirmed・無い = failed・信じられない = 待ち・申告の前に NE にある = 記録だけ・同じ回 = 1 回)・
  *     セットは同じ取得の構成品が全部合うときだけ・使わない (理由・直し方・確かめた) ・全部だめ = failed・実機の確かめの門・DB の守り
  *   J JAN: 足す・外すの記録 (誰・request_id・出どころ・理由)・書き換え / 物理の削除は拒む・SKU の version が変わる・一意 (409)・画面 B で直せる
@@ -14,7 +14,7 @@
  *     company = core を書かない・依頼が無い差 = 食い違い・依頼と同じ = 上げる・数は 0050 の厳密な整数・昇格の答え (もっと新しい観測など) は投げずに数える
  *   S 仕入先: 新しいコードの決まり・状態 ne_pending → 申告で ne_confirmed・申告の前は代表にできない・取引停止 (代表に使っている = 409 / 付け替え)・物理の削除は拒む
  *   D 書き込みの約束 (0051 の ops.master_write_sessions・#1571 R1 High 3): ⑤-2b の関数ごとに約束 (操作・DB が決めた相手・DB の payload_hash) と done・
- *     request_id は使い回せない・画面のロールは約束を作れない / CSV の表・JAN の行の守り (約束の操作・相手)・保存の直接の書き込みも配った CSV の欄は拒む・
+ *     request_id は使い回せない・画面のロールは約束を作れない / CSV の表・JAN の行の守り (約束の操作・相手)・保存の直接の書き込みも作っただけの CSV の欄は拒む (0093: 配った後は通る)・
  *     確かめる前の仕入先は設定に依らず代表にできない・仕入先の関数は画面のロールに渡さない・⑤-2b の操作の一覧は 1 か所
  *   V 0065 (CompanyDB構想/20 v7 §⑤・§⑩ PR-2): 形の版の決まり (lib = DB・single-v2 / variation-v1)・関数の作り直しの差は決めた所だけ・一部だけ入ったときの申告 (partial → verified / failed → 作り直し・申告しないと待ち)・
  *     3 者一致 (NE は合うが Company DB が違う = partial + cdb_drift)・一度でも配った商品の代表は変えない (409 parent_frozen・🔒・DB)
@@ -237,8 +237,16 @@ const atOf = (run) => { if (!ATS.has(run)) ATS.set(run, new Date(Date.now() + 60
 const observe = async (run, observations, { productsAt = null, setsAt = null, absenceTrusted = true, targets, fetch = FETCH(run), snapshot = true } = {}) => {
   if (snapshot) await snapTargets(run);
   const pAt = productsAt ?? atOf(run);
+  // 🆕 0098: 確かめ待ちの写しに「NE のコードの台帳にもうある下書き」(生きている品目なし) も入る。本番の照合は取得から写しの全部の観測を送る。
+  //   この試験は品目の観測だけを渡す = 写しのその下書きには「無い」を足す (品目の観測は今までどおり試験が決める = 足りない品目は今までどおり断られる)
+  const given = new Set(observations.map((o) => o && o.code_norm));
+  const fill = (await pg.query(`select t.code_norm from ops.ne_reg_compare_targets c, unnest(c.target_codes) t(code_norm)
+      join core.skus k on k.code_norm = t.code_norm join ops.master_registrations r on r.sku_id = k.sku_id
+     where c.compare_run_id = $1 and r.state in ('draft', 'ne_pending')
+       and not exists (select 1 from ops.ne_reg_export_items i where i.sku_id = k.sku_id and i.state in ('issued', 'import_declared', 'partial'))`, [run])).rows
+    .map((x) => x.code_norm).filter((c) => !given.has(c)).map((c) => ({ code_norm: c, present: false, trusted: true, kind: null }));
   return as(E, 'watch_writer', async () => (await pg.query('select ops.record_ne_registration_observations($1::jsonb) as r', [JSON.stringify({ compare_run_id: run, fetch,
-    products_at: pAt, sets_at: setsAt ?? pAt, absence_trusted: absenceTrusted, ...(targets === undefined ? {} : { targets }), observations })])).rows[0].r);
+    products_at: pAt, sets_at: setsAt ?? pAt, absence_trusted: absenceTrusted, ...(targets === undefined ? {} : { targets }), observations: [...observations, ...fill] })])).rows[0].r);
 };
 const seal = (run, hash, evidence = 'e'.repeat(64)) => as(E, 'watch_writer', async () => (await pg.query('select ops.seal_ne_registration_run($1, $2, $3) as r', [run, hash, evidence])).rows[0].r);
 const checkRun = (run) => as(E, 'watch_writer', async () => (await pg.query('select ops.record_ne_registration_check($1) as r', [run])).rows[0].r);
@@ -447,7 +455,8 @@ await ta('[C4] 配る前に NE に送る欄を直す = そのファイルは自�
 });
 
 let EXB = null; let SHAB = null;
-await ta('[C5] 配る = built → issued・byte 列はその後だけ・配った後は NE に送る欄 (名前・JAN・原価) を直せない (409)・送らない欄は直せる', async () => {
+const REG_NAME_EDITED = '配った後に直した名前';
+await ta('[C5] 配る = built → issued・byte 列はその後だけ・🆕 0093: 配った後も NE に送る欄 (名前・JAN・原価・税率) を直せる (品目の期待値・ファイルは変わらない)・送らない欄も直せる', async () => {
   const r = await build('products', ['new-a']);
   EXB = r.export.export_id; SHAB = r.export.sha256;
   assert.equal((await G.regExportFile(db, EXB)).bytes, null, 'built は配らない');
@@ -458,14 +467,29 @@ await ta('[C5] 配る = built → issued・byte 列はその後だけ・配っ�
   assert.equal(crypto.createHash('sha256').update(f.bytes).digest('hex'), SHAB);
   assert.match(f.file_name, /^ne_register_products_\d{8}_\d{6}_\d+\.csv$/);   // 0065: 単品 (v2) は試し用でない
   assert.deepEqual((await itemsOf(EXB)).map((i) => i.state), ['issued']);
-  for (const v of [{ name: '直したい' }, { jan: J2 }, { cost: { jpy: '999', reason: '改定' } }, { tax_rate: '8' }]) {
-    const e = await rejectsWith(save('new-a', v), 409, 'reg_csv_issued');
-    assert.match(e.message, new RegExp(`#${EXB}`));
+  const frozen = async () => one('select expected, item_token, snapshot_hash, state from ops.ne_reg_export_items where export_id = $1', [EXB]);
+  const before = await frozen();
+  // 🆕 0093 (2026-10-19 中原さん「名前修正できるようにしてよ」): 配った後も直せる (前 = 409 reg_csv_issued)
+  for (const v of [{ name: REG_NAME_EDITED }, { jan: jan13('490000000095') }, { cost: { jpy: '999', reason: '改定' } }, { tax_rate: '8' }]) {
+    const w = await save('new-a', v);
+    assert.equal(w.ok, true, JSON.stringify(v));
+    assert.ok(!w.no_change, JSON.stringify(v));
   }
-  // JAN の関数も自分で拒む (lib を通さずに呼んでも・#1571 R1 High 3)
-  const aId = await skuId('new-a');
-  await pgErr(as(E, 'master_edit', () => pg.query("select ops.edit_sku_jan(gen_random_uuid(), 'naka@test', null, $1::jsonb, $2::bigint, $3::jsonb, $4::jsonb)",
-    [OWN, aId, JSON.stringify([J1]), JSON.stringify([J2])])), /reg_csv_issued/);
+  const now = await W.readCurrent(db, await skuId('new-a'), TODAY);
+  assert.deepEqual([now.name, Number(now.tax_rate)], [REG_NAME_EDITED, 0.08]);
+  // 名前のほかは戻す (名前は [C7] の確かめまでこのまま = 確かめは品目の期待値 (配った値) と NE を比べる)
+  await save('new-a', { jan: J1 }); await save('new-a', { tax_rate: '10' }); await save('new-a', { cost: { jpy: '300', reason: '改定' } });
+  // 品目の期待値・印・状態は変わらない (配ったファイルの中身のまま)
+  assert.deepEqual(await frozen(), before);
+  assert.equal(before.expected.values.name, '新しい単品');
+  // 0093 の前の DB (印の関数が無い) = アプリは今までどおり 409 reg_csv_issued (アプリを先に出しても断る側)・画面は 🔒
+  await pg.query('alter function ops.reg_csv_edit_after_issue() rename to reg_csv_edit_after_issue__hidden');
+  try {
+    const e = await rejectsWith(save('new-a', { name: '当てる前' }), 409, 'reg_csv_issued');
+    assert.match(e.message, new RegExp(`#${EXB}`));
+    assert.equal(await W.regEditAfterIssue(db), false);
+  } finally { await pg.query('alter function ops.reg_csv_edit_after_issue__hidden() rename to reg_csv_edit_after_issue'); }
+  assert.equal(await W.regEditAfterIssue(db), true);
   const ok2 = await save('new-a', { reorder_months: '5' });
   assert.equal(ok2.ok, true);
 });
@@ -505,9 +529,14 @@ await ta('[C7] 翌朝の確かめ (単品): 申告の前の取得 = 待ち・違
   const r3 = await newRun();
   r = await check(r3, [obsSingle('new-a', { tax_rate: { st: 'invalid', v: null } })]);
   assert.deepEqual(r.counts, { partial: 1 }, '比べられない列は一致にしない');
+  // 🆕 0093: 配った後に Company DB の名前を直した ([C5]) = NE は配った CSV の名前 → 確かめは品目の期待値と比べる = verified (partial にしない・cdb_drift にしない)
+  assert.equal((await W.readCurrent(db, await skuId('new-a'), TODAY)).name, REG_NAME_EDITED);
   const r4 = await newRun();
   r = await check(r4, [obsSingle('new-a')]);
   assert.deepEqual(r.counts, { verified: 1 });
+  assert.deepEqual(r.cdb_drift, []);
+  const d4 = (await one('select detail from ops.ne_reg_checks where compare_run_id = $1', [r4])).detail;
+  assert.deepEqual([d4.compare.ok, d4.compare.cols.name.ok, d4.cdb.ok], [true, true, true], JSON.stringify(d4));
   assert.deepEqual([(await itemsOf(EXB))[0].state, await regOf('new-a')], ['verified', 'ne_confirmed']);
   const ev = await one("select e.evidence, e.actor_type from ops.master_registration_events e join core.skus s on s.sku_id = e.sku_id where s.code = 'new-a' and e.to_state = 'ne_confirmed'");
   assert.deepEqual([ev.evidence.compare_run_id, ev.evidence.matched, ev.actor_type], [r4, true, 'system']);
@@ -742,7 +771,14 @@ await ta('[C9] セット: 構成品が全部 NE 確認済み・構成品 1 つ�
   assert.equal(f, 'set_syohin_code,set_syohin_name,set_baika_tnk,tax_rate,syohin_code,suryo\r\nnew-set,新しいセット,2500,8,s001,1\r\nnew-set,新しいセット,2500,8,s002,2\r\n');
   await issue(id); await declare(id, r.export.sha256, 'ok');
   assert.equal(await regOf('new-set'), 'ne_pending');
-  const obsSet = (children) => ({ code_norm: 'new-set', present: true, trusted: true, kind: 'set', cols: { name: ok('新しいセット'), price: ok(2500) }, children });
+  // 🆕 0093: 配った後もセットの構成 (依頼) だけは確かめが終わるまで 409 (確かめは配った構成と NE を比べる = 先に NE を直すと partial のまま・Codex R1 Medium)。
+  //   (名前・売価の鍵は外した。ただし依頼だけの新しいセットは「今の構成が無い = 導く値が決まらない」で保存できないのは前から = この PR では変えない)
+  const ec = await rejectsWith(save('new-set', { components: [{ code: 's001', qty: 1 }, { code: 's002', qty: 3 }] }), 409, 'reg_csv_issued');
+  assert.deepEqual(ec.extra.exports, [String(id)]);
+  const { readSkuPage: readPage } = await import('../apps/master-edit/read.mjs');
+  const setPage = await readPage(db, 'new-set', { now: NOW, ownership: ALL_COMPANY, open: true });
+  assert.deepEqual([setPage.locks.fields.components?.why, setPage.locks.fields.name], ['reg_wait', undefined]);
+  const obsSet =(children) => ({ code_norm: 'new-set', present: true, trusted: true, kind: 'set', cols: { name: ok('新しいセット'), price: ok(2500) }, children });
   const r1 = await newRun();
   let c = await check(r1, [obsSet([{ code_norm: 's001', st: 'ok', v: 1 }])]);
   assert.deepEqual(c.counts, { partial: 1 }, '構成品が足りない = partial');
@@ -763,13 +799,13 @@ await ta('[C10] 使わない: 理由・NE で何をしたか・確かめた の�
   await rejectsWith(supersede(id, { reason: '' }), 400);
   await rejectsWith(supersede(id, { correction: '' }), 400);
   await rejectsWith(supersede(id, { confirm: false }), 400);
-  await rejectsWith(save('new-c', { name: 'C 改' }), 409, 'reg_csv_issued');
+  assert.equal((await save('new-c', { name: 'C 改' })).ok, true, '🆕 0093: 申告した後 (使わないにする前) も直せる');
   const s = await supersede(id, { reason: '売価を間違えた', correction: 'NE で取り込んだ商品を消した' });
   assert.equal(s.superseded, 1);
   const it = await one('select state, superseded_reason, superseded_correction from ops.ne_reg_export_items where export_id = $1', [id]);
   assert.deepEqual([it.state, it.superseded_reason, it.superseded_correction], ['superseded', '売価を間違えた', 'NE で取り込んだ商品を消した']);
   assert.equal(await regOf('new-c'), 'ne_pending');
-  assert.equal((await save('new-c', { name: 'C 改' })).ok, true);
+  assert.equal((await save('new-c', { name: 'C 改 2' })).ok, true);
   await rejectsWith(supersede(id), 409, 'closed');
   await rejectsWith(declare(id, r.export.sha256), 409, 'closed');
   // 全部だめ
@@ -782,12 +818,15 @@ await ta('[C10] 使わない: 理由・NE で何をしたか・確かめた の�
   assert.equal(await regOf('new-d'), 'draft');
 });
 
-await ta('[C11] 実機の確かめの門: 試し用は 5 行まで・ok は試しのファイルの商品が全部 NE で確かめ済みのときだけ・ok の後は本番 (試し用でない)・ng で戻る', async () => {
+await ta('[C11] 🆕 0099: セットの版 ne-reg-set-v2 は試し用の門なし (6 行のセットも 1 つのファイル・試し用でない)・実機の確かめは門の無い版として断る / 単品 (v2) も同じ', async () => {
   await reg('set', 'new-big', { name: '大きいセット', standard_price: '9000', shipping_code: 'S02',
     components: ['s001', 's002', 's003', 's004', 's005', 's006'].map((c) => ({ code: c, qty: 1 })) });
-  const e = await rejectsWith(build('sets', ['new-big']), 409, 'trial_limit');
-  assert.equal(e.extra.rows, 6);
-  const setExp = (await one("select export_id::text as id from ops.ne_reg_exports where kind = 'sets' and state = 'closed' and close_reason = 'finished'")).id;
+  const big = await build('sets', ['new-big']);
+  const bx = await expOf(big.export.export_id);
+  assert.deepEqual([bx.trial, bx.schema_version, bx.row_count], [false, 'ne-reg-set-v2', 6], '試し用でない (5 行の上限なし)');
+  const eSet = await rejectsWith(as(E, 'master_edit', () => G.recordRegVerified(db, { actor: 'boss@test', kind: 'sets', result: 'ok', exportId: big.export.export_id }, opts())), 409, 'export_mismatch');
+  assert.equal(eSet.extra.why, 'no_gate');
+  await supersede(big.export.export_id);
   const notDone = (await one("select export_id::text as id from ops.ne_reg_exports where kind = 'products' and close_reason = 'superseded' order by export_id desc limit 1")).id;
   await rejectsWith(as(E, 'master_edit', () => G.recordRegVerified(db, { actor: 'boss@test', kind: 'sets', result: 'ok' }, opts())), 400);
   await rejectsWith(as(E, 'master_edit', () => G.recordRegVerified(db, { actor: 'boss@test', kind: 'sets', result: 'ok', exportId: notDone }, opts())), 409, 'export_mismatch');
@@ -795,19 +834,8 @@ await ta('[C11] 実機の確かめの門: 試し用は 5 行まで・ok は試�
   assert.equal((await expOf(notDone)).schema_version, 'ne-reg-single-v2');
   const eNg = await rejectsWith(as(E, 'master_edit', () => G.recordRegVerified(db, { actor: 'boss@test', kind: 'products', result: 'ok', exportId: notDone }, opts())), 409, 'export_mismatch');
   assert.equal(eNg.extra.why, 'no_gate');
-  const setNotDone = (await one("select e.export_id::text as id from ops.ne_reg_exports e where e.kind = 'sets' and exists (select 1 from ops.ne_reg_export_items i where i.export_id = e.export_id and i.state <> 'verified') order by e.export_id desc limit 1"))?.id;
-  assert.ok(setNotDone, '商品がまだ全部は確かめ済みでないセットのファイル');
-  await rejectsWith(as(E, 'master_edit', () => G.recordRegVerified(db, { actor: 'boss@test', kind: 'sets', result: 'ok', exportId: setNotDone }, opts())), 409, 'not_verified');
-  await as(E, 'master_edit', () => G.recordRegVerified(db, { actor: 'boss@test', kind: 'sets', result: 'ok', exportId: setExp, note: '中原さんと実機で' }, opts()));
-  assert.equal(await G.regFormatVerified(db, G.REG_SCHEMAS.sets), true);
   assert.equal(await G.regFormatVerified(db, G.REG_SCHEMAS.products), true, '単品 (v2) = [C7] の翌朝の確かめが記録だけ残した (種類ごと)');
-  const big = await build('sets', ['new-big']);
-  assert.equal((await expOf(big.export.export_id)).trial, false);
-  await supersede(big.export.export_id);
-  await as(E, 'master_edit', () => G.recordRegVerified(db, { actor: 'boss@test', kind: 'sets', result: 'ng', note: '取込でおかしかった' }, opts()));
-  assert.equal(await G.regFormatVerified(db, G.REG_SCHEMAS.sets), false);
-  const v = await one("select converter_version, col, reg_export_id::text as x from ops.ne_csv_verified where kind = 'sets' and result = 'ok'");
-  assert.deepEqual([v.converter_version, v.col, v.x], ['ne-reg-set-v1', 'new_registration', setExp]);
+  assert.equal((await q("select 1 from ops.ne_csv_verified where kind = 'sets' and verified_by <> 'ne_compare'")).length, 0, 'セットの実機の確かめを人が押すことは無い');
 });
 
 await ta('[C12] DB の守り: 中身は変えない・消さない・一方向・生きているファイルは SKU ごとに 1 つ', async () => {
@@ -842,6 +870,16 @@ await ta('[C13] 配る前に登録をやめた商品がある = 配らない (�
   assert.ok(w.warnings.some((m) => m.includes(`#${s.export.export_id}`)), JSON.stringify(w.warnings));
   assert.equal((await expOf(s.export.export_id)).state, 'closed');
   await save('s007', { tax_rate: '10' });
+  // 🆕 0093: 配った後なら s007 の税率は直せる (前 = 409)。依頼だけのセットの税率は保存では計算し直さない + 照合 ② はセットの税率を比べない
+  //   = 保存の答えに「NE の画面でセット new-set-h の税率を確かめる」を出す (Codex R1 High)
+  const s2 = await build('sets', ['new-set-h']);
+  await issue(s2.export.export_id);
+  const w2 = await save('s007', { tax_rate: '8' });
+  assert.equal(w2.ok, true);
+  assert.ok(w2.ne_steps.some((m) => /セット new-set-h の税率/.test(m)), JSON.stringify(w2.ne_steps));
+  assert.equal((await itemsOf(s2.export.export_id))[0].state, 'issued', '配ったファイルはそのまま');
+  await save('s007', { tax_rate: '10' });
+  await supersede(s2.export.export_id);
 });
 
 await ta('[C14] 権限の境界: 画面のロールは表を直接書けない・状態の関数を呼べない / 関数は呼び手の根拠を受けない・行から byte 列・確かめる値・NE の元のコードの回・状態を照らし直す', async () => {
@@ -1064,7 +1102,7 @@ await ta('[C16] 状態の関数の根拠の照らし直し (持ち主が状態�
   assert.ok(m.blockers.some((b) => /new-s1 が NE 確認済みでない/.test(b)), JSON.stringify(m.blockers));
   const rows = m.cells.map((r) => r.map(String));
   assert.deepEqual(rows, [['new-sd', '下書きの構成品のセット', '2000', '10', 'new-s1', '1']]);
-  const pay = JSON.stringify({ request_id: uuid(), actor: 'boss@test', ownership: ALL_COMPANY, kind: 'sets', schema_version: 'ne-reg-set-v1', header: G.REG_SCHEMAS.sets.header.join(','),
+  const pay = JSON.stringify({ request_id: uuid(), actor: 'boss@test', ownership: ALL_COMPANY, kind: 'sets', schema_version: G.REG_SCHEMAS.sets.schema, header: G.REG_SCHEMAS.sets.header.join(','),
     ne_codes_run: run5, cost_day: TODAY, items: [{ sku_id: m.cur.sku_id, expected: m.expected, rows }] });
   await pgErr(inSession(() => pg.query('select ops.ne_reg_build($1::jsonb, $2::bytea) as r', [pay, G.buildRegCsv(G.REG_SCHEMAS.sets, rows).bytes])), /new-s1 が NE 確認済みでない/);
 });
@@ -1135,10 +1173,12 @@ await ta('[C18] 観測 = 回の始まりの写しとちょうど同じ商品 (#1
   // 1. 写し = DB が今の確かめ待ちから決める (呼び手は選べない)。2 つのうち 1 つだけ送る・targets を 1 つにする = 拒む
   const r1 = await newRun();
   const s1 = await snapTargets(r1);
-  assert.deepEqual([s1.state, s1.targets.map((t) => [t.code_norm, t.sku_kind])], ['taken', [['new-w1', 'single'], ['new-w2', 'single']]]);
+  // 🆕 0098: 写しには NE のコードの台帳にもうある下書き (生きている品目なし = この試験の new-dup ほか) も入る = 品目の商品だけを比べる
+  const dine = new Set((await pg.query("select code_norm from ops.v_ne_reg_targets where state = 'draft_in_ne'")).rows.map((x) => x.code_norm));
+  assert.deepEqual([s1.state, s1.targets.filter((t) => !dine.has(t.code_norm)).map((t) => [t.code_norm, t.sku_kind])], ['taken', [['new-w1', 'single'], ['new-w2', 'single']]]);
   const o1 = obsSingle('new-w1', { name: ok('W1') });
   const o2 = obsSingle('new-w2', { name: ok('W2') });
-  await pgErr(observe(r1, [o1]), /写しの商品 \(2 件\)/);
+  await pgErr(observe(r1, [o1]), /写しの商品 \(\d+ 件\)/);
   await pgErr(observe(r1, [o1], { targets: ['new-w1'] }), /targets が回の始まりの写し/);
   await pgErr(observe(r1, [o1, o1]), /写しの商品/);
   // 2. 写しは変えない: 写した後に配った商品 (W3) は入れない・写した後に使わないにした商品 (W2) も写しのまま (今の見え方でなく写しと比べる)
@@ -1149,7 +1189,7 @@ await ta('[C18] 観測 = 回の始まりの写しとちょうど同じ商品 (#1
   await pgErr(observe(r1, [o1, obsSingle('new-w3', { name: ok('W3') })]), /写しの商品/);
   const w = await observe(r1, [o1, o2]);
   assert.equal(w.state, 'written');
-  assert.deepEqual((await one('select target_codes from ops.ne_reg_compare_runs where compare_run_id = $1', [r1])).target_codes, ['new-w1', 'new-w2']);
+  assert.deepEqual((await one('select target_codes from ops.ne_reg_compare_runs where compare_run_id = $1', [r1])).target_codes.filter((c) => !dine.has(c)), ['new-w1', 'new-w2']);
   // 3. 同じ回の 2 回目 = 入力全体が同じなら何もしない (同じ時刻の別の書き方も同じ)・どれか違えば拒む (「無い」を信じるかを後から変えられない)
   const P = atOf(r1);
   assert.equal((await observe(r1, [o2, o1], { productsAt: P.replace('Z', '+00:00') })).state, 'unchanged');
@@ -1207,7 +1247,9 @@ await ta('[V1] 0065 形の版の決まり: lib の REG_SCHEMA_RULES = DB の ops
       { kind: r.kind, sku_kind: r.skuKind, header: r.header.join(','), buildable: r.buildable, why: r.why, trial_gate: r.trialGate, jan: r.jan, parent: r.parent }, schema);
   }
   assert.equal((await one("select ops.ne_reg_schema_rule('ne-reg-single-v3') as r")).r, null);
-  assert.deepEqual([G.REG_SCHEMAS.products.schema, G.REG_SCHEMAS.products.trialGate, G.REG_SCHEMAS.sets.schema, G.REG_SCHEMAS.sets.trialGate], ['ne-reg-single-v2', false, 'ne-reg-set-v1', true]);
+  assert.deepEqual([G.REG_SCHEMAS.products.schema, G.REG_SCHEMAS.products.trialGate, G.REG_SCHEMAS.sets.schema, G.REG_SCHEMAS.sets.trialGate], ['ne-reg-single-v2', false, 'ne-reg-set-v2', false]);
+  assert.deepEqual(['ne-reg-set-v1', 'ne-reg-set-v2'].map((s) => [G.REG_SCHEMA_RULES[s].buildable, G.REG_SCHEMA_RULES[s].trialGate, G.REG_SCHEMA_RULES[s].header.join(',')]),
+    [[false, true, G.REG_SCHEMAS.sets.header.join(',')], [true, false, G.REG_SCHEMAS.sets.header.join(',')]], '🆕 0099: セットは v2 (見出しは v1 と同じ・門なし)・v1 は引退');
   const v = G.REG_VARIATION_SCHEMA;
   assert.deepEqual([v.kind, v.skuKind, v.schema, v.header.join(','), v.trialGate], ['products', 'single', 'ne-reg-variation-v1', G.REG_SCHEMAS.products.header.join(','), false]);
   assert.deepEqual(['buildable', 'jan', 'parent'].map((k) => G.REG_SCHEMA_RULES['ne-reg-variation-v1'][k]), [true, 'empty', 'group'], 'まとまりの版 = JAN は empty・代表商品コード = まとまりのコード・🆕 0067 (PR-5) から作れる');
@@ -1231,7 +1273,7 @@ await ta('[V6] 🆕 10/12 実機の確かめを押せるファイル (regVerifyT
     const v = G.regVerifyTargetOf({ kind: r.kind, schema_version: schema, header: hdr(schema) }, G.regSchemaRuleOf(schema));
     return [schema, [v.can, v.why]];
   }));
-  assert.deepEqual(got, { 'ne-reg-single-v1': [false, 'retired'], 'ne-reg-single-v2': [false, 'no_gate'], 'ne-reg-variation-v1': [false, 'no_gate'], 'ne-reg-set-v1': [true, null] });
+  assert.deepEqual(got, { 'ne-reg-single-v1': [false, 'retired'], 'ne-reg-single-v2': [false, 'no_gate'], 'ne-reg-variation-v1': [false, 'no_gate'], 'ne-reg-set-v1': [false, 'retired'], 'ne-reg-set-v2': [false, 'no_gate'] });   // 🆕 0099: 門のある今の版は無い
   // 決まりから導く (版を足したときもこの式で決まる): 押せる = 今の形 (REG_SCHEMAS) かつ trialGate
   for (const [schema, r] of Object.entries(G.REG_SCHEMA_RULES)) {
     const cur = G.REG_SCHEMAS[r.kind];
@@ -1243,9 +1285,9 @@ await ta('[V6] 🆕 10/12 実機の確かめを押せるファイル (regVerifyT
   }
   assert.equal(G.regSchemaRuleOf('ne-reg-single-v3'), null);
   assert.equal(G.regSchemaRuleOf('__proto__'), null);
-  const mm = G.regVerifyTargetOf({ kind: 'sets', schema_version: 'ne-reg-set-v1', header: 'set_syohin_code' }, G.regSchemaRuleOf('ne-reg-set-v1'));
-  assert.deepEqual([mm.can, mm.why], [false, 'mismatch'], '見出しが今の形と違う = 押せない (API と同じ)');
-  assert.match(mm.message, /今の形 \(ne-reg-set-v1\)と違う/);
+  const mm = G.regVerifyTargetOf({ kind: 'sets', schema_version: 'ne-reg-set-v9', header: 'set_syohin_code' }, G.regSchemaRuleOf('ne-reg-set-v9'));
+  assert.deepEqual([mm.can, mm.why], [false, 'mismatch'], '知らない版 = 押せない (API と同じ)');
+  assert.match(mm.message, /今の形 \(ne-reg-set-v2\)と違う/);
   const unk = G.regVerifyTargetOf({ kind: 'products', schema_version: 'ne-reg-single-v9', header: hdr('ne-reg-single-v2') }, G.regSchemaRuleOf('ne-reg-single-v9'));
   assert.deepEqual([unk.can, unk.why], [false, 'mismatch']);
   assert.doesNotMatch(G.regVerifyTargetOf({ kind: 'products', schema_version: 'ne-reg-single-v1', header: hdr('ne-reg-single-v1') }, G.regSchemaRuleOf('ne-reg-single-v1')).message, /本番の行数で作れるようになります/);
@@ -1346,7 +1388,9 @@ await ta('[V2] 0065 の関数の作り直し: 0065 より前の最後の版と�
     // 例外は名指しの 0067 (PR-5 = まとまりの版): ops.ne_reg_canonical / ops.ne_reg_build を 0065 の版から写す = その中身は scripts/test-master-variation.mjs の [S2] が 0065 との差で確かめる
     //   🆕 0082 (新商品の許可の切れ目を 0 に): ops.ne_reg_issue を 0065 の版から写す = 差は下で確かめる
     const allowLater = ['ops.ne_reg_canonical', 'ops.ne_reg_build'].includes(name) ? ['0067_variation_groups.sql'] : name === 'ops.ne_reg_issue' ? ['0082_new_entry_no_gap.sql'] : [];
-    for (const later of MIG_FILES.filter((x) => x > F0065 && !allowLater.includes(x))) assert.equal(fnDefIn(later, name), null, `${later} も ${name} を作り直している = 0065 の試験の元を見直す`);
+    //   🆕 10/20 (0097 仮番号・reg_csv_one_file): ops.ne_reg_build を 0067 の版から写す = 差は scripts/test-master-variation.mjs の [S4] が 0067 との差で確かめる
+    const oneFile = (x) => name === 'ops.ne_reg_build' && /^\d{4}_reg_csv_one_file\.sql$/.test(x);
+    for (const later of MIG_FILES.filter((x) => x > F0065 && !allowLater.includes(x) && !oneFile(x))) assert.equal(fnDefIn(later, name), null, `${later} も ${name} を作り直している = 0065 の試験の元を見直す`);
   }
   // 🆕 0082: ops.ne_reg_issue の 0065 との差 = NE のコードの回の確かめだけ (許可の回か、それより新しい照合の回の印も通す)
   assert.deepEqual(lineDiff(fnDefIn(F0065, 'ops.ne_reg_issue').split('\n'), fnDefIn('0082_new_entry_no_gap.sql', 'ops.ne_reg_issue').split('\n')), {
@@ -1667,26 +1711,60 @@ await ta('[W2] 0058 (広げる道 §3.9 の 3・4): 配ったファイルは ops
   await pg.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ('mc_20300110T090000000Z_0a5806', '2030-01-10T09:00:00Z', 0)`);
   await recordNeCodes(pg, 'mc_20300110T090000000Z_0a5806', ['new-dup', 'new-x1']);
   assert.equal(await isValid(), true, '停止の床より新しい結果の行の後に開く');
-  // ⑦ セットは単品の許可で通さない (#1644 Codex R1 Medium 2): 単品の許可だけ (本番と同じ) = セットの CSV を作る / 配る / 渡す の許可の確かめは閉じる・セットの許可は出せない
+  // ⑦ 🆕 0099: 単品の許可を出す (grant 'single') とセットの許可も同じ結果の行・同じ期限で出る / 取り消す (revoke 'single') とセットも取り消す (停止の床も両方)。
+  //   セットの許可だけを出す / 取り消すことはできない。セットの許可が無い (取り消した) = セットの CSV を作る / 配る / 渡す の許可の確かめは閉じる
   await pg.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ('mc_20300110T100000000Z_0a5807', '2030-01-10T10:00:00Z', 0)`);
   await recordNeCodes(pg, 'mc_20300110T100000000Z_0a5807', ['new-dup', 'new-x1'], { withSet: false });
   assert.equal(await isValid(), true);
-  //   🆕 0082: 許可は問題のない新しい結果の行では切れない = 前の回に試験だけで置いたセットの許可はまだ有効 → 外して本番と同じ形 (単品の許可だけ) にする
+  const pair = await q(`select kind, result_id::text as r, compare_run_id as c, granted_at::text as g, expires_at::text as x from ops.master_new_entry_leases
+     where revoked_at is null order by kind`);
+  assert.deepEqual(pair.map((x) => x.kind), ['set', 'single'], '生きている許可は単品とセットの 1 つずつ');
+  assert.deepEqual([pair[0].r, pair[0].c, pair[0].g, pair[0].x], [pair[1].r, pair[1].c, pair[1].g, pair[1].x], 'セットの許可は単品と同じ結果の行・回・時刻・期限');
   assert.equal((await one("select ops.new_entry_lease_valid('set') as v")).v, true);
-  await pg.query('begin'); await pg.query("select set_config('ops.lease_protocol', '1', true)");
-  await pg.query("update ops.master_new_entry_leases set revoked_at = clock_timestamp(), revoke_reason = '試験: セットの許可を外す', revoked_by = 'test' where kind = 'set' and revoked_at is null");
-  await pg.query('commit');
+  await pgErr(as(E, 'new_entry_gate', () => pg.query("select ops.revoke_new_entry_lease('set', '試験')")), /invalid_input/);
+  const rvs = (await as(E, 'new_entry_gate', () => pg.query("select ops.revoke_new_entry_lease('single', '試験: セットも閉じる') as r"))).rows[0].r;
+  assert.equal(rvs.set_revoked, 1);
+  assert.deepEqual((await q("select kind from ops.master_new_entry_stop_floors where reason = '試験: セットも閉じる' order by kind")).map((x) => x.kind), ['set', 'single']);
+  assert.equal(await isValid(), false);
   assert.equal((await one("select ops.new_entry_lease_valid('set') as v")).v, false);
   await pg.query('begin');
   await pgErr(pg.query("select ops._require_new_entry_lease('set')"), /new_entry_closed: 新商品 \(set\)/);
   await pg.query('rollback');
   await pgErr(as(E, 'new_entry_gate', () => pg.query("select ops.grant_new_entry_lease('set', 'mc_20300110T100000000Z_0a5807')")), /invalid_input/);
-  // DB の関数を直接呼んでも、セットの CSV は単品の許可では作れない (今は出す道の無いセットの許可が要る)
-  const setPay = JSON.stringify({ request_id: uuid(), actor: 'boss@test', ownership: ALL_COMPANY, kind: 'sets', schema_version: 'ne-reg-set-v1', header: G.REG_SCHEMAS.sets.header.join(','),
+  // DB の関数を直接呼んでも、セットの許可が無ければセットの CSV は作れない
+  const setPay = JSON.stringify({ request_id: uuid(), actor: 'boss@test', ownership: ALL_COMPANY, kind: 'sets', schema_version: G.REG_SCHEMAS.sets.schema, header: G.REG_SCHEMAS.sets.header.join(','),
     ne_codes_run: 'mc_20300110T100000000Z_0a5807', cost_day: TODAY, items: [{ sku_id: await skuId('set001'), expected: {}, rows: [['x']] }] });
   await pgErr(inSession(() => pg.query('select ops.ne_reg_build($1::jsonb, $2::bytea) as r', [setPay, Buffer.from('x')])), /new_entry_closed: 新商品 \(set\)/);
   const setEx = (await one("select export_id::text as id from ops.ne_reg_exports where kind = 'sets' and state in ('issued', 'declared') order by export_id desc limit 1"))?.id;
   if (setEx) await pgErr(as(E, 'master_edit', () => pg.query('select * from ops.ne_reg_file($1::bigint)', [setEx])), /reg_file_expired/);
+  //   🆕 0099: 取り消し (停止の床) の後の新しい照合の回で単品もセットも開き直す
+  await pg.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ('mc_20300110T103000000Z_0a580a', '2030-01-10T10:30:00Z', 0)`);
+  await recordNeCodes(pg, 'mc_20300110T103000000Z_0a580a', ['new-dup', 'new-x1'], { withSet: false });
+  assert.equal(await isValid(), true);
+  assert.equal((await one("select ops.new_entry_lease_valid('set') as v")).v, true);
+  //   🆕 0099 を当てた時 (本物の migration の文 @@SET_LEASE_BEGIN@@〜@@SET_LEASE_END@@): 単品の許可だけが有効 (0099 の前の朝の grant) = 同じ結果の行・回・期限でセットの許可を出す /
+  //   もう一度流しても何もしない / 単品の許可が無い = 出さない
+  {
+    const mig = fs.readFileSync(path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..', 'db', 'company', 'migrations',
+      fs.readdirSync(path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..', 'db', 'company', 'migrations')).find((x) => /^\d{4}_set_entry_on_load\.sql$/.test(x))), 'utf8');
+    const block = mig.slice(mig.indexOf('-- @@SET_LEASE_BEGIN@@'), mig.indexOf('-- @@SET_LEASE_END@@'));
+    assert.match(block, /^-- @@SET_LEASE_BEGIN@@\r?\ndo \$\$/);
+    await pg.query('begin'); await pg.query("select set_config('ops.lease_protocol', '1', true)");
+    await pg.query("update ops.master_new_entry_leases set revoked_at = clock_timestamp(), revoke_reason = '試験: 0099 の前の形 (単品の許可だけ)', revoked_by = 'test' where kind = 'set' and revoked_at is null");
+    await pg.query('commit');
+    assert.equal((await one("select ops.new_entry_lease_valid('set') as v")).v, false);
+    const nL = async () => (await one('select count(*)::int as n from ops.master_new_entry_leases')).n;
+    const n0 = await nL();
+    await pg.query(block);
+    assert.equal(await nL(), n0 + 1);
+    const lp = await q(`select kind, result_id::text as r, compare_run_id as c, granted_at::text as g, expires_at::text as x, granted_by from ops.master_new_entry_leases
+       where revoked_at is null order by kind`);
+    assert.deepEqual(lp.map((x) => [x.kind, x.r, x.c, x.g, x.x]), [['set', lp[1].r, lp[1].c, lp[1].g, lp[1].x], ['single', lp[1].r, lp[1].c, lp[1].g, lp[1].x]]);
+    assert.match(lp[0].granted_by, /^0099 で単品の許可 \(lease \d+\) に合わせて出した$/);
+    assert.equal((await one("select ops.new_entry_lease_valid('set') as v")).v, true);
+    await pg.query(block);
+    assert.equal(await nL(), n0 + 1, 'もう一度流しても何もしない');
+  }
   // ⑧ 🆕 0082: 期限 = 出したときから 72 時間 (予定の切れ目にしない = 確かめが 3 日流れないときの安全弁): 期限の 1 秒前は有効・期限ちょうど以降は無効 (期限の式と比べ方)
   const exp = (await one("select to_char(ops.new_entry_lease_expiry('2030-01-10T08:00:00+09:00') at time zone 'Asia/Tokyo', 'YYYY-MM-DD HH24:MI:SS') as e")).e;
   assert.equal(exp, '2030-01-13 08:00:00');
@@ -1701,6 +1779,88 @@ await ta('[W2] 0058 (広げる道 §3.9 の 3・4): 配ったファイルは ops
   assert.equal(await isValid(), true);
 });
 
+
+await ta('[SC1] 🆕 0100: 今あるセットの中身を、構成の持ち主 load のまま依頼で変える = 依頼だけ (core は書かない)・「セットの中身の CSV」= 足す・数を変えるセットの依頼の全部の行 (NE の書き方・UTF-8・CRLF)・外すだけ = CSV にしない (NE の画面で)・0100 の前の DB = 今までどおり 409', async () => {
+  const SC = await import('../lib/master-set-comp-csv.mjs');
+  const LOAD = { ...ALL_COMPANY, sku_components: 'load' };
+  const compsOf = async (code) => (await q(`select k.code, c.qty from core.sku_components c join core.skus k on k.sku_id = c.child_sku_id join core.skus p on p.sku_id = c.parent_sku_id
+     where p.code = $1 order by c.sort_order, k.code_norm`, [code])).map((r) => ({ code: r.code, qty: Number(r.qty) }));
+  const openReq = async (code) => (await q(`select rows from ops.sku_component_requests where status = 'open' and set_sku_id = (select sku_id from core.skus where code = $1)`, [code]));
+  // 前の試験の依頼を片付ける (この試験は set001 の依頼から始める)
+  await pg.query(`update ops.sku_component_requests set status = 'cancelled', closed_at = now(), closed_by = 'test', close_reason = 'withdrawn' where status = 'open' and set_sku_id = (select sku_id from core.skus where code = 'set001')`);
+  await W2.setActiveOwnershipInDb(pg, LOAD);
+  try {
+    const cur = await compsOf('set001');
+    assert.ok(cur.length >= 2, JSON.stringify(cur));
+    // 0100 の前の DB (印が無い) = 構成は今までどおり直せない (409 切替前・何も書かない)
+    await pg.query('alter function ops.set_comp_request_on_load() rename to set_comp_request_on_load__hidden');
+    try {
+      const e = await save('set001', { components: [...cur, { code: 's003', qty: 2 }] }).then(() => null, (x) => x);
+      assert.ok(e && e.status === 409 && e.reason === 'before_cutover', e && e.message);
+      assert.deepEqual(e.extra.load_keys, ['sku_components']);
+      assert.equal((await openReq('set001')).length, 0);
+    } finally { await pg.query('alter function ops.set_comp_request_on_load__hidden() rename to set_comp_request_on_load'); }
+    // 0100 の後 = 依頼になる (core の構成は書かない)
+    const r = await save('set001', { components: [...cur, { code: 's003', qty: 2 }] });
+    assert.deepEqual(r.changed.map((c) => c.field), ['components']);
+    assert.deepEqual(await compsOf('set001'), cur, 'core の構成は書かない');
+    assert.equal((await openReq('set001')).length, 1);
+    // 一覧と CSV: 足す = CSV に依頼の全部の行 (今の構成の行も依頼の数量で・NE の書き方)
+    const rd = (o = {}) => as(E, 'master_edit', () => SC.readSetCompRequests(db, { nowMs: NOW_MS, ...o }));
+    let v = await rd();
+    let it = v.items.find((i) => i.code === 'set001');
+    assert.deepEqual([it.in_csv, it.add, it.qty, it.remove, it.why], [true, [{ code: 's003', qty: 2 }], [], [], null]);
+    assert.equal(v.ne_codes.current, true);
+    // Codex R1 Medium: 今朝の照合の回でない NE のコードの台帳 (次の日になった・朝の照合がまだ) = CSV に入れない
+    it = (await rd({ nowMs: NOW_MS + 86400e3 })).items.find((i) => i.code === 'set001');
+    assert.deepEqual([it.in_csv, it.why], [false, 'ne_codes_old']);
+    assert.equal(await as(E, 'master_edit', () => SC.buildSetCompCsv(db, { now: new Date(NOW_MS + 86400e3) })), null);
+    // Codex R1 Medium: 構成品がセットになった (夜間ロードが区分を変えた) = CSV に入れない (入れ子にしない)。持ち主のロールで取引の中だけ変えて読む
+    await pg.query('begin');
+    try {
+      // 区分の持ち主が company の間は DB が区分を変えさせない (sku_kind_locked) = 試験の接続のログイン (superuser) で守りを外して、取引の中だけ変える
+      await pg.query(`set local session authorization ${E.sessionUser}`);
+      await pg.query('set local session_replication_role = replica');
+      await pg.query("update core.skus set sku_kind = 'set' where code = 's003'");
+      await pg.query('set local session_replication_role = origin');
+      it = (await SC.readSetCompRequests(db, { nowMs: NOW_MS })).items.find((i) => i.code === 'set001');
+      assert.deepEqual([it.in_csv, it.why], [false, 'child_not_single']);
+    } finally { await pg.query('rollback'); await pg.query(`set session authorization ${E.sessionUser}`); await pg.query('set role deploy'); }
+    // Codex R1 Medium: 今の構成が空でも NE にあるセット (登録の状態が下書き・NE 登録待ちでない) = 今あるセットとして扱う (全部「足す」)
+    await pg.query('begin');
+    try {
+      await pg.query("delete from core.sku_components where parent_sku_id = (select sku_id from core.skus where code = 'set001')");
+      it = (await SC.readSetCompRequests(db, { nowMs: NOW_MS })).items.find((i) => i.code === 'set001');
+      assert.deepEqual([it.in_csv, it.why, it.add.length], [true, null, cur.length + 1]);
+    } finally { await pg.query('rollback'); }
+    const f = await as(E, 'master_edit', () => SC.buildSetCompCsv(db, { now: new Date('2030-01-10T03:04:05Z') }));
+    assert.equal(f.file_name, 'ne_set_components_20300110_120405.csv');
+    assert.equal(f.bytes.toString('utf8'), ['set_syohin_code,syohin_code,suryo', ...[...cur, { code: 's003', qty: 2 }].map((x) => `set001,${x.code},${x.qty}`)].join('\r\n') + '\r\n');
+    assert.equal(f.sha256, crypto.createHash('sha256').update(f.bytes).digest('hex'));
+    assert.deepEqual([f.sets, f.rows], [['set001'], cur.length + 1]);
+    // 外すだけ (今の構成から 1 行外す) = CSV にしない (NE の画面で)・CSV は作らない (null)
+    await save('set001', { components: cur.slice(0, cur.length - 1) });
+    v = await rd();
+    it = v.items.find((i) => i.code === 'set001');
+    assert.deepEqual([it.in_csv, it.why, it.remove.map((x) => x.code)], [false, 'remove_only', [cur.at(-1).code]]);
+    assert.match(it.why_text, /NE の画面/);
+    assert.equal(await as(E, 'master_edit', () => SC.buildSetCompCsv(db, { now: NOW })), null);
+    // 数を変える + 外す = CSV に入る (数の行) + 外すのは NE の画面で
+    await save('set001', { components: [{ ...cur[0], qty: cur[0].qty + 1 }] });
+    v = await rd();
+    it = v.items.find((i) => i.code === 'set001');
+    assert.deepEqual([it.in_csv, it.qty.map((x) => [x.code, x.from, x.to]), it.manual_remove], [true, [[cur[0].code, cur[0].qty, cur[0].qty + 1]], true]);
+    // 今の構成に戻す = 依頼を取り下げる (持ち主 load でも)
+    const back = await save('set001', { components: cur });
+    assert.deepEqual(back.changed.map((c) => c.field), ['components']);
+    assert.equal((await openReq('set001')).length, 0);
+    assert.equal((await q("select close_reason from ops.sku_component_requests where set_sku_id = (select sku_id from core.skus where code = 'set001') order by component_request_id desc limit 1"))[0].close_reason, 'withdrawn');
+    // 画面: 商品の画面の構成の欄が開く (持ち主 load のまま)・「NEへ送る」にセットの中身の板
+    const page = await (await import('../apps/master-edit/read.mjs')).readSkuPage(db, 'set001', { now: NOW, ownership: LOAD, open: true });
+    assert.equal(page.fields.components.editable, true, '構成の依頼は持ち主 load でも直せる');
+    assert.equal(page.fields.name.editable, true);
+  } finally { await W2.setActiveOwnershipInDb(pg, ALL_COMPANY); }
+});
 
 console.log('\n大文字のコードの契約 (🆕 0064・Company DB構想 20 §③ の境の一覧)');
 
@@ -1982,7 +2142,7 @@ await ta('[S2] 作る = ne_pending・同じ 4 桁 = 409・名前に【…】= 40
 });
 
 await ta('[S3] 取引停止: 代表に使っている = 409 (商品の一覧)・付け替え先を渡す = 同じ取引で付け替えて止める・物理の削除は拒む (二重を寄せる merge だけ通る)', async () => {
-  // 0012 を代表にした新商品の NE 登録の CSV を配った = 付け替えは画面の保存と同じく 409 (使わないにすれば付け替えられる)
+  // 0012 を代表にした新商品の NE 登録の CSV を配った = 🆕 0093: 付け替えは画面の保存と同じく通る (前 = 409 reg_csv_issued)
   await reg('single', 'new-sup2', single({ name: 'SUP2', primary_supplier: '0012' }));
   const sx = await build('products', ['new-sup2']);
   await issue(sx.export.export_id);
@@ -1990,12 +2150,13 @@ await ta('[S3] 取引停止: 代表に使っている = 409 (商品の一覧)・
   const e = await rejectsWith(SUP.deactivateSupplier(db, { actor: 'po@test', code: '0012', reason: '取引終了' }, SOPT), 409, 'supplier_in_use');
   assert.deepEqual(e.extra.skus, ['new-sup2', 's004']);
   await pgErr(pg.query("update core.suppliers set active = false where code = '0012'"), /supplier_in_use/);
-  const ei = await rejectsWith(SUP.deactivateSupplier(db, { actor: 'po@test', code: '0012', reason: '取引終了', reassignTo: '0002' }, SOPT), 409, 'reg_csv_issued');
-  assert.match(ei.message, /new-sup2/);
   assert.equal((await one("select active from core.suppliers where code = '0012'")).active, true, '何もしていない');
-  await supersede(sx.export.export_id);
   const r = await SUP.deactivateSupplier(db, { actor: 'po@test', code: '0012', reason: '取引終了', reassignTo: '0002' }, SOPT);
   assert.deepEqual([r.active, r.reassigned], [false, ['new-sup2', 's004']]);
+  // 配ったファイルの品目と期待値はそのまま (期待値の仕入先 = 配った 0012)
+  const sit = await one('select state, expected from ops.ne_reg_export_items where export_id = $1', [sx.export.export_id]);
+  assert.deepEqual([sit.state, sit.expected.values.supplier], ['issued', '0012']);
+  await supersede(sx.export.export_id);
   const prim = await q("select sp.code from core.supplier_skus x join core.suppliers sp on sp.supplier_id = x.supplier_id join core.skus k on k.sku_id = x.sku_id where k.code = 's004' and x.is_primary");
   assert.deepEqual(prim.map((p) => p.code), ['0002']);
   await pgErr(pg.query("delete from core.suppliers where code = '0012'"), /消さない/);
@@ -2157,26 +2318,32 @@ await ta('[D3] JAN の行の守り (専用・core.guard_master_edit_jan): JAN �
     await pg.query('drop function core.zz_t_jan(bigint, text, text)');
   }
   assert.equal((await q('select 1 from core.external_ids where external_value = $1', [J])).length, 0);
-  // ops.edit_sku_jan: 画面が見ていた JAN と違う = version_conflict・配った後 = reg_csv_issued
+  // ops.edit_sku_jan: 画面が見ていた JAN と違う = version_conflict (🆕 0093: 配った後も断らない = [C5])
   await pgErr(as(E, 'master_edit', () => pg.query("select ops.edit_sku_jan(gen_random_uuid(), 'boss@test', null, $1::jsonb, $2::bigint, '[\"4900000000000\"]'::jsonb, '[]'::jsonb)", [OWN, s6])), /version_conflict/);
 });
 
-await ta('[D4] 保存 (sku_edit) の直接の書き込みも、新規登録の CSV が出ている商品の NE に送る欄は DB が拒む (ops.guard_reg_csv_live)・NE に送らない欄は通る / 確かめる前の仕入先は設定に依らず代表にできない', async () => {
+await ta('[D4] 保存 (sku_edit) の直接の書き込みも、作っただけ (built) の新規登録の CSV の商品の NE に送る欄は DB が拒む (ops.guard_reg_csv_live)・🆕 0093: 配った後は通る・NE に送らない欄は通る / 確かめる前の仕入先は設定に依らず代表にできない', async () => {
   await reg('single', 'new-ff', single({ name: 'FF' }));
   const ff = await build('products', ['new-ff']);
   const fid = await skuId('new-ff');
   const pff = (await one('select product_id::text as p from core.skus where sku_id = $1', [fid])).p;
-  await asFakeSession('sku_edit', () => code42501(pg.query("update core.skus set name = 'FF2' where sku_id = $1", [fid]), /reg_csv_issued/), { skuId: fid, products: [pff] });
+  await asFakeSession('sku_edit', () => code42501(pg.query("update core.skus set name = 'FF2' where sku_id = $1", [fid]), /reg_csv_built/), { skuId: fid, products: [pff] });
   await asFakeSession('sku_edit', () => pg.query('update core.skus set reorder_months = 3 where sku_id = $1', [fid]), { skuId: fid, products: [pff] });
   // 代表の仕入先・原価も同じ (CSV の仕入先・原価の列)
   const sup2 = (await one("select supplier_id::text as id from core.suppliers where code = '0002'")).id;
   await asFakeSession('sku_edit', () => code42501(pg.query(`insert into core.supplier_skus (company_id, supplier_id, sku_id, is_primary, created_by_type, created_by_id)
     values (1, $1, $2, false, 'human', 'boss@test')`, [sup2, fid]).then(() => pg.query('update core.supplier_skus set is_primary = true where supplier_id = $1 and sku_id = $2', [sup2, fid])),
-  /reg_csv_issued/), { skuId: fid, products: [pff] });
-  await asFakeSession('sku_edit', () => code42501(pg.query("update core.sku_costs set valid_to = valid_from where sku_id = $1 and valid_to is null", [fid]), /reg_csv_issued/),
+  /reg_csv_built/), { skuId: fid, products: [pff] });
+  await asFakeSession('sku_edit', () => code42501(pg.query("update core.sku_costs set valid_to = valid_from where sku_id = $1 and valid_to is null", [fid]), /reg_csv_built/),
     { skuId: fid, products: [pff] });
   await supersede(ff.export.export_id);
   await asFakeSession('sku_edit', () => pg.query("update core.skus set name = 'FF2' where sku_id = $1", [fid]), { skuId: fid, products: [pff] });   // ファイルが無い = 通る
+  // 🆕 0093: 配った後 (issued) = 直接の書き込みも通る (名前・原価)。保存の流れ (saveSku) と同じ決まり
+  const ff2 = await build('products', ['new-ff']);
+  await issue(ff2.export.export_id);
+  await asFakeSession('sku_edit', () => pg.query("update core.skus set name = 'FF3' where sku_id = $1", [fid]), { skuId: fid, products: [pff] });
+  await asFakeSession('sku_edit', () => pg.query("update core.sku_costs set valid_to = valid_from where sku_id = $1 and valid_to is null", [fid]), { skuId: fid, products: [pff] });
+  await supersede(ff2.export.export_id);
   // 確かめる前 (ne_pending) の仕入先 = 画面のロールの書き込みでは代表にできない (core.source_system の設定が無くても)
   await SUP.createSupplier(db, { actor: 'po@test', code: '17', name: '十七商事' }, SOPT);
   const sup = (await one("select supplier_id::text as id from core.suppliers where code = '0017'")).id;
@@ -2411,8 +2578,8 @@ try {
     assert.equal(r.status, 200, r.text.slice(0, 300));
     const sc = await checkScripts(r.text, 0);
     const rcJs = sc.find((x) => x.includes('me-regcsv.js — NE 登録の CSV の画面')) || '';
-    for (const api of ["'/api/reg-csv/exports'", "'/api/reg-csv/verified'", "'/declare'", "'/supersede'", "'/issue'", "'/file'"]) assert.ok(rcJs.includes(api), `画面が ${api} を呼んでいない`);
-    assert.match(r.text, /new-web/); assert.match(r.text, /NE にもうある/); assert.match(r.text, /試し用/);
+    for (const api of ["'/api/reg-csv/build-all'", "'/api/reg-csv/verified'", "'/declare'", "'/supersede'", "'/issue'", "'/file'"]) assert.ok(rcJs.includes(api), `画面が ${api} を呼んでいない`);
+    assert.match(r.text, /new-web/); assert.match(r.text, /NE にもうある/); assert.match(r.text, /セットの CSV の形 \(ne-reg-set-v2\)/);   // 🆕 0099: セットも門なし (試し用の文は出ない)
     assert.match(r.text, /value="new-web"(?![^>]*disabled)/);
     r = await call('GET', '/apps/master-edit/reg-csv', { session: 'naka@test' });
     assert.match(r.text, /名簿の人だけ/); assert.match(r.text, /value="new-web" disabled/);
@@ -2420,11 +2587,11 @@ try {
     assert.equal(s.j.applied, true);
   });
 
-  await ta('[H3] 🆕 10/12 画面の「この形を実機で確かめた」: 試し用で商品が全部 NE で確かめ済みのファイルのうち、押せる (今の形 + 門のある版 = セット) ものだけボタン・引退した版 (v1) はボタンも「本番の行数で作れるようになります」も出さず一言・API も同じ文で 409', async () => {
+  await ta('[H3] 🆕 10/12 画面の「この形を実機で確かめた」: 試し用で商品が全部 NE で確かめ済みのファイルのうち、押せる (今の形 + 門のある版) ものだけボタン (🆕 0099 = 門のある今の版は無い = どれも出ない)・引退した版 (v1) はボタンも「本番の行数で作れるようになります」も出さず一言・API も同じ文で 409', async () => {
     // 本物の v1 のファイル ([V5] の V1_ISSUED) は画面の「最近の 30 件」から外れている = 同じ形のファイルを版ごとに置く (fixtures/reg-csv-trial-done.mjs)
     const { seedTrialDoneExport } = await import('./fixtures/reg-csv-trial-done.mjs');
     const ids = {};
-    for (const [schema, code] of [['ne-reg-single-v1', 's003'], ['ne-reg-set-v1', 'set001'], ['ne-reg-single-v2', 's004'], ['ne-reg-variation-v1', 's006']]) ids[schema] = await seedTrialDoneExport(pg, { sessionUser: E.sessionUser, schema, code });
+    for (const [schema, code] of [['ne-reg-single-v1', 's003'], ['ne-reg-set-v1', 'set001'], ['ne-reg-single-v2', 's004'], ['ne-reg-variation-v1', 's006'], ['ne-reg-set-v2', 'set001']]) ids[schema] = await seedTrialDoneExport(pg, { sessionUser: E.sessionUser, schema, code });
     const r = await call('GET', '/apps/master-edit/reg-csv');
     assert.equal(r.status, 200);
     const S = (await call('GET', '/apps/master-edit/api/reg-csv/summary')).j;
@@ -2434,7 +2601,7 @@ try {
     const set = done.find((e) => e.export_id === ids['ne-reg-set-v1']);
     assert.ok(v1 && set, `引退した v1 とセットの試し用のファイル (全部確かめ済み) が画面に出ている: ${done.map((e) => e.schema_version).join(',')}`);
     assert.deepEqual(Object.fromEntries(Object.entries(ids).map(([k, id]) => [k, ((x) => (x ? x.verify.why : 'none'))(done.find((e) => e.export_id === id))])),
-      { 'ne-reg-single-v1': 'retired', 'ne-reg-set-v1': null, 'ne-reg-single-v2': 'no_gate', 'ne-reg-variation-v1': 'no_gate' });
+      { 'ne-reg-single-v1': 'retired', 'ne-reg-set-v1': 'retired', 'ne-reg-single-v2': 'no_gate', 'ne-reg-variation-v1': 'no_gate', 'ne-reg-set-v2': 'no_gate' });   // 🆕 0099: セットの v1 も引退
     for (const e of done) {
       const c = cardOf(e.export_id);
       assert.equal((c.match(/data-act="verified"/g) || []).length, e.verify.can ? 2 : 0, `#${e.export_id} ${e.schema_version}`);
@@ -2445,9 +2612,10 @@ try {
     assert.ok(c1.includes('この形 (ne-reg-single-v1) は引退しました。今の形 (ne-reg-single-v2) は実機の確かめが要らず、最初から本番の行数で作れます。このファイルですることはありません'), c1.slice(-800));
     assert.ok(c1.includes('引退の理由: ' + G.REG_SCHEMA_RULES['ne-reg-single-v1'].why), c1.slice(-800));
     const cs = cardOf(set.export_id);
-    assert.match(cs, /data-act="verified" data-kind="sets" data-result="ok"/);
-    assert.doesNotMatch(cs, /data-verify-none/);
-    for (const k of ['ne-reg-single-v2', 'ne-reg-variation-v1']) {
+    assert.match(cs, /data-verify-none="retired"/);
+    assert.ok(cs.includes('この形 (ne-reg-set-v1) は引退しました。今の形 (ne-reg-set-v2) は実機の確かめが要らず、最初から本番の行数で作れます。このファイルですることはありません'), cs.slice(-800));
+    assert.doesNotMatch(cs, /data-act="verified"/);
+    for (const k of ['ne-reg-single-v2', 'ne-reg-variation-v1', 'ne-reg-set-v2']) {
       const c = cardOf(ids[k]);
       assert.match(c, /data-verify-none="no_gate"/, k);
       assert.ok(c.includes('このファイルですることはありません'), k);
@@ -2458,21 +2626,54 @@ try {
     assert.deepEqual([a.status, a.j.reason, a.j.why, a.j.error], [409, 'export_mismatch', 'retired', v1.verify.message]);
     // 🆕 #1699 Codex R1 Medium: 門の無い版 (single-v2・variation-v1) の試し用のファイルも、API に直に ok / ng を送ると 409 export_mismatch (画面と同じ理由)・何も記録しない
     const nRec = (await q('select 1 from ops.ne_csv_verified')).length;
-    for (const k of ['ne-reg-single-v2', 'ne-reg-variation-v1']) {
+    for (const k of ['ne-reg-single-v2', 'ne-reg-variation-v1', 'ne-reg-set-v2']) {
       const want = done.find((e) => e.export_id === ids[k]).verify.message;
       for (const result of ['ok', 'ng']) {
-        const x = await call('POST', '/apps/master-edit/api/reg-csv/verified', { body: { kind: 'products', result, export_id: ids[k], request_id: uuid() } });
+        const x = await call('POST', '/apps/master-edit/api/reg-csv/verified', { body: { kind: k === 'ne-reg-set-v2' ? 'sets' : 'products', result, export_id: ids[k], request_id: uuid() } });
         assert.deepEqual([x.status, x.j.reason, x.j.why, x.j.error], [409, 'export_mismatch', 'no_gate', want], `${k} ${result}`);
       }
     }
     assert.equal((await q('select 1 from ops.ne_csv_verified')).length, nRec, '何も記録しない');
-    // 門のある版 (セット) = 今までどおり通る (ok = 記録が 1 行)
+    // 🆕 0099: 引退したセットの v1 = 409 retired (何も記録しない)
     const xs = await call('POST', '/apps/master-edit/api/reg-csv/verified', { body: { kind: 'sets', result: 'ok', export_id: set.export_id, request_id: uuid() } });
-    assert.equal(xs.status, 200, xs.text);
-    const rs = await one("select converter_version, result, reg_export_id::text as x from ops.ne_csv_verified order by verified_id desc limit 1");
-    assert.deepEqual([rs.converter_version, rs.result, rs.x], ['ne-reg-set-v1', 'ok', set.export_id]);
+    assert.deepEqual([xs.status, xs.j.reason, xs.j.why, xs.j.error], [409, 'export_mismatch', 'retired', set.verify.message]);
+    assert.equal((await q('select 1 from ops.ne_csv_verified')).length, nRec, '何も記録しない');
     const a2 = await call('POST', '/apps/master-edit/api/reg-csv/verified', { body: { kind: 'products', result: 'ng', export_id: String(V1_ISSUED.export_id), request_id: uuid() } });
     assert.deepEqual([a2.status, a2.j.reason, a2.j.why], [409, 'export_mismatch', 'retired'], '本物の v1 のファイル ([V5]) も');
+  });
+
+  await ta('[SC2] 🆕 0100: 画面「NEへ送る」のセットの中身の板 (依頼の一覧・CSV を作るボタン)・API = その場の CSV (sha256 の印・名簿の人だけ)・商品の画面の「NEへ送る」への案内', async () => {
+    const LOAD = { ...ALL_COMPANY, sku_components: 'load' };
+    await W2.setActiveOwnershipInDb(pg, LOAD);
+    try {
+      const cur = (await q(`select k.code, c.qty from core.sku_components c join core.skus k on k.sku_id = c.child_sku_id join core.skus p on p.sku_id = c.parent_sku_id
+         where p.code = 'set001' order by c.sort_order, k.code_norm`)).map((r) => ({ code: r.code, qty: Number(r.qty) }));
+      await pg.query(`update ops.sku_component_requests set status = 'cancelled', closed_at = now(), closed_by = 'test', close_reason = 'withdrawn' where status = 'open' and set_sku_id = (select sku_id from core.skus where code = 'set001')`);
+      await save('set001', { components: [...cur, { code: 's004', qty: 3 }] });
+      const page = await call('GET', '/apps/master-edit/ne-update', { session: 'naka@test' });
+      assert.equal(page.status, 200, page.text.slice(0, 300));
+      assert.match(page.text, /id="nu-sc-panel"/); assert.match(page.text, /セットの中身を変える依頼/);
+      assert.match(page.text, /<tr data-code="set001">/); assert.match(page.text, /足す: s004×3/);
+      assert.match(page.text, /id="nu-sc-csv"/); assert.match(page.text, /セットの中身の CSV を作る \(1 セット\)/);
+      await checkScripts(page.text);
+      // 名簿でない人 = ボタンなし・API は 403
+      const viewer = await call('GET', '/apps/master-edit/ne-update', { session: 'viewer@test' });
+      assert.match(viewer.text, /id="nu-sc-panel"/); assert.doesNotMatch(viewer.text, /id="nu-sc-csv"/);
+      assert.equal((await call('POST', '/apps/master-edit/api/ne-update/set-comp-csv', { body: {}, session: 'viewer@test' })).status, 403);
+      const r = await call('POST', '/apps/master-edit/api/ne-update/set-comp-csv', { body: {}, session: 'naka@test' });
+      assert.equal(r.status, 200, r.text.slice(0, 300));
+      assert.match(r.headers.get('content-disposition'), /^attachment; filename="ne_set_components_\d{8}_\d{6}\.csv"$/);
+      assert.equal(r.headers.get('x-content-sha256'), crypto.createHash('sha256').update(r.buf).digest('hex'));
+      assert.equal(r.headers.get('x-set-count'), '1');
+      assert.equal(r.text, ['set_syohin_code,syohin_code,suryo', ...[...cur, { code: 's004', qty: 3 }].map((x) => `set001,${x.code},${x.qty}`)].join('\r\n') + '\r\n');
+      // 商品の画面 = 依頼の進みに「NEへ送る」への案内 (構成の欄は持ち主 load でも開く)
+      const sku = await call('GET', '/apps/master-edit/sku/set001', { session: 'naka@test' });
+      assert.match(sku.text, /id="req-how"/); assert.match(sku.text, /セットの中身の CSV/);
+      // 依頼を取り下げる = CSV にできるものが無い = 409
+      await save('set001', { components: cur });
+      const none = await call('POST', '/apps/master-edit/api/ne-update/set-comp-csv', { body: {}, session: 'naka@test' });
+      assert.deepEqual([none.status, none.j && none.j.reason], [409, 'nothing_ready']);
+    } finally { await W2.setActiveOwnershipInDb(pg, ALL_COMPANY); }
   });
 
   await ta('[H2] API: 名簿 (MASTER_DECISION_APPROVERS)・Origin・作る → 配る → ダウンロード (sha256) → 申告・商品の画面の CSV の箱と JAN', async () => {
@@ -2491,11 +2692,17 @@ try {
     assert.equal(f.headers.get('x-content-sha256'), sha);
     let page = await call('GET', '/apps/master-edit/sku/new-web', { session: 'naka@test' });
     await checkScripts(page.text);
-    assert.match(page.text, /NE 登録の CSV/); assert.match(page.text, /鍵がかかっています/);
-    // 配った後 = NE に送る欄 (名前・売価・原価・税率・仕入先・取扱区分・代表・JAN) は入力欄にしない (🔒 の値・保存しても 409 reg_csv_issued)
-    for (const f of ['name', 'standard_price', 'tax_rate', 'primary_supplier', 'handling', 'parent_code', 'jan', 'cost']) assert.ok(!new RegExp(`data-field="${f}"`).test(page.text), `配った後の ${f} は入力欄にしない`);
-    assert.match(page.text, /data-field="shipping_code"/);   // NE へ送らない欄は直せる
-    assert.match(page.text, /NE に送った値 \(ファイル #\d+\)/);
+    // 🆕 0093 (2026-10-19 中原さん): 配った後も、ほかの商品と同じように直せる = NE に送る欄も入力欄・🔒 も案内のカードも出さない
+    assert.ok(!/鍵がかかっています/.test(page.text) && !/NE に送った値/.test(page.text), '配った後の 🔒・案内のカードは出さない');
+    for (const f of ['name', 'standard_price', 'tax_rate', 'primary_supplier', 'handling', 'jan']) assert.match(page.text, new RegExp(`data-field="${f}"`), `配った後の ${f} も入力欄`);
+    assert.ok(!/data-field="parent_code"/.test(page.text), '代表 (親) は商品の画面の欄に無い (PR-7)');
+    assert.match(page.text, /data-field="shipping_code"/);
+    // 画面の保存 (API) も通る = 名前を直す。品目の期待値は配った値のまま
+    const tok = page.text.match(/data-token="([0-9a-f]{64})"/)[1];
+    const sv = await call('POST', '/apps/master-edit/api/sku/new-web', { session: 'naka@test', body: { request_id: crypto.randomUUID(), reason: 'テスト', seen: { token: tok }, values: { name: '配った後の新しい名前' } } });
+    assert.equal(sv.status, 200, sv.text);
+    const webExp = (await one('select expected from ops.ne_reg_export_items where export_id = $1', [id])).expected;
+    assert.notEqual(webExp.values.name, '配った後の新しい名前');
     const d = await call('POST', `/apps/master-edit/api/reg-csv/exports/${id}/declare`, { body: { sha256: sha, result: 'ok', ne_message: '1件成功しました。' } });
     assert.equal(d.status, 200, d.text);
     assert.equal(await regOf('new-web'), 'ne_pending');
@@ -2505,6 +2712,89 @@ try {
     await checkScripts(page.text, 0);
     assert.ok(!/data-field="jan"/.test(page.text), '新商品の登録の画面に JAN の欄は無い (登録の後に商品の画面で)');
     assert.ok(!/0012 テスト商事/.test(page.text), '取引停止の仕入先は選べない');
+  });
+
+  await ta('[H5] 🆕 10/20 分け方 (regPlan・DB を読まない): 試しのセット = 5 行まで 1 つ・確かめ待ちの試しがあれば次の試しは待つ・1 つで上限を超えるセットは理由つき・構成品待ち・NE にもうある・全部止める朝・今朝の照合の前', async () => {
+    const base = { applied: true, today: 't', ne_codes: { current: true }, max_rows: 1000, one_file: true, variation: [], exports: [],
+      verified: { products: { ok: true, trial_gate: false }, sets: { ok: false, trial_gate: true } } };
+    const cand = (code, kind, extra = {}) => ({ code, kind, live: null, blockers: [], stop: null, rows: 1, ...extra });
+    const S = { ...base, candidates: [cand('a1', 'products'), cand('s1', 'sets', { rows: 3 }), cand('s2', 'sets', { rows: 3 }), cand('s3', 'sets', { rows: 6 }),
+      cand('s4', 'sets', { blockers: ['構成品 a1 が NE 確認済みでない (draft)'], wait_components: true }), cand('inne', 'products', { stop: 'already_in_ne', blockers: ['x'] }),
+      cand('fx', 'products', { blockers: ['原価が無い'] }), cand('gl', 'products', { blockers: ['g'], gate_all: true })] };
+    let P = G.regPlan(S);
+    assert.deepEqual(P.files.map((f) => [f.kind, f.codes, !!f.trial]), [['products', ['a1'], false], ['sets', ['s1'], true]]);
+    assert.deepEqual([P.sets_later, P.sets_too_big, P.sets_waiting.map((x) => x.code), P.in_ne.map((x) => x.code), P.fix.map((x) => x.code), P.gate_all],
+      [['s2'], ['s3'], ['s4'], ['inne'], ['fx'], true]);
+    // 試しのセットのファイルが確かめ待ち = 次の試しは作らない
+    P = G.regPlan({ ...S, exports: [{ kind: 'sets', trial: true, state: 'issued', items: [] }] });
+    assert.deepEqual([P.files.map((f) => f.kind), P.sets_later, P.set_trial_waiting], [['products'], ['s1', 's2'], true]);
+    P = G.regPlan({ ...S, exports: [{ kind: 'sets', trial: true, state: 'closed', close_reason: 'finished', items: [{ state: 'verified' }] }] });
+    assert.deepEqual(P.sets_later, ['s1', 's2'], '全部確かめ済みで「問題なし」を押す前も待つ');
+    P = G.regPlan({ ...S, exports: [{ kind: 'sets', trial: true, state: 'closed', close_reason: 'finished', verify_recorded: true, items: [{ state: 'verified' }] }] });
+    assert.deepEqual([P.sets_later, P.files.find((f) => f.kind === 'sets').codes], [['s2'], ['s1']], '「問題があった」を記録した後は次の試しを作れる (#Codex R2 Medium 3)');
+    // 試しが済んだ (実機の確かめ ok) = 1,000 行まで 1 つのファイル
+    P = G.regPlan({ ...S, verified: { ...S.verified, sets: { ok: true, trial_gate: true } } });
+    assert.deepEqual([P.files.find((f) => f.kind === 'sets').codes, P.sets_later, P.sets_too_big], [['s1', 's2', 's3'], [], []]);
+    // 今朝の照合の前 = 作らない (何が入るかだけ)
+    P = G.regPlan({ ...S, today: null });
+    assert.deepEqual([P.not_today, P.files.length, P.singles], [true, 0, ['a1']]);
+  });
+
+  await ta('[H4] 🆕 10/20 ボタン 1 つ: 画面 = 次の CSV (ボタン 1 つ)・NE で取り込む (「NE に取り込んだ」1 つ)・NE にもうある商品は短い 1 行・前のファイルは「これまでの記録」にたたむ / API build-all = 名簿・作って配る → ダウンロード → 「取り込んだ」', async () => {
+    await reg('single', 'new-one1', single({ name: 'ワンクリック 1' }));
+    let r = await call('GET', '/apps/master-edit/reg-csv');
+    assert.equal(r.status, 200);
+    const S = (await call('GET', '/apps/master-edit/api/reg-csv/summary')).j;
+    assert.ok(S.plan.singles.includes('new-one1'), JSON.stringify(S.plan.singles));
+    assert.match(r.text, /<button class="btn pri lg" type="button" data-act="build-all">/);
+    assert.match(r.text, /<details class="panel soft" id="history">/, '前のファイルは「これまでの記録」(たたむ)');
+    assert.doesNotMatch(r.text, /id="cands"|data-act="build-variation"/, '前の候補の表・まとまりごとのボタンは無い');
+    if (S.plan.in_ne.length) assert.match(r.text, /id="in-ne"[\s\S]*NE に同じコードの商品がもうある/);
+    // 名簿でない人は作れない
+    assert.equal((await call('POST', '/apps/master-edit/api/reg-csv/build-all', { body: { request_id: uuid() }, session: 'naka@test' })).status, 403);
+    const rid = uuid();
+    const b = await call('POST', '/apps/master-edit/api/reg-csv/build-all', { body: { request_id: rid } });
+    assert.equal(b.status, 200, b.text);
+    const f = b.j.files.find((x) => x.kind === 'products');
+    assert.ok(f && f.state === 'issued', JSON.stringify(b.j));
+    assert.equal((await one('select count(*)::int as n from ops.ne_reg_export_items where export_id = $1 and code_norm = $2', [f.export_id, 'new-one1'])).n, 1);
+    const dl = await call('GET', `/apps/master-edit/api/reg-csv/exports/${f.export_id}/file`);
+    assert.equal(dl.status, 200);
+    assert.equal(crypto.createHash('sha256').update(dl.buf).digest('hex'), f.sha256);
+    // 押し直し = 同じファイル
+    const b2 = await call('POST', '/apps/master-edit/api/reg-csv/build-all', { body: { request_id: rid } });
+    assert.deepEqual([b2.status, b2.j.replayed, b2.j.files.map((x) => x.export_id)], [200, true, b.j.files.map((x) => x.export_id)]);
+    // 画面: 「NE で取り込む」のカードに「NE に取り込んだ」(ボタン 1 つ)
+    r = await call('GET', '/apps/master-edit/reg-csv');
+    const card = new RegExp(`<article class="filecard todo-card exp" data-id="${f.export_id}"[\\s\\S]*?</article>`).exec(r.text);
+    assert.ok(card, '取り込み待ちのカード');
+    assert.match(card[0], /data-act="declare-quick" data-result="ok"/);
+    assert.match(card[0], new RegExp(`data-sha="${f.sha256}"`));
+    // 「NE に取り込んだ」= 申告 (ok)・sha256 は配ったファイルの記録
+    const d = await call('POST', `/apps/master-edit/api/reg-csv/exports/${f.export_id}/declare`, { body: { sha256: f.sha256, result: 'ok', ne_message: '' } });
+    assert.equal(d.status, 200, d.text);
+    assert.equal(await regOf('new-one1'), 'ne_pending');
+    r = await call('GET', '/apps/master-edit/reg-csv');
+    assert.doesNotMatch(r.text, new RegExp(`class="filecard todo-card exp" data-id="${f.export_id}"`), '取り込んだファイルのカードは消える');
+    assert.match(r.text, /id="wait-line"/, '翌朝の確かめ待ちは 1 行');
+    // 前の確かめで分からない断り (前に NE で見たコード = DB の ops.ne_code_seen) の商品は外して作り直した (ほかの商品は作る・理由は errors に)
+    assert.ok(b.j.errors.every((x) => x.dropped === true), JSON.stringify(b.j.errors));
+    // 🆕 #Codex R1: DB の断りの文から商品を取るのは最初の語だけ (文の中の「NE」などを商品と取り違えない)
+    assert.deepEqual(G.regAllCulprits({ message: 'コード new-m は NE にもうある = 新規登録しない' }, ['new-m', 'NE', 'x']), ['new-m']);
+    assert.deepEqual(G.regAllCulprits({ message: 'new-q の登録の状態が cancelled' }, ['new-q', 'cancelled']), ['new-q']);
+    assert.deepEqual(G.regAllCulprits({ message: '1 つのファイルに 1,000 行まで' }, ['new-q']), []);
+    assert.deepEqual(G.regAllCulprits({ message: 'x', extra: { items: [{ code: 'A1' }, { code: 'zz' }] } }, ['a1', 'b1']), ['a1']);
+    // 後の試験のため: 作ったファイルは使わないに戻す
+    for (const x of b.j.files) {
+      const s = await call('POST', `/apps/master-edit/api/reg-csv/exports/${x.export_id}/supersede`, { body: { reason: '試験', correction: 'NE には取り込んでいない', confirm: true } });
+      assert.equal(s.status, 200, s.text);
+    }
+    // 🆕 #Codex R2 Medium 1: 閉じた後に同じ番号で押し直しても、その商品は作り直さない (前のファイルを返すだけ)
+    const n0 = (await one('select count(*)::int as n from ops.ne_reg_exports')).n;
+    const b3 = await call('POST', '/apps/master-edit/api/reg-csv/build-all', { body: { request_id: rid } });
+    assert.equal(b3.status, 200, b3.text);
+    assert.deepEqual(b3.j.files.map((x) => [x.export_id, x.state]), b.j.files.map((x) => [x.export_id, 'closed']));
+    assert.equal((await one('select count(*)::int as n from ops.ne_reg_exports')).n, n0, '新しいファイルを作らない');
   });
 } finally {
   await new Promise((r) => server.close(r));
@@ -2647,6 +2937,105 @@ await ta('[LZ1] 2026-10-08 中原さん: 商品の画面でロジザードの有
   await code42501(asFakeSession('sku_edit', async () => { const pid = (await one("select product_id::text as id from core.skus where code = 's001'")).id; return pg.query('update core.products set expiry_managed = true where product_id = $1', [pid]); },
     { skuId: await skuId('s001'), products: [(await one("select product_id::text as id from core.skus where code = 's001'")).id] }), /logizard_locked/);
   await supersede(x.export.export_id);
+});
+
+await ta('[G1] 🆕 0095 代表 (親) の門 = ずれた色違いのまとまりの商品だけ止まる (中原さん 10/19): 画面の候補に理由の 1 行 (ずれた商品は商品の画面へのリンク)・ほかの商品は選べる / 作る = 鍵の後に同じ判断で先に止める (not_ready)・lib を通らない作るも DB (trigger) が止める / どのまとまりか分からないずれ = 上に 1 つの知らせ・候補は全部止まる・作る = 409 parent_gate_closed / 画面のロールは読み取りの関数だけ', async () => {
+  // 形: 札 PG-GRP (まとまり)・その子の下書き pg-kid・関係の無い下書き pg-free・NE では PG-GRP の子なのに社内は親なしの単品 D (今朝の照合のずれ)
+  await reg('single', 'pg-kid', single({ name: 'PG 子' }));
+  await reg('single', 'pg-free', single({ name: 'PG 関係なし' }));
+  const tagId = (await one("insert into core.products (company_id, display_code, name) values (1, 'PG-GRP', 'PG') returning product_id::text as id")).id;
+  await pg.query('begin');
+  await pg.query("select set_config('core.parent_protocol', '1', true), pg_advisory_xact_lock(core.parent_lock_key())");
+  await pg.query("update core.products set parent_product_id = $1, parent_set_by = 'load' where product_id = (select product_id from core.skus where code = 'pg-kid')", [tagId]);
+  await pg.query('commit');
+  const base = ['s001', 's002', 's003', 's004', 's005', 's006', 's007', 'set001'];
+  const D = (await one(`select k.code from core.skus k left join ops.master_registrations r on r.sku_id = k.sku_id join core.products p on p.product_id = k.product_id
+     where k.sku_kind = 'single' and k.code = any($1::text[]) and coalesce(r.state, 'available') not in ('draft', 'ne_pending', 'cancelled', 'quarantined') and p.parent_product_id is null
+       and not exists (select 1 from core.products c where c.parent_product_id = p.product_id) order by k.code limit 1`, [base])).code;
+  /** 次の朝: 照合の回・NE の元のコード (0041)・代表の数え (D だけ patch)・新商品の許可 (本番 = 照合 ② が残す) */
+  const newDay = async (run, at, patch) => {
+    await pg.query('insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ($1, $2, 0)', [run, at]);
+    const rows = [...base.map((c) => ({ kind: 'single', code_norm: c, spellings: JSON.stringify([c]) })), { kind: 'rep', code_norm: 'pg-grp', spellings: JSON.stringify(['PG-GRP']) }];
+    await pg.query('select ops.record_ne_codes($1::jsonb)', [JSON.stringify({ compare_run_id: run, entries: CNE.resolveNeCodes({ ok: true, rows }).entries })]);
+    const mirror = (await q(`select k.code_norm, k.sku_kind, nullif(core.norm_code(pp.display_code), '') as rep, pp.display_code as raw from core.skus k
+        left join core.products p on p.product_id = k.product_id left join core.products pp on pp.product_id = p.parent_product_id
+       where k.company_id = 1 and k.sku_kind in ('single', 'set') order by k.code_norm`))
+      .map((r) => (r.code_norm === D ? patch : r.sku_kind === 'set' ? [r.code_norm, 'set', null, null, null] : [r.code_norm, 'single', 'ok', r.rep ?? null, r.rep ? r.raw : null]));
+    const obs = { format: 'parent-obs-v1', complete: true, untrusted: [], rep_spellings: { state: 'ok' }, trust: { fetch_counts: 'ok', integrity: 'ok', kind_gate_integrity: 'ok', rep_spellings: 'ok' }, rows: mirror };
+    const t = new Date(Date.now() - 60000).toISOString();
+    const r = (await one('select ops.record_parent_gate($1, $2::jsonb, $3, $4, $5::jsonb) as r', [run, JSON.stringify({ generation_id: `g_${run}`, raw_hash: 'd'.repeat(64), products_complete_at: t, setproducts_complete_at: t }),
+      'mat_g1', 'e'.repeat(64), JSON.stringify(obs)])).r;
+    await (await import('./fixtures/master-widen.mjs')).seedNewEntryLease(pgliteAdapter(pg), { runId: run, withSet: true });
+    return { ...r, gate: (await one('select ops.parent_gate_state() as s')).s };   // 門の状態は許可の回の後に読む (本番の照合 ② = 許可の回の記録の後に代表の数え)
+  };
+  const r1 = await newDay('mc_20300110T145000000Z_c0ffee', '2030-01-10T14:50:00Z', [D, 'single', 'ok', 'pg-grp', 'PG-GRP']);
+  assert.equal(r1.counts.parent_missing, 1, JSON.stringify(r1.counts));
+  assert.deepEqual([r1.gate.enforced, r1.gate.scope.all, r1.gate.scope.groups.map((g) => [g.label, g.codes])], [true, false, [['PG-GRP', [D]]]]);
+  const pre = '色違いのまとまり PG-GRP が NE とずれているので、この商品は CSV にできません。';
+  const want = `${pre}${D} などの代表を NE と同じにすると直ります`;
+  // 画面の候補 (画面のロール): pg-kid だけ止まる (理由の 1 行 + D へのリンク)・pg-free は選べる
+  const S1 = await as(E, 'master_edit', () => G.regSummary(db, { nowMs: NOW_MS }));
+  const kid = S1.candidates.find((c) => c.code === 'pg-kid'); const free = S1.candidates.find((c) => c.code === 'pg-free');
+  assert.deepEqual(kid.blockers, [want]);
+  assert.deepEqual(kid.gate, { kind: 'group', text: want, pre, codes: [D], post: ' などの代表を NE と同じにすると直ります' });
+  assert.deepEqual([free.blockers, free.gate, S1.parent_gate_all], [[], undefined, null]);
+  // ほかに止まるのは D を構成品に入れたセットだけ (今の構成・開いている構成の依頼)
+  const setsWithD = (await q(`select p.code from core.sku_components c join core.skus p on p.sku_id = c.parent_sku_id join core.skus k on k.sku_id = c.child_sku_id where k.code = $1
+     union select s.code from ops.sku_component_requests r join core.skus s on s.sku_id = r.set_sku_id, jsonb_array_elements(r.rows) x
+      where r.status = 'open' and (x ->> 'sku_id') = (select sku_id::text from core.skus where code = $1)`, [D])).map((x) => x.code);
+  const gated = S1.candidates.filter((c) => c.blockers.some((b) => /色違いのまとまり/.test(b)));
+  assert.deepEqual(gated.map((c) => c.code).sort(), ['pg-kid', ...S1.candidates.filter((c) => setsWithD.includes(c.code)).map((c) => c.code)].sort());
+  assert.ok(gated.length > 1 && gated.every((c) => c.gate && c.gate.text === want), '構成品に D があるセットも同じ 1 行');
+  // 作る: 止まる商品が入っていれば何も作らない (理由は同じ 1 行)・関係の無い商品だけなら作れる
+  const e1 = await rejectsWith(build('products', ['pg-kid', 'pg-free']), 409, 'not_ready');
+  assert.deepEqual(e1.extra.items, [{ code: 'pg-kid', stop: null, blockers: [want] }]);
+  const ok1 = await build('products', ['pg-free']);
+  assert.equal(ok1.export.state, 'built');
+  await supersede(ok1.export.export_id);
+  // lib を通らずに DB の関数で作っても、品目の表の trigger が止める (画面を信じない)
+  const kidId = await skuId('pg-kid');
+  const canon = (await one('select ops.ne_reg_canonical($1, $2::date) as c', [kidId, TODAY])).c;
+  assert.deepEqual(canon.blockers, []);
+  const spec = G.REG_SCHEMAS.products;
+  const mark = (await one('select compare_run_id from ops.master_ne_code_mark')).compare_run_id;
+  await pgErr(inSession(() => pg.query('select ops.ne_reg_build($1::jsonb, $2::bytea) as r', [JSON.stringify({ request_id: uuid(), actor: 'boss@test', ownership: ALL_COMPANY,
+    kind: 'products', schema_version: spec.schema, header: spec.header.join(','), ne_codes_run: mark, cost_day: TODAY, items: [{ sku_id: kidId, expected: canon.expected, rows: canon.cells }] }),
+    G.buildRegCsv(spec, canon.cells.map((r) => r.map(String))).bytes])), new RegExp(`^parent_gate_group: ${want}$`));
+  // 画面のロール = 読み取りの関数だけ (部品・表はだれにも渡さない)
+  assert.equal((await one("select has_function_privilege('master_edit', 'ops.parent_gate_csv_check(bigint[])', 'execute') as ok")).ok, true);
+  for (const f of ['ops._parent_gate_match(bigint, jsonb)', 'ops._parent_gate_items(text[])', 'ops._parent_gate_codes(text[], bigint[])', 'ops._parent_gate_global_problems()', 'ops._parent_gate_block(bigint, jsonb)', 'ops.parent_gate_state()']) {
+    assert.equal((await one("select has_function_privilege('master_edit', $1, 'execute') as ok", [f])).ok, false, f);
+  }
+  assert.equal((await one("select has_table_privilege('master_edit', 'ops.master_parent_gate_scopes', 'select') as ok")).ok, false);
+  // 画面: 理由の 1 行と D へのリンク・pg-kid は選べない・pg-free は選べる
+  process.env.MASTER_EDIT_OPEN = '1';
+  const srv = http.createServer(app);
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const get = async (url) => (await fetch(`http://127.0.0.1:${srv.address().port}${url}`, { headers: { Accept: 'text/html', 'x-test-session': 'boss@test' } })).text();
+  try {
+    let html = await get('/apps/master-edit/reg-csv');
+    // 🆕 10/20: 止まる商品は「直すもの」に 1 行 (商品の画面へのリンク + 理由)・作れる商品は「次の CSV」(一部を外す印)
+    assert.ok(html.includes(`<a class="mono" href="/apps/master-edit/sku/pg-kid">pg-kid</a>: ${pre}<a href="/apps/master-edit/sku/${D}">${D}</a> などの代表を NE と同じにすると直ります</span>`), '理由の 1 行とリンク');
+    assert.doesNotMatch(html, /value="pg-kid"/); assert.match(html, /value="pg-free"(?![^>]*disabled)/);
+    // どのまとまりか分からないずれ (D の NE の代表が読めない) の朝 = 全部止める (上に 1 つの知らせ・候補には短い一言)
+    const r2 = await newDay('mc_20300110T145500000Z_c0ffef', '2030-01-10T14:55:00Z', [D, 'single', 'unknown', null, null]);
+    assert.equal(r2.gate.scope.all, true);
+    const allText = `NE とずれた商品の中に、どの色違いのまとまりか分からないものがあるので、いまは新しい商品の CSV を作れません。${D} などを直すと作れます`;
+    const S2 = await as(E, 'master_edit', () => G.regSummary(db, { nowMs: NOW_MS }));
+    assert.deepEqual(S2.parent_gate_all, { kind: 'all', text: allText, pre: 'NE とずれた商品の中に、どの色違いのまとまりか分からないものがあるので、いまは新しい商品の CSV を作れません。', codes: [D], post: ' などを直すと作れます' });
+    for (const c of ['pg-kid', 'pg-free']) assert.deepEqual(S2.candidates.find((x) => x.code === c).blockers.at(-1), G.PARENT_GATE_ALL_ROW, c);
+    const e2 = await rejectsWith(build('products', ['pg-free']), 409, 'parent_gate_closed');
+    assert.equal(e2.message, `${allText} (何も作っていません)`);
+    html = await get('/apps/master-edit/reg-csv');
+    assert.ok(html.includes(`<div class="t">NE とずれた商品の中に、どの色違いのまとまりか分からないものがあるので、いまは新しい商品の CSV を作れません。<a href="/apps/master-edit/sku/${D}">${D}</a> などを直すと作れます</div>`), '上の知らせ');
+    assert.doesNotMatch(html, /value="pg-free"/, '全部止める朝 = 次の CSV に入れない');
+    // 次の CSV に入るのは、全部止める朝も通す作り直し (前の品目が取り込めなかった商品 = DB の trigger と同じ) だけ
+    const S3 = await as(E, 'master_edit', () => G.regSummary(db, { nowMs: NOW_MS }));
+    const planned = S3.plan.files.flatMap((f) => f.codes);
+    assert.ok(!planned.includes('pg-free') && !planned.includes('pg-kid'));
+    assert.ok(planned.every((c) => (S3.candidates.find((x) => x.code === c) || { blockers: [] }).blockers.length === 0), planned.join(','));
+    if (!planned.length) assert.doesNotMatch(html, /data-act="build-all"(?![^>]*disabled)/, '押せる「作る」は出さない');
+  } finally { await new Promise((r) => srv.close(r)); }
 });
 
 try { fs.rmSync(DATA_DIR, { recursive: true, force: true }); } catch { /* Windows で開いたままのことがある */ }
