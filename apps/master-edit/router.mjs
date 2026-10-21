@@ -52,6 +52,7 @@
  *   POST /api/ne-update/csv         CSV を作る (NE にアップする用) { request_id } (送り手が止まっているとき・名簿 MASTER_EDITORS の人)
  *   POST /api/ne-update/files/:id/download  作った CSV を受け取る (作った日だけ・初めてのダウンロードを残す = GET にしない)
  *   POST /api/ne-update/verified    NE の実物の試しの結果 { kind, col, entry, result, sha256?, note? } (名簿 MASTER_DECISION_APPROVERS の人)
+ *   POST /api/ne-update/set-comp-csv 🆕 0100: セットの中身の CSV (開いている構成の依頼の「足す・数を変える」= lib/master-set-comp-csv.mjs・その場で作って渡す・DB に記録しない・名簿 MASTER_EDITORS の人)
  *   ── 発注の設定 (10/9・発注アプリの po_* に書く・apps/master-edit/order-settings.mjs → apps/purchase-orders/order-settings.js の 1 つの部品) ──
  *   POST /api/new の order_settings = { order_lot?, condition_id?, material_group_id?, capacity_per_unit?, case_group?, case_lot?, new_condition?, new_material? } (単品だけ):
  *        ① の前に形・グループ・代表の仕入先を確かめる (誤り = 400 / 409・何も書かない) → ① Company DB の登録 → 通ったら ② 発注アプリに書く。
@@ -106,7 +107,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
-import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS, jstDate } from '../../lib/master-write.mjs';
+import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS, jstDate, setCompOnLoadReady } from '../../lib/master-write.mjs';
 import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_OWNER_KEYS, parseRegisterRequest, registerPayloadHashOf } from '../../lib/master-register.mjs';
 import { MAX_SET_PLANS, SET_QTY_MIN, SET_QTY_MAX, SET_NAME_MAX, SET_PLAN_ALERT_DAYS, setCodeShapeProblem } from '../../lib/set-plan.mjs';
 // 🆕 2026-10-13 中原さん: 必須でない項目は「値」か「入力なし」のどちらか (どちらでもない = 登録しない)。入力なしの一覧は登録の理由に残す
@@ -159,6 +160,7 @@ import {
 import { readGoneCheck, cancelSkuGoneFromNe, goneView } from '../../lib/master-gone.mjs';
 import { checkNeDelete, buildNeDelete, downloadNeDelete, withdrawNeDelete, buildHandling, readNeDelOverview, neDelAvailable, hideBackorder, hideBackorderText, NE_DEL_STATUS_WORDS, NE_DEL_KIND_WORDS, NE_DEL_MAX } from '../../lib/master-ne-delete.mjs';
 import { readNeDeleteStock } from './ne-delete-stock.mjs';
+import { readSetCompRequests, buildSetCompCsv } from '../../lib/master-set-comp-csv.mjs';
 import { readNeUpdate, readSkuNeDiff, requestNeSendNow, makeNeUpdateCsv, downloadNeUpdateFile, recordNeUpdateVerified, VERIFY_TARGETS, COL_WORDS as NE_UPD_COL_WORDS, FILLER_WORDS } from '../../lib/master-ne-update.mjs';
 // AMC 商品ラベルのバーコード印字 (Company DB構想 21 A1・発注アプリの po_barcode_labels に書く)
 import { amcLabelScreen, amcInputOf, saveAmcLabel, amcErrorBody, AmcLabelError, AMC_STATUSES, AMC_STATUS_WORDS, AMC_STATUS_HINTS } from './amc-label.mjs';
@@ -2313,10 +2315,15 @@ router.post('/api/ne-delete/handling', (req, res) => neDelApi(req, res, async (d
 router.get('/ne-update', (req, res) => withPgPage(req, res, async (db, dbError) => {
   const phase = await readPhaseView(db);
   const view0 = db ? await readNeUpdate(db) : null;
+  // 🆕 0100: セットの中身 (構成の依頼) = 足す・数を変える = CSV / 外す・入れ替える = NE の画面で。0100 の前の DB は出さない (読めないときも画面は出す)
+  let setComp = null;
+  if (db && await setCompOnLoadReady(db)) {
+    try { setComp = await readSetCompRequests(db, { nowMs: clock() }); } catch (e) { console.error(`[master-edit] セットの中身の依頼を読めない: ${e && e.message}`); setComp = { ready: false, items: [], csvSets: 0, error: true }; }
+  }
   const gate = editorGate(req);
   const approver = approverGate(req);
   res.render(view('ne-update.ejs'), {
-    ...pageLocals(req, phase), nav: 'neupd', dbError, nu: view0, canSend: gate.ok && !!view0 && view0.ready, sendMessage: gate.message || '',
+    ...pageLocals(req, phase), nav: 'neupd', dbError, nu: view0, setComp, canSend: gate.ok && !!view0 && view0.ready, sendMessage: gate.message || '',
     canVerify: approver.ok, VERIFY_TARGETS, COL_WORDS: NE_UPD_COL_WORDS, FILLER_WORDS,
   });
 }));
@@ -2335,6 +2342,17 @@ router.post('/api/ne-update/files/:id/download', (req, res) => neUpdApi(req, res
   res.set('Content-Disposition', `attachment; filename="${f.file_name}"`);
   res.set('X-Content-SHA256', f.sha256);
   res.set('X-NE-Older', String(f.older || 0));   // 🆕 0096: 前に受け取った CSV がこの直しを古い値で書いている数 (画面の一言)
+  res.send(f.bytes);
+}));
+// 🆕 0100: セットの中身の CSV (その場で作る・DB に記録しない = 開いている依頼からいつでも作り直せる。前に作ったファイルは前の中身 = 取り込むと戻る = 画面で「捨てる」と出す)
+router.post('/api/ne-update/set-comp-csv', (req, res) => neUpdApi(req, res, async (db) => {
+  if (!(await setCompOnLoadReady(db))) return res.status(409).json({ ok: false, error: 'まだ使えません (Company DB に 0100 が入っていません)', reason: 'db_not_ready' });
+  const f = await buildSetCompCsv(db, { now: new Date(clock()) });
+  if (!f) return res.status(409).json({ ok: false, error: 'いま CSV にできるセットの中身の依頼はありません', reason: 'nothing_ready' });
+  res.set('Content-Type', 'text/csv; charset=utf-8');
+  res.set('Content-Disposition', `attachment; filename="${f.file_name}"`);
+  res.set('X-Content-SHA256', f.sha256);
+  res.set('X-Set-Count', String(f.sets.length));
   res.send(f.bytes);
 }));
 router.post('/api/ne-update/verified', (req, res) => neUpdApi(req, res, async (db, actor, b) => res.json({ ok: true, ...(await recordNeUpdateVerified(db,

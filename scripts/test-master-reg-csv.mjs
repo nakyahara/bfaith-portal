@@ -1780,6 +1780,88 @@ await ta('[W2] 0058 (広げる道 §3.9 の 3・4): 配ったファイルは ops
 });
 
 
+await ta('[SC1] 🆕 0100: 今あるセットの中身を、構成の持ち主 load のまま依頼で変える = 依頼だけ (core は書かない)・「セットの中身の CSV」= 足す・数を変えるセットの依頼の全部の行 (NE の書き方・UTF-8・CRLF)・外すだけ = CSV にしない (NE の画面で)・0100 の前の DB = 今までどおり 409', async () => {
+  const SC = await import('../lib/master-set-comp-csv.mjs');
+  const LOAD = { ...ALL_COMPANY, sku_components: 'load' };
+  const compsOf = async (code) => (await q(`select k.code, c.qty from core.sku_components c join core.skus k on k.sku_id = c.child_sku_id join core.skus p on p.sku_id = c.parent_sku_id
+     where p.code = $1 order by c.sort_order, k.code_norm`, [code])).map((r) => ({ code: r.code, qty: Number(r.qty) }));
+  const openReq = async (code) => (await q(`select rows from ops.sku_component_requests where status = 'open' and set_sku_id = (select sku_id from core.skus where code = $1)`, [code]));
+  // 前の試験の依頼を片付ける (この試験は set001 の依頼から始める)
+  await pg.query(`update ops.sku_component_requests set status = 'cancelled', closed_at = now(), closed_by = 'test', close_reason = 'withdrawn' where status = 'open' and set_sku_id = (select sku_id from core.skus where code = 'set001')`);
+  await W2.setActiveOwnershipInDb(pg, LOAD);
+  try {
+    const cur = await compsOf('set001');
+    assert.ok(cur.length >= 2, JSON.stringify(cur));
+    // 0100 の前の DB (印が無い) = 構成は今までどおり直せない (409 切替前・何も書かない)
+    await pg.query('alter function ops.set_comp_request_on_load() rename to set_comp_request_on_load__hidden');
+    try {
+      const e = await save('set001', { components: [...cur, { code: 's003', qty: 2 }] }).then(() => null, (x) => x);
+      assert.ok(e && e.status === 409 && e.reason === 'before_cutover', e && e.message);
+      assert.deepEqual(e.extra.load_keys, ['sku_components']);
+      assert.equal((await openReq('set001')).length, 0);
+    } finally { await pg.query('alter function ops.set_comp_request_on_load__hidden() rename to set_comp_request_on_load'); }
+    // 0100 の後 = 依頼になる (core の構成は書かない)
+    const r = await save('set001', { components: [...cur, { code: 's003', qty: 2 }] });
+    assert.deepEqual(r.changed.map((c) => c.field), ['components']);
+    assert.deepEqual(await compsOf('set001'), cur, 'core の構成は書かない');
+    assert.equal((await openReq('set001')).length, 1);
+    // 一覧と CSV: 足す = CSV に依頼の全部の行 (今の構成の行も依頼の数量で・NE の書き方)
+    const rd = (o = {}) => as(E, 'master_edit', () => SC.readSetCompRequests(db, { nowMs: NOW_MS, ...o }));
+    let v = await rd();
+    let it = v.items.find((i) => i.code === 'set001');
+    assert.deepEqual([it.in_csv, it.add, it.qty, it.remove, it.why], [true, [{ code: 's003', qty: 2 }], [], [], null]);
+    assert.equal(v.ne_codes.current, true);
+    // Codex R1 Medium: 今朝の照合の回でない NE のコードの台帳 (次の日になった・朝の照合がまだ) = CSV に入れない
+    it = (await rd({ nowMs: NOW_MS + 86400e3 })).items.find((i) => i.code === 'set001');
+    assert.deepEqual([it.in_csv, it.why], [false, 'ne_codes_old']);
+    assert.equal(await as(E, 'master_edit', () => SC.buildSetCompCsv(db, { now: new Date(NOW_MS + 86400e3) })), null);
+    // Codex R1 Medium: 構成品がセットになった (夜間ロードが区分を変えた) = CSV に入れない (入れ子にしない)。持ち主のロールで取引の中だけ変えて読む
+    await pg.query('begin');
+    try {
+      // 区分の持ち主が company の間は DB が区分を変えさせない (sku_kind_locked) = 試験の接続のログイン (superuser) で守りを外して、取引の中だけ変える
+      await pg.query(`set local session authorization ${E.sessionUser}`);
+      await pg.query('set local session_replication_role = replica');
+      await pg.query("update core.skus set sku_kind = 'set' where code = 's003'");
+      await pg.query('set local session_replication_role = origin');
+      it = (await SC.readSetCompRequests(db, { nowMs: NOW_MS })).items.find((i) => i.code === 'set001');
+      assert.deepEqual([it.in_csv, it.why], [false, 'child_not_single']);
+    } finally { await pg.query('rollback'); await pg.query(`set session authorization ${E.sessionUser}`); await pg.query('set role deploy'); }
+    // Codex R1 Medium: 今の構成が空でも NE にあるセット (登録の状態が下書き・NE 登録待ちでない) = 今あるセットとして扱う (全部「足す」)
+    await pg.query('begin');
+    try {
+      await pg.query("delete from core.sku_components where parent_sku_id = (select sku_id from core.skus where code = 'set001')");
+      it = (await SC.readSetCompRequests(db, { nowMs: NOW_MS })).items.find((i) => i.code === 'set001');
+      assert.deepEqual([it.in_csv, it.why, it.add.length], [true, null, cur.length + 1]);
+    } finally { await pg.query('rollback'); }
+    const f = await as(E, 'master_edit', () => SC.buildSetCompCsv(db, { now: new Date('2030-01-10T03:04:05Z') }));
+    assert.equal(f.file_name, 'ne_set_components_20300110_120405.csv');
+    assert.equal(f.bytes.toString('utf8'), ['set_syohin_code,syohin_code,suryo', ...[...cur, { code: 's003', qty: 2 }].map((x) => `set001,${x.code},${x.qty}`)].join('\r\n') + '\r\n');
+    assert.equal(f.sha256, crypto.createHash('sha256').update(f.bytes).digest('hex'));
+    assert.deepEqual([f.sets, f.rows], [['set001'], cur.length + 1]);
+    // 外すだけ (今の構成から 1 行外す) = CSV にしない (NE の画面で)・CSV は作らない (null)
+    await save('set001', { components: cur.slice(0, cur.length - 1) });
+    v = await rd();
+    it = v.items.find((i) => i.code === 'set001');
+    assert.deepEqual([it.in_csv, it.why, it.remove.map((x) => x.code)], [false, 'remove_only', [cur.at(-1).code]]);
+    assert.match(it.why_text, /NE の画面/);
+    assert.equal(await as(E, 'master_edit', () => SC.buildSetCompCsv(db, { now: NOW })), null);
+    // 数を変える + 外す = CSV に入る (数の行) + 外すのは NE の画面で
+    await save('set001', { components: [{ ...cur[0], qty: cur[0].qty + 1 }] });
+    v = await rd();
+    it = v.items.find((i) => i.code === 'set001');
+    assert.deepEqual([it.in_csv, it.qty.map((x) => [x.code, x.from, x.to]), it.manual_remove], [true, [[cur[0].code, cur[0].qty, cur[0].qty + 1]], true]);
+    // 今の構成に戻す = 依頼を取り下げる (持ち主 load でも)
+    const back = await save('set001', { components: cur });
+    assert.deepEqual(back.changed.map((c) => c.field), ['components']);
+    assert.equal((await openReq('set001')).length, 0);
+    assert.equal((await q("select close_reason from ops.sku_component_requests where set_sku_id = (select sku_id from core.skus where code = 'set001') order by component_request_id desc limit 1"))[0].close_reason, 'withdrawn');
+    // 画面: 商品の画面の構成の欄が開く (持ち主 load のまま)・「NEへ送る」にセットの中身の板
+    const page = await (await import('../apps/master-edit/read.mjs')).readSkuPage(db, 'set001', { now: NOW, ownership: LOAD, open: true });
+    assert.equal(page.fields.components.editable, true, '構成の依頼は持ち主 load でも直せる');
+    assert.equal(page.fields.name.editable, true);
+  } finally { await W2.setActiveOwnershipInDb(pg, ALL_COMPANY); }
+});
+
 console.log('\n大文字のコードの契約 (🆕 0064・Company DB構想 20 §③ の境の一覧)');
 
 await ta('[U1] 大文字の単品 = 中の鍵は norm・外へは原文: 登録 (Up-ABC-1 / up-abc-1) → カード (ne_code = 原文) → NE 登録の CSV (syohin_code・品目の ne_code = 原文) → 配る → NE の取得 (コードは小文字・0041 の元の書き方 = Up-ABC-1) → 3 者一致 (Company DB = CSV = NE の書き方・照合が verified + NE 確認済み) → ロジザード用 CSV・入荷予定 (原文)', async () => {
@@ -2558,6 +2640,40 @@ try {
     assert.equal((await q('select 1 from ops.ne_csv_verified')).length, nRec, '何も記録しない');
     const a2 = await call('POST', '/apps/master-edit/api/reg-csv/verified', { body: { kind: 'products', result: 'ng', export_id: String(V1_ISSUED.export_id), request_id: uuid() } });
     assert.deepEqual([a2.status, a2.j.reason, a2.j.why], [409, 'export_mismatch', 'retired'], '本物の v1 のファイル ([V5]) も');
+  });
+
+  await ta('[SC2] 🆕 0100: 画面「NEへ送る」のセットの中身の板 (依頼の一覧・CSV を作るボタン)・API = その場の CSV (sha256 の印・名簿の人だけ)・商品の画面の「NEへ送る」への案内', async () => {
+    const LOAD = { ...ALL_COMPANY, sku_components: 'load' };
+    await W2.setActiveOwnershipInDb(pg, LOAD);
+    try {
+      const cur = (await q(`select k.code, c.qty from core.sku_components c join core.skus k on k.sku_id = c.child_sku_id join core.skus p on p.sku_id = c.parent_sku_id
+         where p.code = 'set001' order by c.sort_order, k.code_norm`)).map((r) => ({ code: r.code, qty: Number(r.qty) }));
+      await pg.query(`update ops.sku_component_requests set status = 'cancelled', closed_at = now(), closed_by = 'test', close_reason = 'withdrawn' where status = 'open' and set_sku_id = (select sku_id from core.skus where code = 'set001')`);
+      await save('set001', { components: [...cur, { code: 's004', qty: 3 }] });
+      const page = await call('GET', '/apps/master-edit/ne-update', { session: 'naka@test' });
+      assert.equal(page.status, 200, page.text.slice(0, 300));
+      assert.match(page.text, /id="nu-sc-panel"/); assert.match(page.text, /セットの中身を変える依頼/);
+      assert.match(page.text, /<tr data-code="set001">/); assert.match(page.text, /足す: s004×3/);
+      assert.match(page.text, /id="nu-sc-csv"/); assert.match(page.text, /セットの中身の CSV を作る \(1 セット\)/);
+      await checkScripts(page.text);
+      // 名簿でない人 = ボタンなし・API は 403
+      const viewer = await call('GET', '/apps/master-edit/ne-update', { session: 'viewer@test' });
+      assert.match(viewer.text, /id="nu-sc-panel"/); assert.doesNotMatch(viewer.text, /id="nu-sc-csv"/);
+      assert.equal((await call('POST', '/apps/master-edit/api/ne-update/set-comp-csv', { body: {}, session: 'viewer@test' })).status, 403);
+      const r = await call('POST', '/apps/master-edit/api/ne-update/set-comp-csv', { body: {}, session: 'naka@test' });
+      assert.equal(r.status, 200, r.text.slice(0, 300));
+      assert.match(r.headers.get('content-disposition'), /^attachment; filename="ne_set_components_\d{8}_\d{6}\.csv"$/);
+      assert.equal(r.headers.get('x-content-sha256'), crypto.createHash('sha256').update(r.buf).digest('hex'));
+      assert.equal(r.headers.get('x-set-count'), '1');
+      assert.equal(r.text, ['set_syohin_code,syohin_code,suryo', ...[...cur, { code: 's004', qty: 3 }].map((x) => `set001,${x.code},${x.qty}`)].join('\r\n') + '\r\n');
+      // 商品の画面 = 依頼の進みに「NEへ送る」への案内 (構成の欄は持ち主 load でも開く)
+      const sku = await call('GET', '/apps/master-edit/sku/set001', { session: 'naka@test' });
+      assert.match(sku.text, /id="req-how"/); assert.match(sku.text, /セットの中身の CSV/);
+      // 依頼を取り下げる = CSV にできるものが無い = 409
+      await save('set001', { components: cur });
+      const none = await call('POST', '/apps/master-edit/api/ne-update/set-comp-csv', { body: {}, session: 'naka@test' });
+      assert.deepEqual([none.status, none.j && none.j.reason], [409, 'nothing_ready']);
+    } finally { await W2.setActiveOwnershipInDb(pg, ALL_COMPANY); }
   });
 
   await ta('[H2] API: 名簿 (MASTER_DECISION_APPROVERS)・Origin・作る → 配る → ダウンロード (sha256) → 申告・商品の画面の CSV の箱と JAN', async () => {

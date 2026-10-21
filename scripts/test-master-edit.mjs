@@ -2742,10 +2742,10 @@ await ta('[11L] 🆕 0099: 構成の持ち主が load (NE が正) = 依頼を閉
   const before = await compsOf(SET);
   await W2.setActiveOwnershipInDb(pg, LOAD_COMP);
   try {
-    // 観測 ≠ 依頼 = mismatch (core は変えない)
+    // 観測 ≠ 依頼 = 🆕 0100: NE に入るのを待っている (依頼から 7 日まで = 食い違いにしない・core は変えない)
     let r = await p((await observe([{ set_code: SET, rows: [{ code: 's001', qty: 1, sort: 1 }] }])).set001);
-    assert.deepEqual([r.promoted, r.reason], [false, 'mismatch'], JSON.stringify(r));
-    assert.deepEqual(await openBr(), ['mismatch']);
+    assert.deepEqual([r.promoted, r.reason], [false, 'waiting_ne'], JSON.stringify(r));
+    assert.deepEqual(await openBr(), []);
     // 観測 = 依頼 (並びは逆) でも core がまだ NE の中身でない (夜間ロードの前) = 何も書かない (次の観測でもう一度)
     const rev = [{ code: 's003', qty: 1, sort: 1 }, { code: 's001', qty: 3, sort: 2 }];
     r = await p((await observe([{ set_code: SET, rows: rev }])).set001);
@@ -2771,12 +2771,21 @@ await ta('[11L] 🆕 0099: 構成の持ち主が load (NE が正) = 依頼を閉
     await pg.query(`insert into core.sku_components (company_id, parent_sku_id, child_sku_id, qty, source) select 1, p.sku_id, c.sku_id, 1, 'ne'
       from core.skus p join core.skus c on c.code = 's002' where p.code = $1`, [SET]);
     r = await p((await observe([{ set_code: SET, rows: [{ code: 's002', qty: 1, sort: 1 }] }])).set001);
-    assert.deepEqual([r.promoted, r.reason], [false, 'mismatch'], JSON.stringify(r));
+    assert.deepEqual([r.promoted, r.reason], [false, 'waiting_ne'], JSON.stringify(r));
     const s2cost = (await costsOf('s002')).at(-1).jpy;
     assert.ok(r.derived.some((d) => d.col === 'cost' && d.to === s2cost), JSON.stringify(r.derived));
     assert.equal((await costsOf(SET)).at(-1).jpy, s2cost, '導く値 (原価) は NE の中身 (s002 × 1) で');
     assert.equal((await reqOf()).status, 'open');
-    assert.deepEqual(await openBr(), ['mismatch']);
+    assert.deepEqual(await openBr(), []);
+    // 依頼から 7 日より後も NE が違う = 食い違い stale (依頼を 9 日前にしたことにする = 持ち主のロールで同じ中身の依頼に置き換える)
+    await pg.query(`update ops.sku_component_requests set status = 'cancelled', closed_at = now(), closed_by = 'test', close_reason = 'superseded'
+      where status = 'open' and set_sku_id = (select sku_id from core.skus where code = $1)`, [SET]);
+    await pg.query(`insert into ops.sku_component_requests (company_id, set_sku_id, rows, rows_hash, base_rows, reason, requested_by, edit_request_id, created_at)
+      select company_id, set_sku_id, rows, rows_hash, base_rows, reason, requested_by, gen_random_uuid(), created_at - interval '9 days' from ops.sku_component_requests
+       where component_request_id = (select max(component_request_id) from ops.sku_component_requests where set_sku_id = (select sku_id from core.skus where code = $1))`, [SET]);
+    r = await p((await observe([{ set_code: SET, rows: [{ code: 's002', qty: 1, sort: 1 }] }])).set001);
+    assert.deepEqual([r.promoted, r.reason], [false, 'stale'], JSON.stringify(r));
+    assert.deepEqual(await openBr(), ['stale']);
     await pg.query(`update ops.sku_component_requests set status = 'cancelled', closed_at = now(), closed_by = 'test', close_reason = 'withdrawn'
       where status = 'open' and set_sku_id = (select sku_id from core.skus where code = $1)`, [SET]);
     await pg.query(`update ops.sku_component_breaches set status = 'closed', closed_at = now(), closed_by = 'test', close_reason = 'dismissed'

@@ -14,7 +14,7 @@
     const ok = !dbError && !!N && N.ready;
     const when = (v) => (v ? new Date(new Date(v).getTime() + 9 * 3600e3).toISOString().slice(11, 16) : '');
     const waiting = ok ? N.rows.filter((r) => r.waiting) : [];
-    const pageData = { base, upload: ok && N.uploadReady, sendable: waiting.length };
+    const pageData = { base, upload: ok && N.uploadReady, sendable: waiting.length, setComp: !!(locals.setComp && setComp.csvSets) };
   %>
   <div class="page" id="nu" data-base="<%= base %>">
     <nav class="crumb" aria-label="いまの場所"><a href="<%= base %>/" data-list-back>商品・セット</a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><span aria-current="page">NEへ送る</span></nav>
@@ -65,6 +65,38 @@
       <div class="msgline" id="nu-msg" role="status" aria-live="polite"></div>
     </section>
 
+    <%# 🆕 0100: セットの中身 (構成の依頼)。足す・数を変える = 「セットの中身の CSV」/ 外す・入れ替える = NE の画面で (CSV ではできない)。翌朝 NE とそろえば、その夜に依頼が閉じて一覧から消える %>
+    <% if (locals.setComp) { const SC = setComp; const comp = (l) => l.map((x) => x.code + '×' + x.qty).join(', ') || 'なし'; %>
+    <section class="panel" id="nu-sc-panel" aria-labelledby="h-nu-sc">
+      <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-layers"/></svg></span><h2 id="h-nu-sc">セットの中身を変える依頼 (<%= SC.items.length %>)</h2>
+        <span class="sub">商品の画面で中身を変えたセットです。NE に入れて、翌朝 NE とそろえば消えます</span></div>
+      <% if (SC.error) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow">いま読めません。少し待って開き直してください</div></div><% } %>
+      <% if (!SC.items.length) { %><div class="empty" id="nu-sc-empty">中身を変える依頼はありません。</div><% } else { %>
+      <div class="tblwrap">
+        <table class="tbl" id="nu-sc-rows">
+          <caption class="sr">セットの中身を変える依頼</caption>
+          <thead><tr><th scope="col">セット</th><th scope="col">今の中身 (NE) → 依頼</th><th scope="col">NE でやること</th></tr></thead>
+          <tbody>
+          <% for (const i of SC.items) { %>
+            <tr data-code="<%= i.code %>"<%- i.in_csv ? '' : ' class="mute"' %>>
+              <td class="code"><a href="<%= base %>/sku/<%= encodeURIComponent(i.code) %>"><%= i.code %></a> <span class="hint"><%= i.name %></span></td>
+              <td><span class="mono"><%= comp(i.current) %></span> → <b><%= comp(i.rows) %></b></td>
+              <td><% if (i.in_csv) { %>「セットの中身の CSV」で送る<% if (i.add.length) { %> (足す: <%= i.add.map((x) => x.code + '×' + x.qty).join(', ') %>)<% } %><% if (i.qty.length) { %> (数: <%= i.qty.map((x) => x.code + ' ' + x.from + '→' + x.to).join(', ') %>)<% } %><% } else { %><%= i.why_text %><% } %>
+                <% if (i.manual_remove) { %><div class="hint">外す: <%= i.remove.map((x) => x.code).join(', ') %> は NE の画面で外してください (CSV では外せません)</div><% } %></td>
+            </tr>
+          <% } %>
+          </tbody>
+        </table>
+      </div>
+      <% } %>
+      <% if (canSend && SC.csvSets) { %><div class="buildbar">
+        <button class="btn" type="button" id="nu-sc-csv"><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>セットの中身の CSV を作る (<%= SC.csvSets %> セット)</button>
+        <span class="hint">NE の [商品] → [商品管理の一括登録] →「セット商品情報 CSV」で取り込みます · <b>作ったらすぐに取り込み、前に作ったファイルは捨ててください</b> (前のファイルは前の中身 = 取り込むと戻ります) · Excel で開いて保存し直さないでください</span>
+      </div><% } %>
+      <div class="msgline" id="nu-sc-msg" role="status" aria-live="polite"></div>
+    </section>
+    <% } %>
+
     <% if (canVerify) { %>
     <details class="panel" id="nu-verify">
       <summary>NE の実物の試しの結果を残す (中原さん)</summary>
@@ -84,6 +116,6 @@
     <script type="application/json" id="me-nu"><%- JSON.stringify(pageData).replace(/</g, '\\u003c') %></script>
   </div>
   <%- include('_footer') %>
-  <% if (ok && (canSend || canVerify)) { %><script src="<%= base %>/public/me-neupd.js?v=<%= assetV %>" defer></script><% } %>
+  <% if (ok && (canSend || canVerify || (locals.setComp && setComp.csvSets))) { %><script src="<%= base %>/public/me-neupd.js?v=<%= assetV %>" defer></script><% } %>
 </body>
 </html>

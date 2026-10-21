@@ -66,6 +66,8 @@ const PH = await import('../apps/product-hub/services/cdb-card-intake.js');
 
 /** 🆕 0099 (セットを構成の持ち主 load のまま登録・仮番号 = マージの時に付け替える) の migration のファイル名 */
 const SET_ENTRY_MIG_RE = /^\d{4}_set_entry_on_load\.sql$/;
+/** 🆕 0100 (今あるセットの構成の依頼を持ち主 load のまま・仮番号) の migration のファイル名 */
+const SET_COMP_MIG_RE = /^\d{4}_set_comp_request_on_load\.sql$/;
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
 const quiet = () => {};
@@ -1046,8 +1048,8 @@ await ta('[G-0099] 🆕 0099 (セットを構成の持ち主 load のまま登�
   const f0099 = files.find((x) => SET_ENTRY_MIG_RE.test(x));
   assert.ok(f0099, '0099 (セットの登録) の migration が無い');
   const fnOf = (file, head) => { const t = fs.readFileSync(path.join(MIG, file), 'utf8').replace(/\r\n/g, '\n'); const i = t.indexOf(head); assert.ok(i >= 0, `${file}: ${head}`); return t.slice(i, t.indexOf('\nend $$;\n', i) + 9); };
-  for (const [re, label] of [[/function\s+ops\.register_new_sku\s*\(/i, '登録の関数'], [/function\s+ops\.guard_master_edit_write\s*\(/i, '書き込みの守り']]) {
-    for (const file of files.filter((x) => x > f0099)) assert.ok(!re.test(fs.readFileSync(path.join(MIG, file), 'utf8')), `${file} も${label}を作り直している = [G-0099] を見直す`);
+  for (const [re, label, skip] of [[/function\s+ops\.register_new_sku\s*\(/i, '登録の関数', null], [/function\s+ops\.guard_master_edit_write\s*\(/i, '書き込みの守り', SET_COMP_MIG_RE]]) {
+    for (const file of files.filter((x) => x > f0099 && !(skip && skip.test(x)))) assert.ok(!re.test(fs.readFileSync(path.join(MIG, file), 'utf8')), `${file} も${label}を作り直している = [G-0099] を見直す`);
   }
   const diffOf = (a, b) => { const out = []; let i = 0; for (const line of b) { if (i < a.length && line === a[i]) i++; else out.push(line); } return { i, out }; };
   // 登録の関数: 0061 の 1 行 (単品だけ許可) を「種類の許可」に置き換えただけ
@@ -1077,6 +1079,27 @@ await ta('[G-0099] 🆕 0099 (セットを構成の持ち主 load のまま登�
     const p = await one(`select has_function_privilege('public', oid, 'execute') as pub, prosecdef as d from pg_proc where oid = $1::regprocedure`, [sig]);
     assert.deepEqual(p, { pub: false, d: true }, sig);
   }
+});
+
+await ta('[G-0100] 🆕 0100 (今あるセットの構成の依頼を持ち主 load のまま): 書き込みの守りは 0099 との違いが continue のかたまり (3 行 → 4 行) だけ・依頼と食い違いの表だけ・権限はそのまま', async () => {
+  const MIG = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..', 'db', 'company', 'migrations');
+  const files = fs.readdirSync(MIG).filter((x) => /^\d{4}_.*\.sql$/.test(x));
+  const f0099 = files.find((x) => SET_ENTRY_MIG_RE.test(x)); const f0100 = files.find((x) => SET_COMP_MIG_RE.test(x));
+  assert.ok(f0099 && f0100 && f0100 > f0099, '0099 の後に 0100');
+  for (const file of files.filter((x) => x > f0100)) assert.ok(!/function\s+ops\.guard_master_edit_write\s*\(/i.test(fs.readFileSync(path.join(MIG, file), 'utf8')), `${file} も書き込みの守りを作り直している = [G-0100] を見直す`);
+  const fnOf = (file) => { const t = fs.readFileSync(path.join(MIG, file), 'utf8').replace(/\r\n/g, '\n'); const h = 'create or replace function ops.guard_master_edit_write()'; const i = t.indexOf(h); assert.ok(i >= 0, file); return t.slice(i, t.indexOf('\nend $$;\n', i) + 9).split('\n'); };
+  const a = fnOf(f0099); const b = fnOf(f0100);
+  const gone = a.filter((l) => l.includes('🆕 0099') || l.startsWith('    --   (依頼は「NE に入れてほしい中身」') || l.includes("v_sess.operation = 'sku_create';"));
+  assert.equal(gone.length, 3, JSON.stringify(gone));
+  const keep = a.filter((l) => !gone.includes(l));
+  const out = []; let i = 0;
+  for (const line of b) { if (i < keep.length && line === keep[i]) i++; else out.push(line); }
+  assert.equal(i, keep.length, '0099 のほかの行が 0100 に同じ順で残っていない');
+  assert.equal(out.length, 4, JSON.stringify(out));
+  assert.ok(out[0].trim().startsWith('-- 🆕 0100:') && out[1].trim().startsWith('--') && out[2].trim().startsWith('--'));
+  assert.equal(out[3].trim(), "continue when k = 'sku_components' and v_tbl in ('ops.sku_component_requests', 'ops.sku_component_breaches');");
+  const p = await one(`select has_function_privilege('public', oid, 'execute') as pub, prosecdef as d from pg_proc where oid = 'ops.guard_master_edit_write()'::regprocedure`);
+  assert.deepEqual(p, { pub: false, d: true });
 });
 
 await ta('[G-0064] 大文字のコード (0064): ops.new_sku_code_problem・ops.ne_reg_build の作り直しは 0058 の本文との違いが「形の行」と「🆕 0064 の注記 1 行」だけ・照合の確かめは 0063 の本文 + NE の書き方の確かめの行だけ・権限はそのまま・NE 登録の CSV の品目の ne_code の CHECK は大文字も (小文字にして code_norm)', async () => {

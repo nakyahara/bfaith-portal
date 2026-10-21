@@ -331,7 +331,8 @@
             <li class="step"><div class="dot">4</div><div class="t">今の構成になる</div><div class="s">依頼を閉じる</div></li>
           </ol>
           <% if (newSet) { %><div class="nextline"><svg class="ic" aria-hidden="true"><use href="#i-arrow"/></svg><span class="grow"><b>NE でやること:</b> このセットは「NE 登録の CSV」に入ります。NE に取り込むと、次の朝に確かめて、その夜に「今の構成」になります (構成: <%= compKey(rq.rows) %>)。</span></div><% } else { %>
-          <div class="nextline"><svg class="ic" aria-hidden="true"><use href="#i-arrow"/></svg><span class="grow"><b>NE でやること (構成の依頼):</b> <%= todo.length ? todo.join('、') + 'てください。' : '構成品の並びを依頼のとおりにしてください。' %>並びも下の「依頼」のとおりに (依頼した構成: <%= compKey(rq.rows) %> · 今の構成: <%= compKey(c.components) || 'なし' %>)。</span></div><% } %>
+          <div class="nextline"><svg class="ic" aria-hidden="true"><use href="#i-arrow"/></svg><span class="grow"><b>NE でやること (構成の依頼):</b> <%= todo.length ? todo.join('、') + 'てください。' : '構成品の並びを依頼のとおりにしてください。' %>並びも下の「依頼」のとおりに (依頼した構成: <%= compKey(rq.rows) %> · 今の構成: <%= compKey(c.components) || 'なし' %>)。</span></div>
+          <div class="hint" id="req-how">足す・数を変える = 「<a href="<%= base %>/ne-update">NEへ送る</a>」の「セットの中身の CSV」で送れます (依頼を直したら作り直し、前に作ったファイルは捨ててください)。外す・入れ替えるは NE の画面で直してください (CSV ではできません)。翌朝 NE とそろえば、その夜に今の構成になります</div><% } %>
         </section>
         <% } %>
         <% const BK = { mismatch: 'NE の構成が依頼と違う', stale: '依頼から日がたっても NE の構成が違う', unrequested_diff: '依頼が無いのに NE の構成が今の構成と違う' }; %>

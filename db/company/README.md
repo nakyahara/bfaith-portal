@@ -3025,3 +3025,15 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
   夜間ロードの規則の指紋 (engine.mjs ほか) は変えない = Render と miniPC を同じ朝にそろえる必要はない
 - 戻し方: 非常の止め `MASTER_NEW_ENTRY_STOP=1` (Render の env) で新商品の登録と CSV を止める。持ち主は変えていない = 夜間ロード・古い表・出荷は今のまま
 - 試験 = `scripts/test-master-register.mjs` [R1]・[R9]・[W1]・[W2]・[G-0099] / `scripts/test-master-reg-csv.mjs` [C11]・[V1]・[V6]・[W2] ⑦ (許可と do ブロック)・[H1]・[H3] / `scripts/test-master-edit.mjs` [11L] / `scripts/test-master-edit-ui.mjs` [60]
+
+### 今あるセットの中身を構成の持ち主 NE のまま依頼で変える (0100 仮番号・0099 の次・2026-10-21 中原さん「近道を作って」)
+- **なぜ**: 0099 で新しいセットは依頼の形で登録できるようになった。今あるセットの中身 (構成) の変更も同じ形 (依頼 → NE → 翌朝確かめて閉じる) で、持ち主 load のまま開ける
+- **DB**: `ops.guard_master_edit_write` (0099 の版を写して 🆕 0100 の continue だけ変えた・試験 [G-0100]) = 構成の依頼と食い違いの表 (`ops.sku_component_requests`・`ops.sku_component_breaches`) は持ち主 `sku_components` が load でも通す
+  (表・操作の許可・約束の相手の行・構成品は単品だけ・ほかの持ち主のキーは今までどおり)。印 `ops.set_comp_request_on_load()`
+- **アプリ**: 0100 の後の DB で、セットの導く値のキー (税率・取扱・原価) が company のとき、商品の画面の「構成」は持ち主 load でも依頼として保存できる (`REQUEST_ONLY_KEYS`)。
+  「NEへ送る」に「セットの中身を変える依頼」の板と「セットの中身の CSV を作る」(`lib/master-set-comp-csv.mjs`・`POST /api/ne-update/set-comp-csv`) =
+  足す・数を変えるセットの依頼の全部の行 (`set_syohin_code,syohin_code,suryo`・NE の書き方・UTF-8・CRLF)。外す・入れ替えるは NE の画面で (CSV ではできない)。CSV は DB に記録しない (開いている依頼からその場で作る)。🚨 前に作ったファイルは前の中身 = 依頼を直した・取り下げた・NE で直した後に取り込むと戻る = 画面・つかいかた・保存の後の一言で「作り直す・前のファイルは捨てる」と出す (仕組みでは止めない = 中原さんの「シンプルに」と Codex の「運用の判断として許容」)
+  夜間ロードの後の依頼の閉じ方 (`closeRequestOnLoad`): 依頼から 7 日までは NE が違っても食い違いにしない (waiting_ne = 取り込む前の夜)・7 日より後 = stale
+- 当て方: 0099 の後に `migrate.mjs --dry-run` (関数の置き換えと印だけ・値は変えない) → 中原さんの OK → 本適用 → アプリを配る。ロールの流し直しは要らない。夜間ロードの指紋は変えない
+- NE の実機の試し: `AI_reference/システム設計/CompanyDB構想/_raw/NE_CSV実機の試し_20261021_セットの中身` (数量を変える・足す・書かない内訳が残るか)。結果が出るまでは最初の 1 回を 1 セットで
+- 試験 = `scripts/test-master-reg-csv.mjs` [SC1] (依頼・CSV・外すだけ・取り下げ・0100 の前は 409) [SC2] (画面・API) / `scripts/test-master-edit.mjs` [11L] / `scripts/test-master-register.mjs` [G-0100]

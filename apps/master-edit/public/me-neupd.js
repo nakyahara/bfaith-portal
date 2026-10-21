@@ -6,6 +6,7 @@
  *   - 通信が分からないまま終わった = 同じ request_id で送り直す (2 回作らない・2 回頼まない)
  *   - 受け取りを DB が断った (作った後に値が変わった・もう出した) = そのボタンを外して「もう一度 CSV を作る」を案内
  *   - (名簿の人だけ) NE の実物の試しの結果 = POST /api/ne-update/verified
+ *   - 🆕 0100: 「セットの中身の CSV を作る」= POST /api/ne-update/set-comp-csv (その場で作って渡す・sha256 を照らしてから保存・DB に記録しない = 何度押しても同じ中身)
  */
 (function () {
   'use strict';
@@ -135,6 +136,34 @@
 
   Array.prototype.forEach.call(document.querySelectorAll('#nu-files [data-dl]'), function (b) {
     b.addEventListener('click', function () { download(b.getAttribute('data-dl'), b.getAttribute('data-kind'), b); });
+  });
+
+  var sc = $('#nu-sc-csv');
+  if (sc) sc.addEventListener('click', function () {
+    if (busy) return;
+    lock(true); sc.disabled = true; msg('セットの中身の CSV を作っています…', '', '#nu-sc-msg');
+    var done = function () { lock(false); sc.disabled = false; };
+    timed(P.base + '/api/ne-update/set-comp-csv', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+      .then(function (res) {
+        if (!res.ok) return res.json().catch(function () { return {}; }).then(function (j) { throw new Error(j.error || ('作れませんでした (' + res.status + ')')); });
+        var sha = res.headers.get('X-Content-SHA256') || '';
+        var m = /filename="([^"]+)"/.exec(res.headers.get('Content-Disposition') || '');
+        var n = res.headers.get('X-Set-Count') || '';
+        return res.arrayBuffer().then(function (buf) {
+          var check = window.crypto && window.crypto.subtle ? window.crypto.subtle.digest('SHA-256', buf).then(hex) : Promise.resolve(sha);
+          return check.then(function (got) {
+            if (sha && got !== sha) throw new Error('受け取った CSV が壊れています (保存しません)。もう一度押してください');
+            var a = document.createElement('a');
+            a.href = URL.createObjectURL(new Blob([buf], { type: 'text/csv' }));
+            a.download = m ? m[1] : 'ne_set_components.csv';
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
+            done();
+            msg('セットの中身の CSV を保存しました (' + n + ' セット)。NE の [商品] → [商品管理の一括登録] で「セット商品情報 CSV」として取り込んでください (前に作ったセットの中身の CSV は捨ててください = 取り込むと前の中身に戻ります)。翌朝 NE とそろえば、その夜に一覧から消えます', 'ok', '#nu-sc-msg');
+          });
+        });
+      })
+      .catch(function (e) { done(); msg(e && e.name === 'AbortError' ? '時間がかかりすぎました。もう一度押してください' : (e.message || String(e)), 'err', '#nu-sc-msg'); });
   });
 
   var vs = $('#nu-v-save');
