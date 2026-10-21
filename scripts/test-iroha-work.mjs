@@ -2287,6 +2287,33 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       ok(done1.status === 'closed' && done1.close_reason === 'stocked' && done1.closed_at && done1.ready_at && TD.getTask(wip).status === 'in_progress', '棚入完了 (終了理由・時刻が入り、作業中は動かない)');
       ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'task_status' AND task_id = ? AND to_value LIKE '%まとめて棚入完了%'").get(r1).c === 1, '履歴に残る');
       ok(!(await call('GET', '/api/state', { cookie })).json.cards.some((c) => c.id === r1), '棚入完了したカードは一覧から消える');
+      // ⭐PIN は 1 回で続けて棚入完了できる (中原さん 2026-10-21「1 カードにつき 1 回ずつ PIN」)
+      {
+        ok(bulk.json.staff_mode && bulk.json.staff_mode.staff === true && bulk.json.staff_mode.via === 'device'
+          && Number(bulk.json.staff_mode.workerId) === Number(staff.id), 'PIN を入れて棚入完了したら、その端末はその職員の職員モードになる');
+        const r3 = mk(9191, '棚入待ち3', 'ready_for_stocking');
+        const r4 = mk(9192, '棚入待ち4', 'ready_for_stocking');
+        const noPin = await call('POST', '/api/bulk-stocked', { cookie, body: { ids: [bv(r3)], worker_id: staff.id } });
+        ok(noPin.status === 200 && noPin.json.done.includes(r3), '職員モード中は PIN なしで次のカードを棚入完了できる');
+        ok((await call('POST', '/api/bulk-stocked', { cookie, body: { ids: [bv(r4)], worker_id: w1.id } })).status === 403,
+          '職員モード中でも、選んでいるのが利用者なら棚入完了できない');
+        // 分けた行の ✅ が使う /api/status も同じ (棚入待ち → 棚入完了 だけ)
+        const st = await call('POST', '/api/status', { cookie, body: { id: r4, to: 'closed', close_reason: 'stocked',
+          worker_id: staff.id, expect_version: TD.getTask(r4).version } });
+        ok(st.status === 200 && TD.getTask(r4).status === 'closed', '/api/status の棚入完了も職員モード中は PIN なし');
+        ok((await call('POST', '/api/status', { cookie, body: { id: wip, to: 'closed', close_reason: 'stocked',
+          worker_id: staff.id, expect_version: TD.getTask(wip).version } })).status === 403 && TD.getTask(wip).status === 'in_progress',
+          '棚入待ちでないカードを「棚入完了」で閉じるのは、職員モード中でも PIN が要る (広げない)');
+        ok((await call('POST', '/api/staff-lock', { cookie })).json.staff_mode.staff === false, '職員モードを終える');
+        const r5 = mk(9193, '棚入待ち5', 'ready_for_stocking');
+        const locked = await call('POST', '/api/bulk-stocked', { cookie, body: { ids: [bv(r5)], worker_id: staff.id } });
+        ok(locked.status === 403 && locked.json.error === 'pin_required' && TD.getTask(r5).status === 'ready_for_stocking',
+          '職員モードが切れていれば PIN を求める (画面はここで PIN を聞いて送り直す)');
+        for (let i = 0; i < 6; i++) await call('POST', '/api/bulk-stocked', { cookie, body: { ids: [bv(r5)], worker_id: staff.id } });
+        const after = await call('POST', '/api/bulk-stocked', { cookie, body: { ids: [bv(r5)], worker_id: staff.id, pin: '4649' } });
+        ok(after.status === 200 && after.json.done.includes(r5), 'PIN の空送りは間違いとして数えない (何度来てもロックしない)');
+        ok((await call('POST', '/api/staff-lock', { cookie })).json.staff_mode.staff === false, '後片づけ: 職員モードを終える');
+      }
       // 履歴 (PR-C): 期間・検索・件数
       const hist = await call('GET', '/api/history?q=BULK-X', { cookie });
       ok(hist.status === 200 && hist.json.ok && hist.json.total >= 3 && hist.json.rows.some((x) => x.id === r1 && x.close_reason === 'stocked'), '履歴に終了したカードが出る (検索つき)');
@@ -4231,7 +4258,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok((html.match(/\['unblocked', '止まっていない'\]/g) || []).length === 2 && /curTab === 'unblocked'\) \{ if \(c\.blocked\) return false; \}/.test(html)
     && /curWhen === 'unblocked'\) \{ if \(c\.blocked\) return false; \}/.test(html) && /c\.unblocked = c\.all - c\.blocked;/.test(html),
     '「止まっていない」(⛔ を除く) の絞り込みが一覧とボードの両方にある (中原さん 2026-09-05)');
-  ok(/async function completeStocked\(entries, \{ fromBulk = false \} = \{\}\)/.test(html) && /const okGo = await ask\(\{[\s\S]{0,700}\}\);\s*if \(!okGo\) return;\s*\/\/ ② 職員PIN/.test(html)
+  ok(/async function completeStocked\(entries, \{ fromBulk = false \} = \{\}\)/.test(html) && /const okGo = await ask\(\{[\s\S]{0,700}\}\);\s*if \(!okGo\) return;\s*\}\s*\/\/ ② 職員PIN/.test(html)
     && /if \(stockInflight\) return;\s*stockInflight = true;\s*try \{ await completeStockedInner\(entries, \{ fromBulk \}\); \}\s*finally \{ stockInflight = false; \}/.test(html)
     && /if \(curWhen === 'unblocked' && !\(\(bs\.cards \|\| \[\]\)\.some\(\(c\) => c\.blocked\)\)\) curWhen = 'all';/.test(html),
     'まとめて棚入完了は「先に確認 (何を・戻せない) → 次に PIN」のワンクッション (中原さん 2026-09-05)');
@@ -8844,6 +8871,67 @@ console.log('\n[ボード] 📥 入荷から何日たったか (2026-10-07 中�
   ok(ago('不明') === '入荷 不明' && ago('') === '' && ago(null) === '', '日付でなければそのまま・空なら出さない');
   ok(/c\.arrival \? '📥 ' \+ arrivalAgo\(c\.arrival\) : null,/.test(html.match(/function bcardHtml\(c, status\) \{[\s\S]*?\r?\n\}/)[0]),
     'ボードのカードに入荷から何日かを出す');
+}
+
+console.log('\n[ボード] 📍 Zロケの数 = 在庫 − 引当 (2026-10-21 中原さん)');
+{
+  const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
+  const loc = new Function(html.match(/function locStockText\(c\) \{[\s\S]*?\r?\n\}/)[0] + '; return locStockText;')();
+  ok(loc({ z_stock: 50, z_allocated: 7, z_free: 43 }) === 'Zロケ 43', '在庫 50 − 引当 7 = 「Zロケ 43」');
+  ok(loc({ z_stock: 0, z_allocated: 0, z_free: 0 }) === 'Zロケ 0', 'Z に行が無い (在庫 0) は「Zロケ 0」');
+  ok(loc({ z_stock: null, z_allocated: null, z_free: null }) === '', 'ミラーが取れていなければ出さない (0 と読ませない)');
+  ok(loc({ z_stock: 5, z_allocated: 8, z_free: -3 }) === 'Zロケ 0', '引当が在庫を超えるずれはマイナスにしない');
+  ok(loc({ facility_code: 'workcenter', loc_kind: 'Y', loc_stock: 40, loc_free: 36, z_stock: 10, z_allocated: 0, z_free: 10 }) === 'Zロケ 10',
+    '⭐拠点で替わる loc_* (Y) ではなく、いつも Z を出す (分けた行で拠点と数が食い違わない — Codex)');
+  ok(/locStockText\(c\) \? '📍 ' \+ locStockText\(c\) : null,/.test(html.match(/function bcardHtml\(c, status\) \{[\s\S]*?\r?\n\}/)[0]),
+    'ボードのカードに Zロケの数を出す');
+}
+
+console.log('\n[棚入完了] PIN は 1 回・Zロケに残っていれば聞く (2026-10-21 中原さん)');
+{
+  const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
+  const fn = (name) => html.match(new RegExp('(?:async )?function ' + name + '\\([^)]*\\) \\{[\\s\\S]*?\\r?\\n\\}'))[0];
+  const zLeftOf = new Function(fn('zLeftOf') + '; return zLeftOf;')();
+  ok(zLeftOf({ z_stock: 50, z_allocated: 7, z_free: 43 }) === 43 && zLeftOf({ z_stock: 0, z_allocated: 0, z_free: 0 }) === 0,
+    'Zロケに残っている数 = 在庫 − 引当');
+  ok(zLeftOf({ z_stock: null, z_free: null }) === null, '在庫が取れていなければ「分からない」(0 と読まない)');
+  ok(zLeftOf({ z_stock: 3, z_allocated: 5, z_free: -2 }) === 0, '引当が在庫を超えるずれは 0');
+  // 画面の流れを小さな偽物で動かす: ask が何回・何を聞いたか / 何を送ったか
+  const run = async ({ card, unlocked, session = false, answers = [], responses = [{ ok: true, done: [1], skipped: [] }] }) => {
+    const asked = []; const sent = [];
+    const state = { me: { session }, staff_mode: unlocked ? { staff: true, via: 'device', workerId: 7 } : { staff: false } };
+    const worker = { id: 7, display_name: '職員A', worker_type: 'staff' };
+    const env = {
+      state, worker, toast() {}, showWarn() {}, showErr(m) { asked.push('ERR ' + m); }, exitBulk() {}, loadState: async () => {}, openGate() {},
+      stateCan: () => true, findCard: () => card, fmtDate: () => '10/21', fmtTime: () => '14:00',
+      ask: async (o) => { asked.push(o.input === 'pin' ? 'PIN' : o.title); return answers.length ? answers.shift() : true; },
+      apiFetch: async (url, o) => { sent.push(JSON.parse(o.body)); return responses.shift() || { ok: true, done: [], skipped: [] }; },
+      bulkSkipLabel: (r) => r,
+    };
+    const src = ['zLeftOf', 'zLeftNote', 'stockingUnlocked', 'sendWithStockPin', 'completeStockedInner'].map(fn).join('\n')
+      + '\nconst STOCK_PIN_ASK = ' + html.match(/const STOCK_PIN_ASK = ([^\n]+);/)[1] + ';\nreturn completeStockedInner;';
+    const f = new Function(...Object.keys(env), src)(...Object.values(env));
+    await f([{ id: 1, version: 3 }]);
+    return { asked, sent };
+  };
+  const base = { id: 1, title: '商品A', status: 'ready_for_stocking' };
+  let r = await run({ card: { ...base, z_stock: 0, z_allocated: 0, z_free: 0 }, unlocked: true });
+  ok(r.asked.length === 0 && r.sent.length === 1 && r.sent[0].pin == null, '⭐職員モード中・Zロケ 0 個 → 何も聞かずにそのまま棚入完了');
+  r = await run({ card: { ...base, z_stock: 50, z_allocated: 7, z_free: 43 }, unlocked: true });
+  ok(r.asked.length === 1 && r.asked[0] === 'Zロケに 43 個残っていますが棚入完了しますか?' && r.sent.length === 1,
+    '⭐Zロケに残っていれば「Zロケに 43 個残っていますが棚入完了しますか?」と聞く');
+  r = await run({ card: { ...base, z_stock: 50, z_allocated: 7, z_free: 43 }, unlocked: true, answers: [false] });
+  ok(r.sent.length === 0, '「やめる」なら送らない');
+  r = await run({ card: { ...base, z_stock: null, z_allocated: null, z_free: null }, unlocked: true });
+  ok(r.asked.length === 1 && /を棚入完了にしますか\?$/.test(r.asked[0]), '在庫が取れていなければ、これまでの確認を出す');
+  r = await run({ card: { ...base, z_stock: 0, z_free: 0 }, unlocked: false, answers: ['4649'] });
+  ok(r.asked.join(',') === 'PIN' && r.sent[0].pin === '4649', '職員モードでなければ PIN を 1 回聞いて送る');
+  r = await run({ card: { ...base, z_stock: 0, z_free: 0 }, unlocked: true, answers: ['4649'],
+    responses: [{ ok: false, error: 'pin_required' }, { ok: true, done: [1], skipped: [] }] });
+  ok(r.asked.join(',') === 'PIN' && r.sent.length === 2 && r.sent[0].pin == null && r.sent[1].pin === '4649',
+    '画面の取り直しより先に職員モードが切れていたら、PIN を聞いて 1 回だけ送り直す');
+  r = await run({ card: { ...base, z_stock: 0, z_free: 0 }, unlocked: false, session: true });
+  ok(r.asked.length === 0 && r.sent.length === 1, 'ポータルから入っている人は PIN なし');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

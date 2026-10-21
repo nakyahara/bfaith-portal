@@ -1957,6 +1957,17 @@ function arrivalAgo(ymd) {
   return days + '日前入荷';
 }
 /**
+ * ボードのカードに出す「Zロケ 43」= Z ロケの 在庫 − 引当 (中原さん 2026-10-21)。
+ * 値はサーバーが毎時の在庫ミラーから出した z_free (画面は 60 秒ごとに取り直す)。取れていなければ出さない (0 個とは別 — 監修 B-8)。
+ * ⭐拠点で Z/Y を切り替える loc_* は使わない — 分けた行 (いろは + ワークセンター) は拠点だけ替わって
+ *   loc_* は親カードのままなので、行の拠点と数が食い違う (Codex)。Z は商品ごとの数なのでどの行でも同じ
+ * 引当が在庫を超えるずれはマイナスにせず 0 で出す
+ */
+function locStockText(c) {
+  if (c.z_stock == null) return '';
+  return 'Zロケ ' + Math.max(0, Number(c.z_free) || 0);
+}
+/**
  * ⭐職員向けの表示か (Notion リンク・在庫日数・売上・外部出し目安・ラベル待ちの事務項目 — 監修 F-5)。
  * 職員モードで許可リストに入る「計画」の許可を目印にする — 職員モードが終わると enforceWorkerCaps / dropPlanCaps が
  * 落とすので、利用者に切り替えた瞬間に職員向けの表示も消える (描いてから隠さない — 要件 §U-7)
@@ -2171,6 +2182,7 @@ function bcardHtml(c, status) {
     && (boardCols === 'fac' ? stateCan('task.facility.assign') : boardCols === 'when' ? stateCan('task.plan.assign') : stateCan('task.status.change'));
   const sel = selectable && bulkIds.has(c.id);
   const meta = [c.qty != null ? c.qty + ' 個' : null,
+    locStockText(c) ? '📍 ' + locStockText(c) : null,
     c.arrival ? '📥 ' + arrivalAgo(c.arrival) : null,
     c.done_qty != null ? '✅ できた ' + c.done_qty + (c.qty != null ? '/' + c.qty : '') : null,
     c.hold_memo ? '📝 メモ' : null,
@@ -3502,23 +3514,44 @@ async function completeStockedInner(entries, { fromBulk = false } = {}) {
   const w = worker;
   if (!w) { openGate(); return; }
   if (!state.me.session && w.worker_type !== 'staff') { toast('棚入完了にできるのは職員だけです (右上の名前を職員に替えてください)'); return; }
-  const names = items.map((x) => (findCard(x.id) || {}).title).filter(Boolean);
+  const cardsIn = items.map((x) => findCard(x.id) || {});
+  const names = cardsIn.map((c) => c.title).filter(Boolean);
   const list = names.slice(0, 8).join('\n') + (names.length > 8 ? '\n…ほか ' + (names.length - 8) + ' 件' : '');
-  // ① 確認 (ワンクッション)。何を終了にするか・戻せない (一覧から外れる) ことを見せる
-  const okGo = await ask({
-    title: items.length === 1 ? '「' + (names[0] || '') + '」を棚入完了にしますか?' : '本当に ' + items.length + ' 件を棚入完了にしますか?',
-    text: (items.length === 1 ? '' : list + '\n\n') + '棚に入れ終わったものだけにしてください。終了にすると一覧から外れます (履歴には残ります)',
-    ok: items.length === 1 ? 'はい、棚入完了にする' : 'はい、' + items.length + ' 件を棚入完了にする', cancel: 'やめる', danger: true,
-  });
-  if (!okGo) return;
-  // ② 職員PIN (端末から。ポータルから入っている人は職員なので要らない)
-  let pin = null;
-  if (!state.me.session) {
-    pin = await ask({ title: '🔑 職員PIN', text: w.display_name + ' さんの職員PIN を入れてください', input: 'pin', ok: '棚入完了にする' });
-    if (pin == null) return;
+  // ① 確認。⭐1 枚のときは Zロケ (在庫 − 引当) で決める (中原さん 2026-10-21):
+  //   0 個 → 聞かずにそのまま棚入完了 (続けて押していける) / 残っている → 「Zロケに N 個残っていますが…」/
+  //   在庫が取れていない → 確かめようがないので、これまでのワンクッション (中原さん 2026-09-05) を出す
+  if (items.length === 1) {
+    const c = cardsIn[0];
+    const z = zLeftOf(c);
+    if (z == null || z > 0) {
+      const okGo = await ask(z == null ? {
+        title: '「' + (names[0] || '') + '」を棚入完了にしますか?',
+        text: 'Zロケの在庫がまだ取れていないので確かめられません。棚に入れ終わったものだけにしてください。終了にすると一覧から外れます (履歴には残ります)',
+        ok: 'はい、棚入完了にする', cancel: 'やめる', danger: true,
+      } : {
+        title: 'Zロケに ' + z + ' 個残っていますが棚入完了しますか?',
+        text: '「' + (names[0] || '') + '」\n' + zLeftNote(c) + '\n\n終了にすると一覧から外れます (履歴には残ります)',
+        ok: 'はい、棚入完了にする', cancel: 'やめる', danger: true,
+      });
+      if (!okGo) return;
+    }
+  } else {
+    // まとめては何を終了にするかを一覧で見せる。Zロケに残っているものはそれも書く
+    const left = cardsIn.filter((c) => (zLeftOf(c) || 0) > 0);
+    const leftText = left.length === 0 ? '' : '\n\n⚠ Zロケに残っています:\n'
+      + left.slice(0, 8).map((c) => c.title + ' … ' + zLeftOf(c) + ' 個').join('\n')
+      + (left.length > 8 ? '\n…ほか ' + (left.length - 8) + ' 件' : '');
+    const okGo = await ask({
+      title: '本当に ' + items.length + ' 件を棚入完了にしますか?',
+      text: list + leftText + '\n\n棚に入れ終わったものだけにしてください。終了にすると一覧から外れます (履歴には残ります)',
+      ok: 'はい、' + items.length + ' 件を棚入完了にする', cancel: 'やめる', danger: true,
+    });
+    if (!okGo) return;
   }
-  const j = await apiFetch('/api/bulk-stocked', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ids: items.map((x) => ({ id: x.id, version: x.version })), worker_id: w.id, pin }) });
+  // ② 職員PIN。⭐職員モード中 (PIN を入れた本人) は聞かない。入れたら 30 分は続けて棚入完了できる
+  const j = await sendWithStockPin(w, (pin) => apiFetch('/api/bulk-stocked', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids: items.map((x) => ({ id: x.id, version: x.version })), worker_id: w.id, pin }) }));
+  if (!j) return;
   if (!j.ok) { showErr(j.message || '棚入完了にできませんでした'); return; }
   const skipped = (j.skipped || []).length;
   // 飛ばした理由は「状態が変わった」だけではない (作業中・見つからない・すでに完了) — 理由は下の警告に出す
@@ -3531,6 +3564,44 @@ async function doBulkStocked() {
   if (!stateCan('tasks.bulk_stocked')) return;   // 許可リストに無ければ動かない (ボタンも描いていない。二重の守り)
   if (!bulkIds || bulkIds.size === 0) { toast('カードを選んでください'); return; }
   await completeStocked([...bulkIds.entries()].map(([id, version]) => ({ id, version })), { fromBulk: true });
+}
+/** Zロケに残っている数 (在庫 − 引当。マイナスは 0)。在庫ミラーが取れていなければ null = 分からない */
+function zLeftOf(c) {
+  if (!c || c.z_stock == null) return null;
+  return Math.max(0, Number(c.z_free) || 0);
+}
+/** 「在庫 50 − 引当 7 ・ 10/21 14:00 時点」(在庫は 1 時間ごとの取り込みなので、いつの数かを添える) */
+function zLeftNote(c) {
+  return '在庫 ' + c.z_stock + ' 個 − 引当 ' + (c.z_allocated || 0) + ' 個'
+    + (c.z_at ? ' ・ ' + fmtDate(c.z_at) + ' ' + fmtTime(c.z_at) + ' 時点 (在庫は 1 時間ごとに更新)' : '');
+}
+/** 棚入完了をしてよい職員モードか (ポータルの人 / この端末で PIN を入れた本人)。サーバーの requireStaffStocking と同じ */
+function stockingUnlocked() {
+  if (state.me && state.me.session) return true;
+  const sm = state.staff_mode || {};
+  return !!sm.staff && !!worker && worker.worker_type === 'staff' && Number(sm.workerId) === Number(worker.id);
+}
+const STOCK_PIN_ASK = (w) => ({ title: '🔑 職員PIN', text: w.display_name + ' さんの職員PIN を入れてください (入れると 30 分は PIN なしで続けて棚入完了できます)', input: 'pin', ok: '棚入完了にする' });
+/**
+ * 棚入完了を送る。職員モード中なら PIN なし、そうでなければ PIN を聞いて送る (中原さん 2026-10-21)。
+ * 画面の取り直しより先に職員モードが切れていたら (サーバーが pin_required)、PIN を聞いて 1 回だけ送り直す。
+ * @param send (pin) => Promise<応答>
+ * @returns 応答 / null (PIN をやめた)
+ */
+async function sendWithStockPin(w, send) {
+  let pin = null;
+  if (!stockingUnlocked()) {
+    pin = await ask(STOCK_PIN_ASK(w));
+    if (pin == null) return null;
+  }
+  let j = await send(pin);
+  if (j && !j.ok && pin == null && j.error === 'pin_required') {
+    pin = await ask(STOCK_PIN_ASK(w));
+    if (pin == null) return null;
+    j = await send(pin);
+  }
+  if (j && j.staff_mode) state.staff_mode = j.staff_mode;
+  return j;
 }
 /** 棚入待ちのカード 1 枚を棚入完了に (ボード・一覧の ✅ から — 中原さん 2026-09-05「個別に完了できるように」) */
 async function stockOne(id) {
@@ -4536,21 +4607,20 @@ async function stockBatchOf(taskId, batchId) {
   if (!w) { openGate(); return; }
   if (!state.me.session && w.worker_type !== 'staff') { toast('棚入完了にできるのは職員だけです (右上の名前を職員に替えてください)'); return; }
   const rest = (c.batches || []).filter((x) => x.work_status !== 'cancelled' && !sameId(x.id, b.id) && x.work_status !== 'done').length;
+  // 分けた行は「残りのぶんがどうなるか」を見せたいので確認は残す。Zロケに残っていればそれを先に書く
+  const z = zLeftOf(c);
   const okGo = await ask({
-    title: facilityName(b.facility_code || c.facility_code) + ' のぶんを棚入完了にしますか?',
-    text: '棚に入れ終わったぶんだけにしてください。'
+    title: (z > 0 ? 'Zロケに ' + z + ' 個残っていますが' : '') + facilityName(b.facility_code || c.facility_code) + ' のぶんを棚入完了にしますか?',
+    text: (z > 0 ? zLeftNote(c) + '\n\n' : '') + '棚に入れ終わったぶんだけにしてください。'
       + (rest > 0 ? '残り ' + rest + ' つのぶんはそのまま残ります (カードは一覧に残ります)。' : 'これで全部そろうので、カードは一覧から外れます (履歴には残ります)。'),
     ok: 'はい、棚入完了にする', cancel: 'やめる', danger: true,
   });
   if (!okGo) return;
-  let pin = null;
-  if (!state.me.session) {
-    pin = await ask({ title: '🔑 職員PIN', text: w.display_name + ' さんの職員PIN を入れてください', input: 'pin', ok: '棚入完了にする' });
-    if (pin == null) return;
-  }
-  const j = await apiFetch('/api/status', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  // 職員モード中は PIN なし (まとめての口と同じ)
+  const j = await sendWithStockPin(w, (pin) => apiFetch('/api/status', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ id: c.id, to: 'closed', close_reason: 'stocked', batch_id: b.id,
-      worker_id: w.id, pin, expect_version: c.version }) });
+      worker_id: w.id, pin, expect_version: c.version }) }));
+  if (!j) return;
   if (!j.ok) { showErr(j.message || '棚入完了にできませんでした'); return; }
   applyTask(c, j.task);
   c.status = j.status;
