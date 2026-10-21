@@ -153,7 +153,9 @@
       opt('card.official_url', 'sec-card', '公式ページ URL', '#official-url', 3);
     }
     // 発送方法 = 出品カードの楽天の配送方法にも使う (届いてサイズを見てから = 入力なし・商品の画面で入れる)。カードを作らないときは ④
-    opt('shipping_code', 'sec-ship', '発送方法 (届いてからでも可)', document.getElementById('shipping') ? '#shipping' : '[data-row="shipping_code"] .nonechk input', card ? 3 : 4);
+    // 🆕 2026-10-21: セットは必須 (①・入力なしは無い)。送料コードが空だと利益がずっと出ない
+    if (isSet) list.push({ id: 'shipping_code', sec: 'sec-ship', t: '発送方法 (セットは必須)', ok: !!val('shipping'), focus: document.getElementById('shipping') ? '#shipping' : '#sec-ship', level: 1 });
+    else opt('shipping_code', 'sec-ship', '発送方法 (届いてからでも可)', document.getElementById('shipping') ? '#shipping' : '[data-row="shipping_code"] .nonechk input', card ? 3 : 4);
     if (!isSet && card) opt('card.set_decision', 'sec-card', 'セット商品を作るか', '#set-plan button', 3);
     // 🆕 2026-10-17: 「作る」= 作るセットが 1 つ以上・全部の行の形が正しい (サーバーの確かめで「使えない」と分かった行も直すまで止める。確かめ中・確かめられない = 保存のときにサーバーがもう一度)
     if (!isSet && card && segVal('set-plan') === 'create') {
