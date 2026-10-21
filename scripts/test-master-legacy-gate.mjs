@@ -1428,6 +1428,33 @@ await t('product-hub の詳細画面: 閉じたら手入力の欄 (id="y-tax") �
   assert.ok(/data-tax="10"/.test(r.text), '試算は今の値');
   __setCdbTaxReader(null);
 });
+await t('product-hub の詳細画面 (2026-10-21): 閉じた後は送料も開いたときの Company DB の送料コードを使う (写しは翌朝なので、マスタ編集で入れたらすぐ出る)・閉じる前は写しのまま', async () => {
+  // 写し (mirror_products) には原価だけあって送料が無いセット (cranberryp30-2 と同じ状態)
+  mdb.prepare(`INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 消費税率, 売上分類, 原価, updated_at)
+    VALUES ('ph-ship-live', '送料の即時反映', 'セット', '取扱中', 'OK', 0.08, 3, 820, '2026-10-01 00:00:00')`).run();
+  const id = Number(phdb.prepare("INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('ph-ship-live', '送料の即時反映', 'test')").run().lastInsertRowid);
+  const reader = (ship) => async (codes) => ({ ok: true, rows: codes.map((c) => ({ code: c, found: true, tax_rate: 0.08, tax_class: null, ...ship })) });
+  setPhase('frozen'); G.__resetLegacyGate();
+  // Company DB に送料コードが入った (マスタ編集で入れた直後。写しはまだ空)
+  __setCdbTaxReader(reader({ shipping_code: '5', shipping_method: 'ネコポス', shipping_cost_jpy: '237' }));
+  let r = await call('GET', `/apps/product-hub/detail/${id}`);
+  assert.equal(r.status, 200, r.text.slice(0, 300));
+  assert.ok(/id="profit-sim"[^>]*data-ship="237"/.test(r.text), '🚨 写しが空でも Company DB の送料 237 で試算する');
+  assert.ok(!r.text.includes('id="profit-ship-missing"'), '未登録の案内は出さない');
+  assert.ok(/data-current="ネコポス"/.test(r.text), '配送方法も Company DB の値');
+  // Company DB でも未登録 = 案内を出し、「読み直すとすぐ出る」と書く (翌朝ではない)
+  __setCdbTaxReader(reader({ shipping_code: null, shipping_method: null, shipping_cost_jpy: null }));
+  G.__resetLegacyGate();
+  r = await call('GET', `/apps/product-hub/detail/${id}`);
+  assert.ok(/id="profit-sim"[^>]*data-ship=""/.test(r.text) && r.text.includes('id="profit-ship-missing"'));
+  assert.ok(r.text.includes('入れたら、この画面を読み直すとすぐ出ます') && !r.text.includes('翌朝からここにも自動で出ます'));
+  // 閉じる前 (legacy_open) は Company DB を読まない = 写しのまま (翌朝)
+  setPhase('legacy_open'); G.__resetLegacyGate();
+  r = await call('GET', `/apps/product-hub/detail/${id}`);
+  assert.ok(/id="profit-sim"[^>]*data-ship=""/.test(r.text) && r.text.includes('翌朝からここにも自動で出ます'));
+  __setCdbTaxReader(null);
+  mdb.prepare("DELETE FROM mirror_products WHERE 商品コード = 'ph-ship-live'").run();
+});
 
 // 発注アプリの仕入先・売れ筋共有の表示名 (R1 H4)
 await t('発注アプリ: 仕入先 (kind = suppliers) の追加・削除・CSV・宛先の CSV・一括取込は閉じたら 410 / 読めない 503・仕入先でないマスタ (発注条件) は止めない・legacy_open は今までどおり', async () => {

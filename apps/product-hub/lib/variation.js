@@ -148,6 +148,34 @@ export function getNeCost(db, neCode, { draftId = null } = {}) {
 }
 
 /**
+ * 写し (mirror_products・毎朝) の送料を、開いたときに読んだ Company DB の送料 (送料コード) で置き換える (2026-10-21 中原さん:
+ * マスタ編集で送料コードを入れても翌朝まで出なかった)。live = shippingFromByCode の答え { byCode: { 小文字のコード: { code, method, cost } } }。
+ *   - 単品・セット (source 'self'): そのコードの値にする (送料コードが空なら送料も null = 未登録)
+ *   - バリエーション (source 'members'): 子 SKU が**全部**読めたときだけ置き換える (一部だけだと写しと混ざる)。
+ *     SKU ごとの送料を入れ直し、全部同じならその値、違えば null (= 一つに決まらない)
+ *   - 読めていない (live が無い・コードが無い) = 写しのまま
+ * shippingLive = true を付ける (画面が「入れたら読み直すとすぐ出る」と案内する)
+ */
+export function applyLiveShipping(neCost, live, neCode) {
+  if (!neCost || !live || !live.byCode) return neCost;
+  const get = (code) => live.byCode[norm(code)] || null;
+  const agreedOf = (vals) => (new Set(vals).size === 1 ? vals[0] : null);
+  if (neCost.source === 'members') {
+    const skus = neCost.skuCosts || [];
+    if (!skus.length || !skus.every((s) => get(s.code))) return neCost;
+    const skuCosts = skus.map((s) => ({ ...s, shippingCost: get(s.code).cost }));
+    return {
+      ...neCost, skuCosts, shippingLive: true,
+      shippingCost: agreedOf(skuCosts.map((s) => s.shippingCost)),
+      shippingMethod: agreedOf(skus.map((s) => get(s.code).method)),
+    };
+  }
+  const l = get(neCode);
+  if (!l) return neCost;
+  return { ...neCost, shippingCost: l.cost, shippingMethod: l.method, shippingLive: true };
+}
+
+/**
  * その商品コードが「どこかのドラフトでバリエーションから外された」ものか。
  * 外した SKU を別ページにしたい場合はそのコードで新規登録する運用なので、
  * ここに載っているコードは自動まとめの対象から除く (2026-07-25 中原さん方針)。

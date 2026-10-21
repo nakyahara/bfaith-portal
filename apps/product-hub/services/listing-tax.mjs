@@ -24,5 +24,6 @@ export async function resolveListingTax(db, draft, { gate = checkLegacyGate, pre
   if (!r.ok) {
     return { mode: 'blocked', reason: `税率を Company DB から決められないので出品を止めています (マスタは新しい画面で直します): ${r.reason}` };
   }
-  return { mode: 'cdb', percent: r.percent, label: r.label };
+  // 送料 (Company DB の送料コード・同じ問い合わせで読んだもの)。セットの楽天配送方法の補完に使う (翌朝の写しを待たない・2026-10-21)
+  return { mode: 'cdb', percent: r.percent, label: r.label, shipping: r.shipping || null };
 }

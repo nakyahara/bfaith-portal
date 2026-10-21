@@ -69,7 +69,7 @@ import { importImageDbByStatus } from './services/notion-image-import.js';
 import { buildPromptTemplates, composeColorVariations, composeProductInfo } from './lib/prompt-templates.js';
 // 画像タブの商品情報の自動表示 (2026-09-13 スタッフ要望)
 import { autoProductInfoText, effectiveProductInfo } from './lib/product-info-auto.js';
-import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost, listNeShippingOptions, profitShipChoices, RAKUTEN_GROUP_NE_HINTS } from './lib/variation.js';
+import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost, applyLiveShipping, listNeShippingOptions, profitShipChoices, RAKUTEN_GROUP_NE_HINTS } from './lib/variation.js';
 import { existingPageOfDraft, EXISTING_PAGE_CHOICES } from './lib/existing-page.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, newKindOfCode, MAX_REGISTER_CODES } from './services/new-product-intake.js';
@@ -404,7 +404,11 @@ router.get('/detail/:id', (req, res) => {
 
   // 利益シミュレーション (Notion 数式の移植)。原価・送料 (配送方法から自動算出済) ・税率は NE から。
   // バリエーションは子SKUから集計するので、外したSKUを除くため draftId を渡す
-  const neCost = getNeCost(db, draft.ne_code, { draftId: draft.id });
+  // 切替で閉じた後 (cdb) は、税率と同じ問い合わせで読んだ Company DB の送料 (送料コード) で置き換える。
+  // 写し (mirror_products) は毎朝なので、マスタ編集で入れた送料が翌朝まで出なかった (2026-10-21 中原さん)
+  const neCostMirror = getNeCost(db, draft.ne_code, { draftId: draft.id });
+  const neCost = res.locals.taxMode === 'cdb' && res.locals.cdbTax?.shipping
+    ? applyLiveShipping(neCostMirror, res.locals.cdbTax.shipping, draft.ne_code) : neCostMirror;
   // SKU別売価 (原価がSKUで異なる場合に設定する)。キーは正規化済み sku_code
   const skuPrices = {};
   for (const r of db.prepare('SELECT sku_code, price FROM draft_sku_prices WHERE draft_id = ?').all(draft.id)) {
@@ -457,7 +461,8 @@ router.get('/detail/:id', (req, res) => {
   const rakuten = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(draft.id) || null;
   // 出品時に商品画像の末尾へ自動追加される店舗共通バナー (画像タブのプレビュー用)。
   // 配送方法の解決は buildItemPayload と同じ関数 (アプリ指定 > NEマッピング)
-  const effShipGroup = effectiveShippingForDraft(db, draft.ne_code, rakuten?.shipping_method_group).group;
+  const effShipGroup = effectiveShippingForDraft(db, draft.ne_code, rakuten?.shipping_method_group,
+    neCost?.shippingLive ? { neMethod: neCost.shippingMethod } : {}).group;
   const trailingBanners = [
     ...(SHIPPING_BANNER_LOCATIONS[effShipGroup]
       ? [{ location: SHIPPING_BANNER_LOCATIONS[effShipGroup], label: `配送: ${SHIPPING_METHOD_GROUPS[effShipGroup]}` }]
