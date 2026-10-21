@@ -45,13 +45,13 @@ const TARGET = '2030-01-16', RUN_DIR = 'lzd_20300116T070000000Z_abcdef';
 const NIGHT = JST('2030-01-17T00:20:00'), DAY = JST('2030-01-17T08:40:00');
 
 /** 前の日 (TARGET) の lz-daily の正式な証跡と CSV */
-function setupData({ verdict = 'pass', portalOk = true, rows = DAILY } = {}) {
+function setupData({ verdict = 'pass', portalOk = true, rows = DAILY, evExtra = {} } = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lzn-'));
   const rel = `lz-daily/${TARGET}/${RUN_DIR}/cdb_logizard_shohinmaster_upload.csv`;
   fs.mkdirSync(path.join(dataDir, path.dirname(rel)), { recursive: true });
   const buf = csvBuf(['形式/型番', '商品名', 'ふりがな', '仕入単価', '取引先id'], rows);
   fs.writeFileSync(path.join(dataDir, rel), buf);
-  writeEvidence(dataDir, 'lz-daily', { state: 'complete', version: 'lzd-v3', portal: { ok: portalOk, stored: portalOk }, as_of: TARGET, run_id: RUN_DIR, verdict, deadline: '2030-01-17T01:00:00+09:00', csv: { path: rel, sha256: sha(buf), rows: rows.length } },
+  writeEvidence(dataDir, 'lz-daily', { state: 'complete', version: 'lzd-v3', portal: { ok: portalOk, stored: portalOk }, as_of: TARGET, run_id: RUN_DIR, verdict, deadline: '2030-01-17T01:00:00+09:00', csv: { path: rel, sha256: sha(buf), rows: rows.length }, ...evExtra },
     { now: new Date('2030-01-15T22:00:00Z'), warn: () => {} });
   return dataDir;
 }
@@ -1116,6 +1116,100 @@ await ta('[35] 並びの前提の崩れ・見張りのバーコード (Codex #15
   assert.match(x.rec.error, /sentinel_barcode_pre/);
   x = await run({});
   assert.equal(x.r.result, 'verified');
+});
+
+// ───────── 🆕 外した行 (lzd-v4・2026-10-21 中原さん「悪い行だけ外して、残りは毎晩取り込む」) ─────────
+const EX_COST = { code_norm: 'c-3', ne_code: 'C-3', reason: 'cdb_cost_missing', label: '原価が無い' };
+const EX_COLL = { code_norm: 'u60e-05', ne_code: 'U60E-05', reason: 'lz_case_collision', label: 'ロジザードに大文字小文字ちがいが 2 つ', lz_ids: ['U60E-05', 'u60e-05'] };
+const v4 = (rows, counts = {}) => ({ version: 'lzd-v4', fail_by: [], counts: { targets: 5122, invalid: rows.length, excluded: rows.length, ...counts }, excluded: { count: rows.length, limit: 100, over_cap: false, rows } });
+
+await ta('[36] 🆕 外した行 端から端まで (本物のエンジン・本物の確かめ): 外した商品 (原価が無い C-3・ロジザードに大文字小文字ちがいが 2 つの U60E-05 / u60e-05) は CSV に無い = 取り込まない・前後で全部の列が同じ / ほかは取り込んで verified・ok の ping / 1 行に取り込んだ件数と外した行', async () => {
+  const p = portal();
+  p.putArtifact();
+  const dataDir = setupData({ evExtra: v4([EX_COST, EX_COLL]) });
+  const lz = realLikeLz({ ids: ['A-1', 'B-2', 'C-3', 'U60E-05', 'u60e-05'], now: () => p.clock.now });
+  const before = new Map(['C-3', 'U60E-05', 'u60e-05'].map((id) => [id, [...lz.st.lz.get(id)]]));
+  const { o } = e2eOpts(p, dataDir, lz);
+  const r = await N.runNightly(o);
+  assert.deepEqual([r.state, r.result, r.ping, r.rows, r.excluded.count, S.getStatus(p.db, { now: p.clock.now }).state], ['imported', 'verified', 'ok', 2, 2, 'verified']);
+  // 外した商品はロジザードで触っていない (全部の列が前と同じ)・取り込んだ CSV にも無い
+  for (const [id, cells] of before) assert.deepEqual(lz.st.lz.get(id), cells, id);
+  const imported = iconv.decode(fs.readFileSync(path.join(N.nightlyRunDir(dataDir, r.runId), 'import.csv')), 'cp932');
+  assert.deepEqual(imported.split('\r\n').slice(1).map((l) => l.split(',')[0].replace(/"/g, '')), ['A-1', 'B-2']);
+  // 確かめ (verify.json): 取り込まなかった商品の差 0
+  const v = JSON.parse(fs.readFileSync(path.join(N.nightlyRunDir(dataDir, r.runId), 'verify.json'), 'utf8'));
+  assert.deepEqual([v.product.ok, v.product.counts.imported, v.product.counts.untouched, v.product.counts.diffs, v.barcode.ok], [true, 2, 4, 0, true]);   // 取り込まなかった = C-3・U60E-05・u60e-05・見張り
+  const s = N.summarize(r);
+  assert.deepEqual([s.code, s.line.replace(/\(lzim_night_[^)]+\)/, '(id)')], [0, '✅ ロジザード毎日の商品マスタの取込 (毎晩): 取込 verified (id)・2 件を取り込んだ・ロジザードに送れなかった商品 2 件 (原価が無い 1・ロジザードに大文字小文字ちがいが 2 つ 1): C-3・U60E-05']);
+});
+
+await ta('[36b] 🆕 小文字の重複を無効 (削除フラグ 1) にした朝 (2026-10-21 中原さん): U60E-05 は送って verified・無効の u60e-05 は書き込まない (前後で全部の列が同じ)', async () => {
+  const rows = [...DAILY, ['U60E-05', 'U', 'U', '10', '0001']];
+  const buf = csvBuf(['形式/型番', '商品名', 'ふりがな', '仕入単価', '取引先id'], rows);
+  const p = portal();
+  p.putArtifact({ csvBuf: buf, sha256: sha(buf), rows: rows.length });
+  const dataDir = setupData({ rows, evExtra: v4([]) });
+  const lz = realLikeLz({ ids: ['A-1', 'B-2', 'U60E-05', 'u60e-05'], now: () => p.clock.now });
+  lz.st.lz.get('u60e-05')[LZ_SHOHIN.header.indexOf('削除フラグ')] = '1';
+  const before = [...lz.st.lz.get('u60e-05')];
+  const r = await N.runNightly(e2eOpts(p, dataDir, lz).o);
+  assert.deepEqual([r.state, r.result, r.ping, r.rows], ['imported', 'verified', 'ok', 3]);
+  assert.deepEqual(lz.st.lz.get('u60e-05'), before, '無効の ID に値を書き込まない');
+  assert.equal(lz.st.lz.get('U60E-05')[LZ_SHOHIN.header.indexOf('商品名')], 'U');
+});
+
+await ta('[37] 🆕 外した行 (守り): CSV に外した商品がある (大文字小文字ちがいの ID も)・外した行が多すぎる・外してよい理由でない = ロジザードに入らない / 直前の書き出しに CSV の商品の大文字小文字ちがいの別の ID ができた = 押さない', async () => {
+  for (const [rows, ev, reason] of [
+    [[...DAILY, ['c-3', 'C', 'C', '10', '0001']], v4([EX_COST]), 'target_excluded_in_csv'],
+    [[...DAILY, ['u60e-05', 'U', 'U', '10', '0001']], v4([EX_COLL]), 'target_excluded_in_csv'],
+    [DAILY, v4([EX_COST], { targets: 10 }), 'target_excluded_over_cap'],
+    [DAILY, v4([{ ...EX_COST, reason: 'cdb_no_sku' }]), 'target_excluded_reason'],
+    [DAILY, { counts: { targets: 5122, invalid: 1 } }, 'target_invalid_without_excluded'],
+  ]) {
+    const p = portal();
+    const buf = csvBuf(['形式/型番', '商品名', 'ふりがな', '仕入単価', '取引先id'], rows);
+    p.putArtifact({ csvBuf: buf, sha256: sha(buf), rows: rows.length });
+    const dataDir = setupData({ rows, evExtra: ev });
+    const { o } = nightlyOpts(p, dataDir);   // ロジザードに入ったら投げる
+    const r = await N.runNightly(o);
+    assert.deepEqual([r.state, r.reason, r.ping], ['skipped', reason, null], reason);
+    assert.match(N.summarize(r).line, new RegExp(`しない \\(skipped・${reason}\\)`));
+  }
+  // 不合格の朝 = 不合格の理由も 1 行に (なぜ取り込まなかったか)
+  {
+    const p = portal();
+    p.putArtifact();
+    const r = await N.runNightly(nightlyOpts(p, setupData({ verdict: 'fail', evExtra: { fail_by: ['invalid'] } })).o);
+    assert.equal(N.summarize(r).line, '⏭️ ロジザード毎日の商品マスタの取込 (毎晩): しない (skipped・target_not_pass・invalid)');
+  }
+  // 直前の書き出しに a-1 (CSV の A-1 の大文字小文字ちがい) = 押さない (precheck)
+  const p = portal();
+  p.putArtifact();
+  const lz = realLikeLz({ ids: ['A-1', 'B-2', 'a-1'], now: () => p.clock.now });
+  const dataDir = setupData({ evExtra: v4([]) });
+  const r = await N.runNightly(e2eOpts(p, dataDir, lz).o);
+  const rec = JSON.parse(fs.readFileSync(path.join(N.nightlyRunDir(dataDir, r.runId), 'import.json'), 'utf8'));
+  assert.deepEqual([r.result, lz.st.calls.includes('execute'), r.ping], ['not_started', false, null]);
+  assert.match(rec.error, /大文字小文字ちがい 1 件 \(A-1\)/);
+});
+
+await ta('[38] 🆕 08:40 / 11:45 の回 (知らせだけ): 昨夜の取込 (対象の日・状態・件数) と外した行を 1 行に / 証跡が無い = 件数なし (投げない)', async () => {
+  // 昨夜 = 00:20 に取り込んで verified
+  const p = portal();
+  p.putArtifact();
+  const dataDir = setupData({ evExtra: v4([EX_COST]) });
+  const lz = realLikeLz({ ids: ['A-1', 'B-2', 'C-3'], now: () => p.clock.now });
+  assert.equal((await N.runNightly(e2eOpts(p, dataDir, lz).o)).result, 'verified');
+  p.clock.now = DAY;
+  const r = await N.runNightly(nightlyOpts(p, dataDir).o);
+  assert.deepEqual([r.state, r.last_night], ['notify_only', { target_as_of: TARGET, last_state: 'verified', rows: 2, excluded: { count: 1, text: 'ロジザードに送れなかった商品 1 件 (原価が無い 1): C-3' } }]);
+  assert.deepEqual(N.summarize(r), { code: 0, line: `ℹ ロジザード毎日の商品マスタの取込 (毎晩): notify_only (知らせの送り直しだけ)・昨夜の取込 (対象 ${TARGET}) = verified・2 件・ロジザードに送れなかった商品 1 件 (原価が無い 1): C-3` });
+  // 昨夜は始めていない・証跡が無い = 件数なし
+  const p2 = portal({ at: DAY });
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'lzn-empty-'));
+  const r2 = await N.runNightly(nightlyOpts(p2, empty).o);
+  assert.deepEqual([r2.state, r2.last_night], ['notify_only', { target_as_of: TARGET, last_state: null, rows: null, excluded: { count: 0, text: '' } }]);
+  assert.equal(N.summarize(r2).line, `ℹ ロジザード毎日の商品マスタの取込 (毎晩): notify_only (知らせの送り直しだけ)・昨夜の取込 (対象 ${TARGET}) = 始めていない`);
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);

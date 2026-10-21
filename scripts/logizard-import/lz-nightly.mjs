@@ -21,6 +21,9 @@
  *   4. 最後にもう一度知らせの送り直し (止め・要確認 → 止まった状態 → 再適用待ち。verified の取引で積まれた再適用待ちも)
  *   ping (lz-daily-import) の ok = その夜の取込 (か確かめのやり直し) が verified **かつ** 前後どの回にも未送・知らせ済みにできない止まった状態が無いときだけ
  *   (ほか = ping しない = dead-man が拾う)
+ * 🆕 lzd-v4 (2026-10-21 中原さん): 対象の合格に「外した行」(その行だけの問題で CSV に出さなかった商品) が入りうる。照らし直しは pickTarget (lz-import-plan.mjs の checkExcluded)・
+ *   取り込む・確かめるのは CSV の行だけ (外した行は「取り込まなかった商品 = 全部の列が直前と同じ」で確かめる = 今までと同じ)。
+ *   1 行の結果に取り込んだ件数と外した行 (やさしい 1 文) を出す。08:40 / 11:45 の回 (知らせだけ) も昨夜の取込の件数と外した行を 1 行に出す
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -28,6 +31,8 @@ import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { pickTarget } from '../../apps/master-decisions/lz-import-plan.mjs';
+import { excludedSentence } from '../../apps/master-decisions/lz-cdb.mjs';
+import { readEvidence } from '../../apps/company-db/push/evidence.mjs';
 import { POLICIES, STOP_STATES, assertPolicyReady, importOne, verifyAgain, startAllowed } from './lz-import-engine.mjs';
 import { portalWrite } from './portal-io.mjs';
 import { jobsHook, sendJobsChat } from './notify-jobs.mjs';
@@ -56,6 +61,29 @@ export function nightlyRunDir(dataDir, runId) {
 }
 /** その夜の済みの印 (Render の時刻の JST の日) */
 export const nightlyMarker = (dataDir, jstDate) => path.join(dataDir, 'lz-import', jstDate, 'nightly-done.json');
+
+/** 証跡の外した行 → やさしい 1 文 (無い・読めない = '') */
+export function excludedOf(ev) {
+  const x = ev && ev.excluded;
+  if (!x || typeof x !== 'object' || !Array.isArray(x.rows)) return { count: 0, text: '' };
+  const count = Number.isSafeInteger(x.count) ? x.count : x.rows.length;
+  return { count, text: excludedSentence(x.rows, { show: 3, total: count }) };
+}
+/**
+ * 08:40 / 11:45 の回 (知らせだけ) に出す昨夜の取込 (対象の日の lz-daily の証跡と、ポータルの nightly_last)。読めない = null (投げない)
+ * @returns {{ target_as_of: string, last_state: string|null, rows: number|null, excluded: { count, text } } | null}
+ */
+export function lastNightOf({ dataDir, status }) {
+  try {
+    const target = status && status.clock && status.clock.expected_target_as_of;
+    if (!target) return null;
+    const nl = status.nightly_last && status.nightly_last.target_as_of === target ? status.nightly_last : null;
+    const ev = readEvidence(dataDir, target)['lz-daily'];
+    const mine = ev && !ev.error && ev.state === 'complete' && ev.as_of === target && (!nl || !nl.source_run_id || nl.source_run_id === ev.run_id) ? ev : null;
+    return { target_as_of: target, last_state: nl ? nl.last_state ?? null : null, rows: mine && mine.csv && Number.isSafeInteger(mine.csv.rows) ? mine.csv.rows : null,
+      excluded: excludedOf(mine) };
+  } catch { return null; }
+}
 
 /** 1 回の起動で共通の知らせの予算 (件数と時間。前後の送り直しとエンジンの知らせで分け合う。N5・Codex #1547 R1 Medium) */
 export function makeBudget({ perfNow = () => performance.now(), budget = BUDGET } = {}) {
@@ -128,7 +156,7 @@ export async function runNightly({ dataDir, client, checkInit, localInitFile, wi
   // 窓の外 (08:40 / 11:45) = 知らせだけ (全部)
   if (!clk.in_start_window) {
     notices.push(await sendNotices({ client, notify, budget, includePending: true }));
-    return { state: 'notify_only', ping: null, unsent: notices[0].remaining, notices };
+    return { state: 'notify_only', ping: null, unsent: notices[0].remaining, notices, last_night: lastNightOf({ dataDir, status: st0 }) };
   }
   // 窓の中: 最初は止め・要確認と止まった状態だけ (再適用待ちは最後 = 止めの知らせを先に)
   notices.push(await sendNotices({ client, notify, budget, includePending: false }));
@@ -184,7 +212,8 @@ export async function runNightly({ dataDir, client, checkInit, localInitFile, wi
   const target = clk.expected_target_as_of;
   if (st.nightly_last && st.nightly_last.target_as_of === target) return finish({ state: 'already_started', runId: st.nightly_last.run_id });
   const t = pickTarget({ dataDir, now: new Date(nowMs()), requirePass: true, asOf: target });
-  if (!t.ok) return finish({ state: 'skipped', reason: `target_${t.reason}` });
+  // 対象を使えない。不合格の理由 (fail_by) と外した行も 1 行に出す (なぜ取り込まなかったかが分かるように)
+  if (!t.ok) return finish({ state: 'skipped', reason: `target_${t.reason}`, ...(t.evidence && Array.isArray(t.evidence.fail_by) ? { fail_by: t.evidence.fail_by } : {}), excluded: excludedOf(t.evidence) });
   const ident = { source_run_id: t.evidence.run_id, target_as_of: t.asOf, csv_sha256: sha256(t.csvBuf), rows: t.evidence.csv.rows };
   let art;
   try { art = await client.getArtifact(ident.source_run_id); } catch (e) {
@@ -204,16 +233,26 @@ export async function runNightly({ dataDir, client, checkInit, localInitFile, wi
   const r = await importOneFn({ policy: POLICIES.nightly, runsDir: path.join(dataDir, 'lz-import', 'runs'), csvBuf: t.csvBuf,
     csv: { sha256: ident.csv_sha256, rows: ident.rows, target_as_of: ident.target_as_of, source_run_id: ident.source_run_id },
     context: { artifact }, now: new Date(nowMs()), localInitFile, client, checkInit, withSession, capabilities, notify: engineNotify, createGuard, log, perfNow, ...minRows });
-  return finish({ state: 'imported', runId: r.runId, result: r.state });
+  return finish({ state: 'imported', runId: r.runId, result: r.state, rows: ident.rows, excluded: excludedOf(t.evidence) });
 }
 
 /** 回の結末 → 終了コードと 1 行 */
 export function summarize(r) {
   const tail = r.unsent ? `・未送の知らせ ${r.unsent} 件` : '';
-  if (r.ping === 'ok') return { code: EXIT.ok, line: `✅ ${LABEL}: ${r.state === 'verify_again' ? '前の夜の回の確かめのやり直し' : '取込'} verified (${r.runId})` };
-  if (['notify_only', 'already', 'running', 'already_started'].includes(r.state)) return { code: EXIT.ok, line: `ℹ ${LABEL}: ${r.state}${r.runId ? ` (${r.runId})` : ''}${tail}` };
+  // 取り込んだ件数と外した行 (やさしい 1 文)
+  const n = (x) => Number(x).toLocaleString('en-US');
+  const ex = r.excluded && r.excluded.text ? `・${r.excluded.text}` : '';
+  const rows = Number.isSafeInteger(r.rows) ? `・${n(r.rows)} 件を取り込んだ` : '';
+  if (r.ping === 'ok') return { code: EXIT.ok, line: `✅ ${LABEL}: ${r.state === 'verify_again' ? '前の夜の回の確かめのやり直し' : '取込'} verified (${r.runId})${r.state === 'imported' ? `${rows}${ex}` : ''}` };
+  if (r.state === 'notify_only') {
+    const ln = r.last_night;
+    const last = ln ? `・昨夜の取込 (対象 ${ln.target_as_of}) = ${ln.last_state || '始めていない'}${ln.last_state === 'verified' && Number.isSafeInteger(ln.rows) ? `・${n(ln.rows)} 件` : ''}${ln.excluded && ln.excluded.text ? `・${ln.excluded.text}` : ''}` : '';
+    return { code: EXIT.ok, line: `ℹ ${LABEL}: notify_only (知らせの送り直しだけ)${last}${tail}` };
+  }
+  if (['already', 'running', 'already_started'].includes(r.state)) return { code: EXIT.ok, line: `ℹ ${LABEL}: ${r.state}${r.runId ? ` (${r.runId})` : ''}${tail}` };
   if (r.state === 'imported' || r.state === 'verify_again') return { code: EXIT.skipped, line: `⏭️ ${LABEL}: ${r.state} = ${r.result}${r.reason ? ` (${r.reason})` : ''} (${r.runId})${tail}` };
-  return { code: EXIT.skipped, line: `⏭️ ${LABEL}: しない (${r.state}${r.reason ? `・${r.reason}` : ''}${r.codes ? `・${r.codes.join(',')}` : ''})${tail}` };
+  const fb = Array.isArray(r.fail_by) && r.fail_by.length ? `・${r.fail_by.join(',')}` : '';
+  return { code: EXIT.skipped, line: `⏭️ ${LABEL}: しない (${r.state}${r.reason ? `・${r.reason}` : ''}${fb}${r.codes ? `・${r.codes.join(',')}` : ''})${ex}${tail}` };
 }
 
 /**

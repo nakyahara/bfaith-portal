@@ -112,8 +112,10 @@ const CONTEXTS = Object.freeze({
       const preCheck = (lz) => {
         const pc = precheck({ csvBuf, lz });
         return pc.ok ? null : {
-          stage: ['precheck_failed', { missing: pc.missing.slice(0, 50), missing_count: pc.missing.length, deleted: pc.deleted.slice(0, 50), deleted_count: pc.deleted.length }],
-          error: `CSV の商品がロジザードに無い・削除 = 押さない (L-7): 無い ${pc.missing.length} 件・削除 ${pc.deleted.length} 件 (${[...pc.missing, ...pc.deleted].slice(0, 5).join(', ')})`,
+          stage: ['precheck_failed', { missing: pc.missing.slice(0, 50), missing_count: pc.missing.length, deleted: pc.deleted.slice(0, 50), deleted_count: pc.deleted.length,
+            case_variants: pc.case_variants.slice(0, 50), case_variants_count: pc.case_variants.length }],
+          // 🆕 大文字小文字だけ違う別の ID が直前の書き出しにある = 別の商品を書き換えるおそれ = 押さない (2026-10-21・外した行の導入と一緒に)
+          error: `CSV の商品がロジザードに無い・削除・大文字小文字ちがいの別の ID がある = 押さない (L-7): 無い ${pc.missing.length} 件・削除 ${pc.deleted.length} 件・大文字小文字ちがい ${pc.case_variants.length} 件 (${[...pc.missing, ...pc.deleted, ...pc.case_variants].slice(0, 5).join(', ')})`,
         };
       };
       return { tag: {}, recExtra: { artifact: a.source_run_id }, notifyTail: `・対象 ${a.target_as_of}`, preCheck, extraIds: [] };
