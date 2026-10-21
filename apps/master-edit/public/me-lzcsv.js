@@ -135,11 +135,23 @@
       var s = (S.byExport || {})[e.id] || null;
       var last = s && s.last;
       cell.textContent = '';
-      var top = el('div', null, [last ? el('span', { cls: 'b ' + (badgeOf[last.state] || 'mute'), 'data-bc-state': last.state, text: last.state_words }) : el('span', { cls: 'hint', 'data-bc-state': 'none', text: 'まだ取り込んでいない' })]);
+      // 🆕 2026-10-21 CSV の商品が全部ロジザードの写しにある = 手で取り込み済み (ボタンで取り込むと 2 回登録になる = ボタンを出さない・ポータルも断る)
+      //   ボタンで取り込んだ・動いている・分からない回がある CSV は今までどおり (押す前に止めた回だけ = ボタンでは取り込んでいない)
+      var inLzAll = e.in_lz_total > 0 && e.in_lz === e.in_lz_total;
+      var viaBtn = !!(s && (s.imported_job || s.active_job || s.unresolved_job));
+      var manual = inLzAll && !viaBtn;
+      var partly = !inLzAll && e.in_lz > 0 && !viaBtn;
+      var top = el('div', null, [manual ? el('span', { cls: 'b ok', 'data-bc-state': 'in_lz', text: 'ロジザードにもうあります (手で取り込み済み)' })
+        : last ? el('span', { cls: 'b ' + (badgeOf[last.state] || 'mute'), 'data-bc-state': last.state, text: last.state_words })
+          : el('span', { cls: 'hint', 'data-bc-state': 'none', text: 'ボタンではまだ' })]);
+      if (manual && last) top.appendChild(el('div', { cls: 'hint', text: 'ボタンの最後の回: ' + last.state_words }));
       if (last && last.state === 'unknown' && last.resolved_outcome) top.appendChild(el('span', { cls: 'hint', text: ' → 確かめ: ' + (last.resolved_outcome === 'imported' ? '取り込んだ' : '取り込んでいない') }));
       cell.appendChild(top);
       if (s && s.downloads) cell.appendChild(el('div', { cls: 'hint', 'data-bc-dl': s.downloads, text: 'ダウンロード ' + s.downloads + ' 回' }));
+      if (partly) cell.appendChild(el('div', { cls: 'hint', 'data-bc-inlz': e.id, text: 'ロジザードに ' + e.in_lz + ' / ' + e.in_lz_total + ' 件もうあります。取り込むと 2 回登録になるので、ボタンでは取り込みません (取り消して作り直す)' }));
       if (!CAN || e.state !== 'issued') return;
+      if (manual || partly) return;
+      if (e.in_lz_collide > 0) { cell.appendChild(el('div', { cls: 'hint', 'data-bc-collide': e.id, text: 'ロジザードに大文字小文字だけ違う商品ID が ' + e.in_lz_collide + ' 件あります (別の商品になるおそれ)。ボタンでは取り込みません' })); return; }
       // 取り込めたか分からない回は、その CSV の行でも記せる (下の③に出るのは最後の回だけ。Codex R1 Medium)
       if (s && s.unresolved_job) cell.appendChild(resolveForm({ job_id: s.unresolved_job }, 'cell'));
       if (s && s.active_job) {
@@ -170,7 +182,9 @@
     var again = !!(s && s.imported_job);
     var legacy = !!LEGACY[e.id];
     var dl = (s && s.downloads > 0) || legacy;
-    var withExp = el('input', { type: 'checkbox', checked: true, id: 'bc-exp-' + e.id });
+    // ② は、できると分かっているとき (miniPC が新しい・ポータルが共有ドライブに書ける) だけ既定で入れる。できない = 外して押せない + 理由 1 行
+    var EX = S.export || { ok: false, message: '② (バーコードマスタの書き出し) は、できるか分からないので、しません。今までどおり Stream Deck で書き出してください' };
+    var withExp = el('input', { type: 'checkbox', checked: !!EX.ok, disabled: !EX.ok, id: 'bc-exp-' + e.id });
     var notManual = dl ? el('input', { type: 'checkbox', id: 'bc-nm-' + e.id }) : null;
     var reason = again ? el('textarea', { rows: '2', maxlength: '200', id: 'bc-rr-' + e.id, placeholder: '例: ロジザードで商品を消したので入れ直す (4〜200 字)', style: 'width:100%' }) : null;
     var go = el('button', { cls: 'btn pri sm', type: 'button', 'data-bc-go': e.id, text: again ? 'もう一度取り込む' : '取り込む' });
@@ -178,8 +192,9 @@
     var line = el('div', { cls: 'msgline', 'data-bc-form-msg': e.id, role: 'status' });
     var box = el('div', { cls: 'callout info' }, [el('div', { cls: 'grow' }, [
       el('div', { cls: 't', text: 'CSV #' + e.id + ' (' + e.rows + ' 件) を miniPC がロジザードに取り込みます' }),
-      el('div', { cls: 'hint', text: '① インポート [商品マスタ / 新商品バーコード登録] にこの CSV そのもの (帳面のファイル・sha256 を確かめる) → ② (印があれば) バーコード情報を書き出してバーコードマスタ.csv を上書き。1〜2 分かかります。' }),
+      el('div', { cls: 'hint', text: '① インポート [商品マスタ / 新商品バーコード登録] にこの CSV そのもの (帳面のファイル・sha256 を確かめる) → ② (印があれば) バーコード情報を書き出して、共有ドライブのバーコードマスタ.csv を上書き。1〜2 分かかります。' }),
       el('label', null, [withExp, ' ② バーコードマスタ.csv も書き出す']),
+      EX.ok ? null : el('div', { cls: 'hint', 'data-bc-exp-why': e.id, text: EX.message }),
       notManual ? el('div', null, [el('label', null, [notManual, legacy && !(s && s.downloads > 0) ? ' この CSV はボタンができる前に作りました (ダウンロードしたかポータルでは分からない)。手でロジザードに取り込んでいないことを確かめた' : ' この CSV はダウンロードされています。手でロジザードに取り込んでいないことを確かめた'])]) : null,
       again ? el('div', null, [el('div', { cls: 'hint', text: 'この CSV はもう取り込みました (#' + s.imported_job + ')。もう一度取り込むとロジザードに 2 回登録されることがあります。理由:' }), reason]) : null,
       el('div', { style: 'margin-top:6px' }, [go, ' ', stop]), line,
@@ -266,6 +281,14 @@
       rn.appendChild(document.createTextNode(' 最後 ' + when(S.runner && S.runner.seen_at) + (S.runner && S.runner.busy ? ' · ' + (S.runner.busy === 'night' ? '夜なので取らない' : '忙しい: ' + S.runner.busy) : '')));
       if (S.night && S.night.enqueue) rn.appendChild(el('div', { cls: 'hint', 'data-bc-night': '1', text: P.nightWords }));
       if (BLOCK) rn.appendChild(el('div', { cls: 'hint', 'data-bc-block': BLOCK.code, text: BLOCK.message }));
+    }
+    var ex = $('#lzc-bc-export');
+    if (ex) {
+      // ② の書く先 (共有ドライブ) の様子・最後に書いた回
+      ex.textContent = '';
+      var X = S.export || null, D = S.drive_last || null;
+      if (X) ex.appendChild(el('div', { 'data-bc-export': X.ok ? 'ok' : (X.code || 'ng'), text: X.ok ? '② 共有ドライブのバーコードマスタ.csv に書けます' + (X.drive_modified ? ' (今のファイル ' + X.drive_modified + ')' : '') : X.message }));
+      if (D) ex.appendChild(el('div', { 'data-bc-drive-last': D.job_id, text: '② 最後に書いた: ' + when(D.at) + (D.rows != null ? ' · ' + D.rows + ' 行' : '') + ' · 取り込み #' + D.job_id }));
     }
     var lt = $('#lzc-bc-latest');
     if (lt) {

@@ -8,10 +8,13 @@
  *      ほかの定時の前後 (毎時 :50〜:02 = 在庫の毎時の取込・08:26〜08:34 = 値札の CSV)・ロジザードの ID が無い = 「忙しい」と言うだけ (取らない。待ちは 15 分まで残る)
  *   2. 渡されたファイルを確かめる: sha256 が帳面と同じ・Shift-JIS で厳密に読める・見出しがロジザード登録の CSV (8 列) と同じ・行数が帳面と同じ。
  *      この PC で同じ中身を前に取り込んだ (logs\barcode_imported.json の import1) = 「もう一度」でなければ押さない
- *   3. ブラウザでロジザードを開いていない・② の保存先がある → セッションの鍵 (共通 = 毎晩の取込・在庫・値札と同じ) → ログイン (共通アカウント)
+ *   3. ブラウザでロジザードを開いていない → セッションの鍵 (共通 = 毎晩の取込・在庫・値札と同じ) → ログイン (共通アカウント)
  *   4. ① 取込 [PM07/FM07_01] 商品マスタ / 新商品バーコード登録 (barcode-steps.js = auto-barcode.js と同じ手順・同じ守り)。
  *      **実行ボタンを押す直前にポータルへ「押す」**を知らせる。断られた・届かない = 押さない
- *   5. ① の結果 (総件数・エラー件数) を知らせる → (ボタンで選んだとき) ② 書き出し [PM08/FM08_01] → バーコードマスタ.csv (検証 NG = 前のまま)
+ *   5. ① の結果 (総件数・エラー件数) を知らせる → (ボタンで選んだとき) ② 書き出し [PM08/FM08_01] → この PC の work\bc-import\job-N\barcode_master.csv (検証 NG = 置かない)
+ *      → ロジザードを閉じた後、そのファイルをポータルに送る (POST /jobs/:id/export-file) → ポータルが確かめて共有ドライブのバーコードマスタ.csv を上書き。
+ *      (2026-10-21〜。miniPC には共有ドライブ G: が無い。前は G: に書く道で、G: が無いと ① も押さずに止まっていた)
+ *      ② ができなくても (ポータルが Drive に書けない・送れない) ① は取り込んだまま (② は「書けなかった」)
  *   6. 終わりの知らせ (ログつき)。届かない = logs\bc-import-pending\ に残して次の回に送る
  * 分け方 (ポータルの帳面の状態):
  *   「押す」の前に止まった = not_executed (取り込んでいない)・① の結果がエラー / 件数が合わない = import_error・押した後に分からない = unknown (人が履歴で確かめる)
@@ -19,7 +22,7 @@
  *
  * 使い方: node bc-import-runner.js          (定時から。何も無ければすぐ終わる)
  * env (このフォルダの .env): LOGIZARD_USER_ID / LOGIZARD_PASSWORD (共通アカウント)・LZ_BC_RUNNER_TOKEN・LZ_BC_PORTAL_URL (任意)・
- *   LOGIZARD_BC_OUT (② の保存先・既定 G:\共有ドライブ\入荷バーコード発行\バーコードマスタ.csv)・LOGIZARD_BC_EXPORT_DAYS・LOGIZARD_BC_MIN_ROWS・LOGIZARD_HEADLESS
+ *   LOGIZARD_BC_EXPORT_DAYS・LOGIZARD_BC_MIN_ROWS・LOGIZARD_HEADLESS
  * 終了コード: 0 = 何も無い / 回を終えた (結果はポータルに)・1 = ポータルに届かない・設定の誤り
  */
 import fs from 'fs';
@@ -29,7 +32,7 @@ import { spawnSync } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { checkImportCsvBytes, LZ_BC_HEADER } from './barcode-steps.js';
 
-export const VERSION = 'bc-runner-v1';
+export const VERSION = 'bc-runner-v2';   // v2 = ② をポータルに送る (claim で export_upload: true と言う)
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const sha256 = (b) => crypto.createHash('sha256').update(b).digest('hex');
 const LOCK_STALE_MS = 30 * 60 * 1000;
@@ -158,14 +161,34 @@ export function tailBytes(s, max) {
 }
 
 /**
+ * ② の書き出し (この PC の作業用フォルダのファイル) をポータルに送る → ポータルが共有ドライブに書く。例外は投げない (① は取り込んだまま)
+ * @returns {Promise<{ status: 'ok' | 'failed', rows: number | null, detail: string | null }>}
+ */
+async function sendExport(client, job, token, file) {
+  let buf;
+  try { buf = fs.readFileSync(file); } catch (e) { return { status: 'failed', rows: null, detail: `② のファイルが無い (${e && e.code})` }; }
+  console.log(`📤 ② のファイルをポータルに送る (${Math.round(buf.length / 1024)} KB) → 共有ドライブのバーコードマスタ.csv に書いてもらう`);
+  let r;
+  try { r = await client.uploadExport(job.job_id, { claim_token: token, file_b64: buf.toString('base64'), sha256: sha256(buf) }); } catch (e) {
+    console.log(`⚠ ② のファイルをポータルに送れない (${e && e.code}: ${e && e.message})`);
+    return { status: 'failed', rows: null, detail: `② のファイルをポータルに送れない: ${String((e && e.message) || e).slice(0, 200)}` };
+  }
+  const x = (r && r.export) || {};
+  const out = { status: x.status === 'ok' ? 'ok' : 'failed', rows: Number.isInteger(x.rows) ? x.rows : null, detail: typeof x.detail === 'string' ? x.detail.slice(0, 280) : null };
+  console.log(out.status === 'ok' ? `✅ ② ${out.detail || '共有ドライブに書いた'} (${out.rows ?? '?'} 行)` : `⚠ ② ${out.detail || '書けなかった'}`);
+  if (out.status === 'ok') { try { fs.unlinkSync(file); } catch { /* 残っても次の回には使わない */ } }
+  return out;
+}
+
+/**
  * 1 回分。ロジザードの画面の操作は session (試験で差し替える)。
  * @param {object} p
  * @param {{ claim, executing, reportImport, final }} p.client  ポータルの機械の口 (bc-import-client.js)
  * @param {string} p.logDir   このフォルダの logs (鍵・pending・取込済みの記録)
  * @param {string} p.workDir  ファイルを置く所 (このフォルダの work\bc-import)
  * @param {() => string | null} p.localBusy  取らない理由 (null = 取ってよい)
- * @param {(job) => string | null} [p.afterClaimCheck]  取った後・押す前の確かめ (ブラウザでロジザードが開いている・② の保存先が無い など)。理由 = 押さない
- * @param {(o: { csvPath, withExport, beforeExecute, onImported, pressGuard }) => Promise<{ export: object | null }>} p.session  ロジザード (① ②)
+ * @param {(job) => string | null} [p.afterClaimCheck]  取った後・押す前の確かめ (セッションの鍵 など)。理由 = 押さない
+ * @param {(o: { csvPath, withExport, exportOut, beforeExecute, onImported, pressGuard }) => Promise<{ export: object | null }>} p.session  ロジザード (① ②)。② は exportOut に置く
  * @param {{ read: () => object, record: (info) => void }} p.imported  この PC の取込済みの記録 (logs\barcode_imported.json の import1)
  */
 export async function runOnce({ client, logDir, workDir, localBusy, afterClaimCheck = () => null, session, imported, runnerId = 'minipc', now = () => Date.now(), log = console.log, sleep, onExitHook = (f) => process.once('exit', f), offExitHook = (f) => process.removeListener('exit', f) }) {
@@ -173,7 +196,7 @@ export async function runOnce({ client, logDir, workDir, localBusy, afterClaimCh
   if (!(await flushPending(client, pendingDir, log))) return { state: 'pending_unsent' };
   const busy = localBusy();
   let r;
-  try { r = await client.claim({ runner_id: runnerId, version: VERSION, busy }); } catch (e) {
+  try { r = await client.claim({ runner_id: runnerId, version: VERSION, busy, export_upload: true }); } catch (e) {
     log(`❌ ポータルに届かない・断られた (${e && e.code}: ${e && e.message})`);
     return { state: 'portal_error', error: e };
   }
@@ -218,8 +241,9 @@ export async function runOnce({ client, logDir, workDir, localBusy, afterClaimCh
     const csvPath = path.join(dir, String(job.file_name || 'logizard_bc_upload.csv').replace(/[^\w.\-]/g, '_'));
     fs.writeFileSync(csvPath, buf, { flag: 'wx' });
     if (sha256(fs.readFileSync(csvPath)) !== job.file_sha256) { const e = new Error('置いたファイルの sha256 が違う'); e.code = 'file_check'; throw e; }
+    const exportOut = path.join(dir, 'barcode_master.csv');
     const out = await session({
-      csvPath, withExport: !!job.with_export, pressGuard,
+      csvPath, withExport: !!job.with_export, exportOut, pressGuard,
       beforeExecute: async () => {
         const t0 = now();
         const t0Real = Date.now();
@@ -247,9 +271,9 @@ export async function runOnce({ client, logDir, workDir, localBusy, afterClaimCh
       },
     });
     if (!body.import_result) throw new Error('① の結果が無いまま終わった');
-    body.export_result = job.with_export
-      ? (out && out.export && out.export.status === 'SUCCESS' ? { status: 'ok', rows: out.export.rows ?? null, detail: null } : { status: 'failed', rows: null, detail: '② の結果が無い' })
-      : { status: 'skipped', rows: null, detail: null };
+    if (!job.with_export) body.export_result = { status: 'skipped', rows: null, detail: null };
+    else if (out && out.export && out.export.status === 'SUCCESS') body.export_result = await sendExport(client, job, token, exportOut);
+    else body.export_result = { status: 'failed', rows: null, detail: '② の結果が無い' };
     console.log(`🎉 終わり: ① ${body.import_result.summary || ''}${job.with_export ? ` / ② ${body.export_result.status}` : ''}`);
   } catch (e) {
     const msg = String((e && e.message) || e).slice(0, 280);
@@ -331,7 +355,7 @@ async function main() {
     exportPattern: process.env.LOGIZARD_BC_EXPORT_PATTERN || 'バーコード情報',
     exportDays: common.requireIntEnv('LOGIZARD_BC_EXPORT_DAYS', 30, { min: 1, max: 365 }),
     minRows: common.requireIntEnv('LOGIZARD_BC_MIN_ROWS', 1, { min: 0, max: 10000000 }),
-    exportOut: (process.env.LOGIZARD_BC_OUT || 'G:\\共有ドライブ\\入荷バーコード発行\\バーコードマスタ.csv').trim(),
+    // ② の置き場所は回ごと (work\bc-import\job-N\barcode_master.csv)。共有ドライブにはポータルが書く (この PC は G: に書かない)
   };
   const pattern = process.env.LOGIZARD_BC_IMPORT1_PATTERN || IMPORT1_PATTERN_DEFAULT;
   const headless = (process.env.LOGIZARD_HEADLESS || '0') === '1';
@@ -349,13 +373,9 @@ async function main() {
     if (!process.env.LOGIZARD_USER_ID || !process.env.LOGIZARD_PASSWORD) return 'no_credentials (.env の LOGIZARD_USER_ID / PASSWORD)';
     return sessionLockBusy(logDir);
   };
-  const afterClaimCheck = (job) => {
-    if (job.with_export && !fs.existsSync(path.dirname(cfg.exportOut))) return `② の保存先フォルダが無い (${path.dirname(cfg.exportOut)})。② なしで押すか、共有ドライブを確かめる`;
-    const lockWhy = sessionLockBusy(logDir);
-    if (lockWhy) return lockWhy;
-    return null;
-  };
-  const session = async ({ csvPath, withExport, beforeExecute, onImported, pressGuard }) => {
+  // ② の保存先 (共有ドライブ) の有無では止めない (② はポータルが書く。2026-10-21 ② の保存先が無くて ① も押さずに止まった)
+  const afterClaimCheck = () => sessionLockBusy(logDir);
+  const session = async ({ csvPath, withExport, exportOut, beforeExecute, onImported, pressGuard }) => {
     common.assertNoLogizardBrowserOpen();   // 開いている = その場で終わる (押していない・終わりの知らせは pending に残る)
     common.acquireLock();   // 共通の鍵 (毎晩の取込・在庫・値札と同じ)。取れない = その場で終わる (押していない)
     const releaseOnExit = () => { try { common.releaseLock(); } catch { /* */ } };
@@ -363,7 +383,7 @@ async function main() {
     try {
       const { browser, page } = await common.launchBrowser({ headless });
       try {
-        const steps = createBarcodeSteps({ page, dry: false, cfg, beforeExecute, pressGuard });
+        const steps = createBarcodeSteps({ page, dry: false, cfg: { ...cfg, exportOut }, beforeExecute, pressGuard });
         const loginOpts = () => ({ label: 'ボタンの取込 (共通アカウント)', beforeSubmit: () => mode.clickBudgetMs('ログインのボタンの前') });
         const withRelogin = makeWithRelogin({ page, loginOpts });
         mode.assertOutsideNightBlock('ログインの前');

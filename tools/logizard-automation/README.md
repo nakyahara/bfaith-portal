@@ -87,6 +87,10 @@ node tools/logizard-automation/deploy.mjs --pc minipc --check   # 写したも�
 - 鍵: ロジザードのセッションの鍵 `logs\logizard-session.lock` (毎晩の取込・在庫・値札と共用)。使われている間は取らない (画面に「忙しい」)。鍵があると待たずに終わる定時の前後も取らない (毎時 :50〜:02 = 在庫の毎時の取込・08:26〜08:34 = 値札の CSV)。自分の二重起動は `logs\bc-import-runner.lock`。
 - 夜: miniPC は JST 23:50〜01:30 は取らない (ポータルは 23:45 から積まない・23:50 から渡さない / 押させない)。auto-barcode.js の夜の止め (00:00〜01:30) も barcode-steps.js の中でそのまま効く。
 - この PC で同じ中身を前に取り込んだ (`logs\barcode_imported.json` の import1・auto-barcode.js と同じ記録) = 画面で「もう一度」(理由) を選んでいなければ押さない。ボタンで取り込んだら同じ記録に書く (miniPC の CLI も同じ中身を飛ばす)。
+- **② (バーコードマスタの書き出し) はポータルが共有ドライブに書く** (2026-10-21〜・miniPC には G: が無い)。miniPC は ② を `work\bc-import\job-<番号>\barcode_master.csv` に置き、ロジザードを閉じた後に `POST /apps/lz-bc-import/api/jobs/<番号>/export-file` で送る →
+  ポータル (`apps/lz-bc-import/drive-export.js`) が中身を確かめて (Shift_JIS のまま・見出し 商品ID / バーコード・4,000 行以上・今のファイルの半分より小さくない)、共有ドライブ「入荷バーコード発行」の `バーコードマスタ.csv` (同じファイル ID) を上書き。
+  ポータルが書けない (Render の env `LZ_BC_DRIVE_WRITE=1` が無い・サービスアカウントが閲覧者のまま) = 画面の ② の印が外れて押せない (① だけ)。② が書けなくても ① は取り込んだまま。
+  claim で `export_upload: true` と言わない古い runner (v1) には、ポータルが ② の印を外して渡す (① だけ)。
 - 終わりの知らせが届かない = `logs\bc-import-pending\job-<番号>.json` に残し、次の回が先に送る (送れるまで新しい回は取らない)。
 - 台帳 = `config/jobs-registry.mjs` の `lz-bc-import-runner` (heartbeat・1 時間に 1 回 `ping.ps1`)。
 
@@ -102,7 +106,7 @@ node tools/logizard-automation/deploy.mjs --pc minipc --check   # 写したも�
    node tools/logizard-automation/deploy.mjs --pc minipc --check
    ```
    (写すあいだはセッションの鍵を deploy.mjs が持つ = 00:20 / 08:40 / 08:50 / 11:45 と毎時 00 分を避ける)
-4. miniPC の `C:\tools\logizard-automation\.env` に `LZ_BC_RUNNER_TOKEN=<1 と同じ値>` を足す (中原さんが入れる)。ほかは今の値のまま (`LOGIZARD_USER_ID` / `LOGIZARD_PASSWORD` = 共通アカウント・`LOGIZARD_HEADLESS`・`LOGIZARD_BC_OUT` の既定 = `G:\共有ドライブ\入荷バーコード発行\バーコードマスタ.csv`)。
+4. miniPC の `C:\tools\logizard-automation\.env` に `LZ_BC_RUNNER_TOKEN=<1 と同じ値>` を足す (中原さんが入れる)。ほかは今の値のまま (`LOGIZARD_USER_ID` / `LOGIZARD_PASSWORD` = 共通アカウント・`LOGIZARD_HEADLESS`)。ボタンの道は `LOGIZARD_BC_OUT` を使わない (② はポータルが共有ドライブに書く・Stream Deck の auto-barcode.js は今までどおり)。
 5. 手で 1 回: `cd C:\tools\logizard-automation` → `node bc-import-runner.js` (待ちが無い = 何も出さずに 0 で終わる)。画面の「③ ロジザードへの取り込み」が「miniPC: 来ている」になる。
 6. 定時を作る (定時 `Logizard-NyukaCSV` と同じユーザー・「ログオンしているときだけ」= 共有ドライブ G: が見える形):
    ```

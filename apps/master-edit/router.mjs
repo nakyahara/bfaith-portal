@@ -177,10 +177,11 @@ import { brandLifeReady, brandLifeTablesExist, readBrands, createBrand, setBrand
   BRAND_NAME_MAX, LIFE_STAGES, LIFE_FILTERS, END_SOON_DAYS } from '../../lib/master-brand-life.mjs';
 // 🆕 0090 表示の項目 (原産国・内容量・メーカー型番・消費期限の目安・Company DB構想 27 ④-1)
 import { readLabelView, labelReady, defaultPhLabelLookup, COUNTRY_SUGGEST, NET_UOMS } from '../../lib/master-label.mjs';
-import { lzListStale, lzNewCandidates, issueLzNewExport, lzNewExports, lzNewExportFile, voidLzNewExport, LZ_HOLD_WORDS, LZ_LIST_FRESH_HOURS } from '../../lib/lz-new-export.mjs';
+import { lzListStale, lzNewCandidates, issueLzNewExport, lzNewExports, lzNewExportFile, voidLzNewExport, lzExportsInMirror, LZ_HOLD_WORDS, LZ_LIST_FRESH_HOURS } from '../../lib/lz-new-export.mjs';
 // 🆕 2026-10-17「ロジザードに取り込む」ボタン (miniPC が取りに来て ① 取込 → ② 書き出し。帳面 = Render の SQLite・apps/lz-bc-import)
 import * as BC from '../lz-bc-import/store.js';
 import { importStateBlock } from '../lz-bc-import/lz-state.js';
+import { getDriveTarget, exportAvailability, jstOf as driveJst } from '../lz-bc-import/drive-export.js';
 
 /**
  * 注文残 (発注アプリの台帳 = 仕入先・発注日・数・納期) を見せてよいか = 発注アプリの利用権もある人だけ (#1620 Codex R1 M3)。
@@ -281,6 +282,17 @@ export function __setLzMirrorProvider(fn) { lzMirrorProvider = fn || defaultLzMi
 /** 🆕「ロジザードに取り込む」: ロジザードの毎日の商品マスタの取込の状態の止め (試験で差し替える) */
 let lzBcImportBlock = importStateBlock;
 export function __setLzBcImportBlock(fn) { lzBcImportBlock = fn || importStateBlock; }
+/** 🆕 ② の書く先 (共有ドライブのバーコードマスタ.csv・apps/lz-bc-import/drive-export.js。試験は __setDriveTarget で差し替える) */
+const bcDriveTarget = () => getDriveTarget();
+/** 書けるか (覚えている答え・古い = 確かめ直す)。確かめられない = 書けない側 */
+async function bcDriveStatus() {
+  try { return await bcDriveTarget().status(); } catch (e) { return { ok: false, code: 'unreachable', message: `Google Drive を確かめられない (${String(e && e.message).slice(0, 120)})` }; }
+}
+/** 画面の ② の印: { ok, code, message, drive_ok, drive_modified (JST の表示) } */
+function bcExportView(runner, drive) {
+  const a = exportAvailability(runner, drive);
+  return { ...a, drive_ok: !!(drive && drive.ok), drive_modified: drive && drive.ok ? driveJst(drive.modified_time) : null };
+}
 /** 🆕「ロジザードに取り込む」の帳面の時計 (夜の止め・期限。試験は機械の口と同じ時計を渡す・ほかの画面の時計は変えない) */
 let bcClock = () => clock();
 export function __setLzBcClock(fn) { bcClock = fn || (() => clock()); }
@@ -2275,6 +2287,15 @@ router.get('/lz-csv', (req, res) => withPgPage(req, res, async (db, dbError) => 
     bc = BC.screenStatus(BC.getLzBcDb(), { now: bcClock(), exportIds: exports.map((e) => e.id) });
     for (const e of exports) if (bc.byExport[e.id]) bc.byExport[e.id].legacy = BC.legacyExport(BC.getLzBcDb(), createdMs.get(e.id));
   } catch (e) { console.error(`[master-edit] 取り込みの帳面を読めない: ${e && e.message}`); bcError = '取り込みの帳面 (Render の lz-bc-import.db) を読めません'; }
+  // 🆕 2026-10-21 ② (バーコードマスタ → 共有ドライブ) ができるか (miniPC が新しい・ポータルが Drive に書ける)
+  if (bc) bc.export = bcExportView(bc.runner, await bcDriveStatus());
+  // 🆕 CSV の商品がロジザードの写しにもうあるか (手で取り込んだ CSV = ボタンで 2 回登録しない)
+  if (db && exports.length) {
+    try {
+      const m = await lzExportsInMirror(db, mirror, exports.map((e) => e.id));
+      for (const e of exports) { const x = m.get(String(e.id)); e.in_lz = x ? x.in_lz : null; e.in_lz_total = x ? x.total : null; e.in_lz_collide = x ? x.collide : null; }
+    } catch (e) { console.error(`[master-edit] CSV の商品とロジザードの写しを照らせない: ${e && e.message}`); }
+  }
   res.render(view('lz-csv.ejs'), {
     ...pageLocals(req, phase), nav: 'lzcsv', ui2: true, dbError, cands, exports, canApprove: gate.ok, approveMessage: gate.message || '',
     mirror: { ok: mirror.ok, reason: mirror.reason, list_as_of: mirror.list_as_of, bc_as_of: mirror.bc_as_of, rows: mirror.rows, stale: mirror.ok && lzListStale(mirror, clock()) },
@@ -2366,7 +2387,7 @@ router.get('/api/lz-csv/import-status', (req, res) => {
   const ids = String(req.query.ids || '').split(',').map((s) => s.trim()).filter((s) => /^[1-9]\d{0,17}$/.test(s)).slice(0, 60);
   try {
     const st = BC.screenStatus(BC.getLzBcDb(), { now: bcClock(), exportIds: ids });
-    res.json({ ok: true, ...st, block: lzBcImportBlock(bcClock()), can_import: lzImportGate(req).ok });
+    res.json({ ok: true, ...st, export: bcExportView(st.runner, bcDriveTarget().peek()), block: lzBcImportBlock(bcClock()), can_import: lzImportGate(req).ok });
   } catch (e) { bcErrorBody(res, e); }
 });
 router.post('/api/lz-csv/:id/import', (req, res) => {
@@ -2383,10 +2404,28 @@ router.post('/api/lz-csv/:id/import', (req, res) => {
     if (!f) return res.status(404).json({ ok: false, error: 'ファイルがありません', reason: 'not_found' });
     const meta = (await db.query('select row_count, (extract(epoch from created_at) * 1000)::float8 as created_ms from ops.lz_new_exports where export_id = $1', [f.id])).rows[0] || {};
     const rows = meta.row_count;
+    // 🆕 CSV の商品が全部ロジザードの写しにある = 手で取り込み済み = 積まない。
+    //   飛ばすのは、帳面にボタンで取り込んだ回がある CSV だけ (その「もう一度」は帳面が理由を求める。理由の欄の有無では決めない = Codex R1 High)
+    //   大文字小文字だけ違う商品ID がロジザードにある = いつも積まない (別の商品として登録されるおそれ)
+    {
+      let viaButton = false;
+      try { viaButton = !!BC.exportImportState(BC.getLzBcDb(), f.id).imported; } catch { /* 帳面が読めない = 下の enqueue が断る */ }
+      const mirror = await lzMirrorProvider();
+      const x = (await lzExportsInMirror(db, mirror, [f.id])).get(String(f.id));
+      if (x && x.collide > 0) return res.status(409).json({ ok: false, error: `この CSV の商品のうち ${x.collide} 件は、ロジザードに大文字小文字だけ違う商品ID があります。別の商品として登録されるおそれがあるので積みません (ロジザードで確かめる)`, reason: 'lz_case_collision' });
+      // 一部でもある = その商品が 2 回登録になる = 積まない (取り消して作り直すと、まだ無い商品だけの CSV になる。Codex R2 High)
+      if (!viaButton && x && x.total > 0 && x.in_lz === x.total) return res.status(409).json({ ok: false, error: 'この CSV の商品は全部ロジザードにもうあります (手で取り込み済み)。取り込むと 2 回登録になるので積みません', reason: 'already_in_lz' });
+      if (!viaButton && x && x.in_lz > 0) return res.status(409).json({ ok: false, error: `この CSV の商品のうち ${x.in_lz} / ${x.total} 件はロジザードにもうあります。取り込むとその商品が 2 回登録になるので積みません (CSV を取り消して作り直すと、まだ無い商品だけになります)`, reason: 'partly_in_lz' });
+    }
+    // 🆕 ② は、miniPC が新しい・ポータルが共有ドライブに書けるときだけ (できない = ① だけ積む。画面も印を外して押せない)
+    let withExport = b.with_export !== false;
+    if (withExport) {
+      try { withExport = bcExportView(BC.runnerView(BC.getLzBcDb(), bcClock()), await bcDriveStatus()).ok; } catch { withExport = false; }
+    }
     try {
       const r = BC.enqueue(BC.getLzBcDb(), {
         requestId: rid, exportId: f.id, exportState: f.state, fileSha256: f.file_sha256, textSha256: f.text_sha256, seenTextSha256: String(b.text_sha256), rows: Number(rows), exportCreatedMs: Number(meta.created_ms),
-        withExport: b.with_export !== false, by: String(req.session.email).trim().toLowerCase(), rerunReason: b.rerun_reason ?? null, confirmNotManual: b.confirm_not_manual === true,
+        withExport, by: String(req.session.email).trim().toLowerCase(), rerunReason: b.rerun_reason ?? null, confirmNotManual: b.confirm_not_manual === true,
         importBlock: lzBcImportBlock(bcClock()), now: bcClock(),
       });
       res.json({ ok: true, ...r });
