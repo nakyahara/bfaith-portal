@@ -17,7 +17,7 @@ import { fileURLToPath } from 'url';
 import { loadDimMall } from '../../lib/dim-mall.js';
 import { getDB, insertRun, appendEvent, getRun, listRuns, newId, runClaim, recoveryRunsOf, createRecoveryRun } from './db.js';
 import { planRecovery, buildRecoveryOperations, RECOVERABLE_STATES } from './recovery.js';
-import { buildTargets, listingUrl, normCode, UPDATABLE_MALLS } from './resolve.js';
+import { buildTargets, expandParentCodes, listingUrl, normCode, UPDATABLE_MALLS } from './resolve.js';
 import { fetchRakutenPrices, fetchYahooPrices, loadAmazonSnapshot, fetchAupayPrices, fetchQoo10Prices } from './live-price.js';
 import { fetchLinegiftPrices } from './linegift-read.js';
 import { evaluateRow, runLimits, mergeGuardWarns } from './pricing.js';
@@ -128,6 +128,19 @@ export function parseStrictPrice(v) {
     return { ok: true, value: Number(s) };
   }
   return { ok: false, raw: v };
+}
+
+const SPLIT_HINT = '。代表商品コードは、バリエーションの商品コードを何回かに分けて入れれば扱えます';
+
+/**
+ * 代表商品コードを広げた後の NEコード数が上限を超えていたら、その文言を返す (超えなければ null)。
+ * ★入力の数だけ見て通すと、記録はできても実行 API の上限 (NEコード数) で送れない履歴ができる
+ */
+export function expandedLimitMessage(codes, expansions, limits) {
+  if (codes.length <= limits.maxNeCodes) return null;
+  const sizes = expansions.map((e) => `${e.parent} → ${e.children.length + (e.parentIsProduct ? 1 : 0)} 品`).join('、');
+  return `代表商品コードを広げると ${codes.length} コードになり、一度に扱える ${limits.maxNeCodes} コードを超えます`
+    + ` (${sizes})${SPLIT_HINT}`;
 }
 
 /** 行の一意キー (プレビュー内で行を指すため。運用IDではない) */
@@ -348,6 +361,7 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
         neCode: t.neCode,
         productName: t.name,
         rowKind: t.rowKind,
+        isSetProduct: !!t.isSetProduct,
         viaCode: t.viaCode,
         mall: l.mall,
         listingCode,
@@ -446,11 +460,17 @@ router.post('/api/resolve', async (req, res) => {
   try {
     const db = getDB();
     const limits = runLimits();
-    const codes = parseCodes(req.body?.codes);
-    if (codes.length === 0) throw validationError('NE商品コードを入力してください');
-    if (codes.length > limits.maxNeCodes) {
-      throw validationError(`一度に扱えるのは ${limits.maxNeCodes} コードまでです (入力 ${codes.length} 件)`);
+    const inputCodes = parseCodes(req.body?.codes);
+    if (inputCodes.length === 0) throw validationError('NE商品コードを入力してください');
+    if (inputCodes.length > limits.maxNeCodes) {
+      throw validationError(`一度に扱えるのは ${limits.maxNeCodes} コードまでです (入力 ${inputCodes.length} 件)`);
     }
+    // 代表商品コードはバリエーションの NEコードへ広げる (楽天RMS の商品ページ単位でまとめて直せるように)。
+    // ★上限は広げた後の数で見る。実行 API も NEコードの数で止めるので、ここで通すと記録できても送れない
+    const { codes, expansions } = expandParentCodes(db, inputCodes);
+    const splitHint = expansions.length > 0 ? SPLIT_HINT : '';
+    const overLimit = expandedLimitMessage(codes, expansions, limits);
+    if (overLimit) throw validationError(overLimit);
     const costOverrides = new Map();
     for (const [k, v] of Object.entries(req.body?.costOverrides || {})) {
       const n = Number(v);
@@ -459,7 +479,7 @@ router.post('/api/resolve', async (req, res) => {
 
     const { rows, unknownCodes, notices } = await buildPreviewRows(db, codes, costOverrides);
     if (rows.length > limits.maxSkuRows) {
-      throw validationError(`対象行が多すぎます (${rows.length} 行 / 上限 ${limits.maxSkuRows} 行)。コードを分けて実行してください`);
+      throw validationError(`対象行が多すぎます (${rows.length} 行 / 上限 ${limits.maxSkuRows} 行)。コードを分けて実行してください${splitHint}`);
     }
     // 1 NEコードからの展開が多すぎる場合も止める (要件 F4)
     const perCode = new Map();
@@ -481,7 +501,7 @@ router.post('/api/resolve', async (req, res) => {
     });
     res.json({
       ok: true, previewId, expiresAt: new Date(now + PREVIEW_TTL_MS).toISOString(),
-      rows: evaluateRows(rows), unknownCodes, notices, limits,
+      rows: evaluateRows(rows), unknownCodes, notices, limits, expansions,
     });
   } catch (e) {
     apiError(res, e, 'resolve');
