@@ -19,12 +19,14 @@
  * 守り:
  *   - 列がレポートに無い・空・数でない ("--" など) は null (0 にしない)。どの列が無かったかは印 (missing_columns) とログに残す
  *   - 置き換えは日 × market ごと (1 取引)。同じ日に取り直すと、新しい取得で丸ごと入れ替わる (冪等)
- *   - 古い取得 (取得時刻が印より前) では戻さない・行数が前の 30% 未満に急に減った取得では置き換えない (planning_latest と同じ考え)・行が 0 の取得では消さない
+ *   - 古い取得 (取得時刻が印より前) では戻さない・行数が前の 30% 未満に急に減った取得では置き換えない (planning_latest と同じ考え。
+ *     比べる相手 = その日の前の取得、無ければ直近 7 日の中の前の日)・行が 0 の取得では消さない
  *   - 未来の日付は受けない。古い日の行は「いまの JST の日付」から KEEP_DAYS 日より前を消す (入力の日付で消す範囲を動かさない)
  */
 
 export const PLANNING_HISTORY_KEEP_DAYS = 400;     // 1 年 + α (前年同週と比べられる・365 日超の在庫の 1 周期をまるごと見られる)
 export const PLANNING_HISTORY_MIN_RATIO = 0.3;     // 前の取得の行数のこの割合より少ない取得では置き換えない
+export const PLANNING_HISTORY_GUARD_LOOKBACK_DAYS = 7;   // その日が初めての取得なら、この日数の中の前の日と比べる
 
 /**
  * [列名, 型, レポートの列の候補...]。候補の比べ方は normHeader (大文字小文字・空白・_ の違いを無視)。
@@ -235,7 +237,11 @@ export function savePlanningHistory(db, { snapshotDate, market, rawRows, fetched
     // 取引の中で前の印を読む (同時に 2 つ走っても、後から書く側が前の印を見てから決める)
     const prev = db.prepare('SELECT fetched_at, report_rows FROM fba_planning_daily_days WHERE snapshot_date = ? AND market = ?').get(snapshotDate, market);
     if (prev && Date.parse(prev.fetched_at) > fetchedMs) { result = { saved: false, reason: 'older_fetch', ...base }; return; }
-    if (prev && reportRows < prev.report_rows * PLANNING_HISTORY_MIN_RATIO) { result = { saved: false, reason: 'count_guard', prev: prev.report_rows, ...base }; return; }
+    // 急に減った取得: その日の前の取得と比べる。その日が初めてなら、直近 GUARD_LOOKBACK_DAYS 日の前の日と比べる (Codex R2: 日の最初の取得も守る)。
+    //   それより前の日しか無ければ比べない (本当に SKU が減ったときに、ずっと置き換えられなくならないように)
+    const lookbackFrom = new Date(Date.parse(`${snapshotDate}T00:00:00Z`) - PLANNING_HISTORY_GUARD_LOOKBACK_DAYS * 86400000).toISOString().slice(0, 10);
+    const ref = prev || db.prepare('SELECT snapshot_date, report_rows FROM fba_planning_daily_days WHERE market = ? AND snapshot_date < ? AND snapshot_date >= ? ORDER BY snapshot_date DESC LIMIT 1').get(market, snapshotDate, lookbackFrom);
+    if (ref && reportRows < ref.report_rows * PLANNING_HISTORY_MIN_RATIO) { result = { saved: false, reason: 'count_guard', prev: ref.report_rows, prevDate: ref.snapshot_date || snapshotDate, ...base }; return; }
     db.prepare('DELETE FROM fba_planning_daily WHERE snapshot_date = ? AND market = ?').run(snapshotDate, market);
     let rows = 0;
     for (const row of bySku.values()) {

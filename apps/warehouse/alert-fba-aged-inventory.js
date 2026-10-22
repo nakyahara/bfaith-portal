@@ -152,8 +152,9 @@ export async function runAgedAlert(db, { nowMs = Date.now(), webhook = process.e
   ensureAlertLog(db);
   const today = jstDate(nowMs);
   const week = weekKeyJst(nowMs);
-  // 送る曜日でなくても、同じ週に送れなかった回 ('failed') があれば、もう一度試す
-  const retryFailed = !!db.prepare(`SELECT 1 AS x FROM fba_aged_alert_log WHERE week_key = ? AND status = 'failed'`).get(week);
+  // 送る曜日でなくても、同じ週に送れなかった回 ('failed')・送っている途中で落ちた回 (古い 'sending') があれば、もう一度試す (Codex R2)
+  const wk = db.prepare('SELECT status, claimed_at FROM fba_aged_alert_log WHERE week_key = ?').get(week);
+  const retryFailed = !!wk && (wk.status === 'failed' || (wk.status === 'sending' && nowMs - Date.parse(wk.claimed_at) >= CLAIM_STALE_MS));
   if (!force && !dryRun && !retryFailed && jstWeekday(nowMs) !== ALERT_WEEKDAY_JST) return { status: 'not_today', lastLine: `⏭️ 長期在庫アラート: 送る曜日ではない (${'日月火水木金土'[ALERT_WEEKDAY_JST]}曜だけ)` };
   if (!force && !dryRun) {
     const sent = db.prepare(`SELECT sent_at FROM fba_aged_alert_log WHERE week_key = ? AND status = 'sent'`).get(week);

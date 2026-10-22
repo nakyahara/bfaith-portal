@@ -108,6 +108,18 @@ await t('🚨 古い取得 (取得時刻が印より前) では戻さない・�
   assert.equal(rowsOf(db, '2026-10-22').length, 10);
   assert.equal(dayOf(db, '2026-10-22').fetched_at, FETCHED);
 });
+await t('🚨 その日の最初の取得も守る (Codex R2): 直近 7 日の中の前の日と比べて 30% 未満なら残さない (印も作らない = アラートは前の日を使う)。8 日以上前としか比べられなければ残す', () => {
+  const db = openDb();
+  const ten = Array.from({ length: 10 }, (_, i) => raw(`s${i}`));
+  savePlanningHistory(db, { snapshotDate: '2026-10-18', market: 'jp', rawRows: ten, fetchedAt: '2026-10-18T00:00:00Z', now: NOW });
+  const r = savePlanningHistory(db, { snapshotDate: '2026-10-22', market: 'jp', rawRows: [raw('s0'), raw('s1')], fetchedAt: FETCHED, now: NOW });
+  assert.deepEqual([r.saved, r.reason, r.prev, r.prevDate], [false, 'count_guard', 10, '2026-10-18']);
+  assert.deepEqual([rowsOf(db, '2026-10-22').length, dayOf(db, '2026-10-22')], [0, undefined]);
+  assert.equal(savePlanningHistory(db, { snapshotDate: '2026-10-22', market: 'us', rawRows: [raw('u')], fetchedAt: FETCHED, now: NOW }).saved, true);   // US は JP と比べない
+  const db2 = openDb();
+  savePlanningHistory(db2, { snapshotDate: '2026-10-14', market: 'jp', rawRows: ten, fetchedAt: '2026-10-14T00:00:00Z', now: NOW });
+  assert.equal(savePlanningHistory(db2, { snapshotDate: '2026-10-22', market: 'jp', rawRows: [raw('s0')], fetchedAt: FETCHED, now: NOW }).saved, true);
+});
 await t('🚨 古い日の掃除: 「いまの JST の日付」から KEEP_DAYS 日より前の行と印を消す (入力の日付では動かない)。既定は 400 日', () => {
   assert.equal(PLANNING_HISTORY_KEEP_DAYS, 400);
   const db = openDb();
@@ -237,6 +249,14 @@ await t('🚨 同時に 2 つ走っても 1 通 (送る前に週の権利を取�
   ensureAlertLog(db2);
   db2.prepare(`INSERT INTO fba_aged_alert_log (week_key, status, claimed_at, snapshot_date, sku_count) VALUES ('2026-10-26', 'sending', ?, '2026-10-26', 1)`).run(new Date(MON - 3600000).toISOString());
   assert.equal((await runAgedAlert(db2, { nowMs: MON, webhook: 'https://x', send: async () => true, log: quiet })).status, 'sent');
+  // 月曜に送っている途中で落ちた (古い 'sending' のまま) → 火曜の朝にもう一度 (Codex R2)。まだ新しい 'sending' なら火曜は何もしない
+  const db3 = openDb();
+  seed(db3, '2026-10-27', agedRows());
+  ensureAlertLog(db3);
+  db3.prepare(`INSERT INTO fba_aged_alert_log (week_key, status, claimed_at, snapshot_date, sku_count) VALUES ('2026-10-26', 'sending', ?, '2026-10-26', 1)`).run(new Date(TUE - 60000).toISOString());
+  assert.equal((await runAgedAlert(db3, { nowMs: TUE, webhook: 'https://x', send: async () => true, log: quiet })).status, 'not_today');
+  db3.prepare(`UPDATE fba_aged_alert_log SET claimed_at = ?`).run(new Date(MON).toISOString());
+  assert.equal((await runAgedAlert(db3, { nowMs: TUE, webhook: 'https://x', send: async () => true, log: quiet })).status, 'sent');
 });
 await t('送れなかった週は、同じ週のうちは曜日を問わず翌朝もう一度 (次の週には持ち越さない)', async () => {
   const db = openDb();
