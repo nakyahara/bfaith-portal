@@ -204,6 +204,7 @@ export function parseTsv(text, { joinExtraIntoLast = false } = {}) {
  * @param {object} [p.reportOptions]
  * @param {string} [p.dataStartTime] / [p.dataEndTime] - ISO 8601
  * @param {number} [p.pollIntervalMs=30000] / [p.maxPolls=40] - polling の間隔と上限 (上限を超えたら TIMEOUT)
+ * @param {Function} [p.beforeCreate] - createReport の前に待つ (createRateGate)
  * @returns {Promise<{ reportId, reportDocumentId, generation, encoding, compressionAlgorithm, bytes, text, headers?, rows?, json? }>}
  */
 export async function fetchSpReport({
@@ -213,6 +214,7 @@ export async function fetchSpReport({
   createTimeoutMs = 150000, getTimeoutMs = 30000, docTimeoutMs = 150000, downloadTimeoutMs = 300000,
   throttleAttempts = 4, throttleWaitMs = 65000,
   joinExtraIntoLast = false,
+  beforeCreate = null,   // createReport の前に待つ (createRateGate。レポートの種類ごとの上限)
   fetchImpl = globalThis.fetch, sleepImpl = sleep, now = Date.now, log = console.log,
 }) {
   if (!sp || typeof sp.callAPI !== 'function') throw new Error('sp (callAPI を持つ SP クライアント) が無い');
@@ -225,6 +227,7 @@ export async function fetchSpReport({
   if (dataStartTime) body.dataStartTime = dataStartTime;
   if (dataEndTime) body.dataEndTime = dataEndTime;
 
+  if (beforeCreate) await beforeCreate();
   const generation = now();   // この取得の世代 = 頼んだ時刻
   const created = await callApi(sp, { operation: 'createReport', endpoint: 'reports', body, options: { version: REPORTS_VERSION } },
     { label: `${reportType} createReport`, timeoutMs: createTimeoutMs, attempts: throttleAttempts, waitMs: throttleWaitMs, ...common });
@@ -499,4 +502,27 @@ export async function fetchSpReportOrNoData(params) {
     (params.log || console.log)(`[SP-API] ${params.reportType} は CANCELLED = データなし (0 行) と読む (reportId=${e.reportId})`);
     return { noData: true, reportId: e.reportId, reportDocumentId: null, generation: e.generation, headers: [], rows: [], text: '' };
   }
+}
+
+/**
+ * レポートの種類ごとの上限 (例: GET_SALES_AND_TRAFFIC_REPORT は 5 分に 3 回まで = Reports API 全体の burst 15 とは別) に合わせて、
+ * createReport の前に待つ門。呼ぶたびに「直近 windowMs に max 回」を超えないところまで待つ (同時に呼ばれても順に通す)
+ * @returns {() => Promise<void>}
+ */
+export function createRateGate({ max, windowMs, now = Date.now, sleepImpl = sleep, log = () => {} }) {
+  const stamps = [];
+  let chain = Promise.resolve();
+  return () => {
+    chain = chain.then(async () => {
+      for (;;) {
+        const t = now();
+        while (stamps.length && t - stamps[0] >= windowMs) stamps.shift();
+        if (stamps.length < max) { stamps.push(t); return; }
+        const wait = windowMs - (t - stamps[0]) + 1;
+        log(`[SP-API] レポートの種類ごとの上限 (${Math.round(windowMs / 1000)} 秒に ${max} 回) → ${Math.ceil(wait / 1000)} 秒待つ`);
+        await sleepImpl(wait);
+      }
+    });
+    return chain;
+  };
 }

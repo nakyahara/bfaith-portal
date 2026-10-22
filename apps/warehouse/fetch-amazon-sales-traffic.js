@@ -32,7 +32,7 @@ import 'dotenv/config';
 import { initDB, getDB } from './db.js';
 import {
   fetchSpReport, createSpClient, isDirectRun, parseCommonArgs, datesBetween, jstStart, jstEnd,
-  numOrNull, strOrNull, ensureReportFetchDays, dayWriteDecision, recordFetchDay, checkSaveArgs, gzipText,
+  numOrNull, strOrNull, ensureReportFetchDays, createRateGate, dayWriteDecision, recordFetchDay, checkSaveArgs, gzipText,
 } from './sp-api-report.js';
 
 export const REPORT_TYPE = 'GET_SALES_AND_TRAFFIC_REPORT';
@@ -41,6 +41,9 @@ const DEFAULT_DAYS = 5;
 const POLL_INTERVAL_MS = 20000;
 const MAX_POLLS = 45;   // 20 秒 × 45 = 15 分
 const DEFAULT_CONCURRENCY = 3;   // 同時に頼むレポートの数 (--concurrency で 1〜10)
+// 🚨 このレポートは「5 分に 3 回まで」(公式の report type values: Sales and Traffic Business Report。Reports API 全体の burst 15 とは別。Codex R3)。
+//    少し余裕を持たせて 5 分 15 秒に 3 回 = 直近 5 日の朝は 3 つ → 5 分待って 2 つ (約 5〜10 分)・90 日のさかのぼりは約 2.6 時間
+export const CREATE_QUOTA = Object.freeze({ max: 3, windowMs: 315000 });
 
 /** 頼む期間の書き方 */
 export function dayWindow(d, boundary = 'jst') {
@@ -283,7 +286,7 @@ export function saveSalesTrafficDay(db, { date, json, rawText, generation, repor
 }
 
 export function parseArgs(argv = process.argv.slice(2), nowMs = Date.now()) {
-  const r = parseCommonArgs(argv, { defaultDays: DEFAULT_DAYS, maxDays: 800, nowMs });
+  const r = parseCommonArgs(argv, { defaultDays: DEFAULT_DAYS, maxDays: 730, nowMs });   // dataStartTime は 2 年より前を頼めない (公式)
   r.boundary = r.extra.boundary || 'jst';
   r.concurrency = r.extra.concurrency === undefined ? DEFAULT_CONCURRENCY : Number(r.extra.concurrency);
   if (!Number.isInteger(r.concurrency) || r.concurrency < 1 || r.concurrency > 10) throw new Error(`--concurrency が不正 (1〜10): ${r.extra.concurrency}`);
@@ -303,12 +306,13 @@ async function main() {
   const sp = await createSpClient();
   let ok = 0, failed = 0, skipped = 0, rows = 0;
   // 何日かを同時に頼む (1 日ずつ順に待つと 5 日で 5 倍かかる)。createReport の burst (15) の内に収まる数にする
+  const gate = createRateGate({ ...CREATE_QUOTA, log: console.log });
   const queue = [...days];
   const worker = async () => { for (let d = queue.shift(); d; d = queue.shift()) await oneDay(d); };
   const oneDay = async (d) => {
     try {
       const rep = await fetchSpReport({ sp, reportType: REPORT_TYPE, format: 'json', reportOptions: { ...REPORT_OPTIONS }, ...dayWindow(d, args.boundary),
-        pollIntervalMs: POLL_INTERVAL_MS, maxPolls: MAX_POLLS });
+        pollIntervalMs: POLL_INTERVAL_MS, maxPolls: MAX_POLLS, beforeCreate: gate });
       if (args.check) {
         const p = parseSalesTrafficDay(rep.json, d);
         console.log(`[SalesTraffic] --check ${d}: SKU ${p.skus.length} 行 / 店全体 sessions=${p.store.sessions} units=${p.store.units_ordered} sales=${p.store.ordered_product_sales} ${p.store.currency_code || ''}`);

@@ -691,7 +691,7 @@ async function main() {
   //   返品 = GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA (直近 60 日を UPSERT) → 取れた朝だけ返品のアラート (控えめ・GCHAT_WEBHOOK が無ければ送らない・exit 0)
   //   補てん = GET_FBA_REIMBURSEMENTS_DATA (直近 60 日を UPSERT)・在庫の台帳 = GET_LEDGER_DETAIL_VIEW_DATA (直近 30 日を日ごとに置き換え) = 保存まで
   //   SP-API の主取得が失敗した朝は全部スキップ (カート価格と同じ)。どれかが失敗しても後ろは続ける。🚨 引数を必ず渡す (runScript は引数なしだと '7' を足す)
-  //   createReport / getReportDocument は 1 分に 1 回 (burst 15) = 朝のふだんの 8 レポートは burst の内。timeout は polling の上限 (15〜25 分) より長く
+  //   createReport / getReportDocument は 1 分に 1 回 (burst 15)。アクセスのレポートだけは別に「5 分に 3 回」= 直近 5 日は 3 つ → 5 分待って 2 つ (約 10 分)。timeout は polling の上限 (15〜25 分) より長く
   if (spResult.success) {
     const salesTrafficResult = runScript('apps/warehouse/fetch-amazon-sales-traffic.js --days 5', 'Amazonアクセス・転換率', 2700000);
     results.push({ name: 'Amazonアクセス・転換率', ...salesTrafficResult });

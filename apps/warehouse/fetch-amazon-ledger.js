@@ -3,7 +3,7 @@
  *
  * レポート: GET_LEDGER_DETAIL_VIEW_DATA (TSV・値は "" で囲まれていることがある)。dataStartTime / dataEndTime で期間を頼む
  *   列 (公式の見出し): Date, FNSKU, ASIN, MSKU, Title, Event Type, Reference ID, Quantity, Fulfillment Center, Disposition, Reason, Country,
- *                       Reconciled Quantity, Unreconciled Quantity (と新しいレポートには Date and Time)
+ *                       Reconciled Quantity, Unreconciled Quantity, Date and Time, Store (後ろの 2 つは無くてもよい)
  *   🚨 必須の列 (Date / FNSKU / Event Type / Quantity) が無ければ見出しを出して失敗
  *
  * ふだんは JST の昨日まで直近 30 日を毎朝取り直す (Reconciled / Unreconciled Quantity は紛失・破損の調査が進むと後から変わるため)。
@@ -51,6 +51,7 @@ export function ensureLedgerTable(db) {
     disposition           TEXT,               -- SELLABLE / DEFECTIVE / CUSTOMER_DAMAGED など
     reason                TEXT,               -- Adjustments の理由のコード (紛失・破損・見つかった など)
     country               TEXT,
+    store                 TEXT,               -- Store (レポートにあれば)
     reconciled_quantity   INTEGER,
     unreconciled_quantity INTEGER,
     line_no               INTEGER NOT NULL,   -- レポートの中の行番号
@@ -65,7 +66,7 @@ export function ensureLedgerTable(db) {
 }
 
 const COLS = ['event_date', 'event_datetime', 'fnsku', 'asin', 'msku', 'title', 'event_type', 'reference_id', 'quantity', 'fulfillment_center',
-  'disposition', 'reason', 'country', 'reconciled_quantity', 'unreconciled_quantity', 'line_no'];
+  'disposition', 'reason', 'country', 'store', 'reconciled_quantity', 'unreconciled_quantity', 'line_no'];
 
 /** 頼む期間 = [from の前の日の 00:00 JST, to の次の日の 23:59:59 JST] (今より後は今の 2 分前まで) */
 export function requestWindow(from, to, nowMs = Date.now()) {
@@ -83,7 +84,7 @@ export function parseLedgerRows({ headers, rows }, { from, to }) {
   const col = {
     date: h('Date'), dateTime: h('Date and Time'), fnsku: h('FNSKU'), asin: h('ASIN'), msku: h('MSKU'), title: h('Title'), eventType: h('Event Type'),
     referenceId: h('Reference ID'), quantity: h('Quantity'), fc: h('Fulfillment Center'), disposition: h('Disposition'), reason: h('Reason'),
-    country: h('Country'), reconciled: h('Reconciled Quantity'), unreconciled: h('Unreconciled Quantity'),
+    country: h('Country'), store: h('Store'), reconciled: h('Reconciled Quantity'), unreconciled: h('Unreconciled Quantity'),
   };
   const missing = ['date', 'fnsku', 'eventType', 'quantity'].filter((k) => !col[k]);
   if (missing.length) throw new Error(`在庫の台帳のレポートに必須の列が無い (${missing.join(', ')})。見出し: ${JSON.stringify(headers).slice(0, 400)}`);
@@ -104,7 +105,7 @@ export function parseLedgerRows({ headers, rows }, { from, to }) {
     const row = {
       event_date: d, event_datetime: get(r, 'dateTime'), fnsku, asin: get(r, 'asin'), msku: get(r, 'msku'), title: get(r, 'title'),
       event_type: eventType, reference_id: get(r, 'referenceId'), quantity, fulfillment_center: get(r, 'fc'), disposition: get(r, 'disposition'),
-      reason: get(r, 'reason'), country: get(r, 'country'),
+      reason: get(r, 'reason'), country: get(r, 'country'), store: get(r, 'store'),
       reconciled_quantity: numOrNull(get(r, 'reconciled'), `${at} の Reconciled Quantity`, signedInt),
       unreconciled_quantity: numOrNull(get(r, 'unreconciled'), `${at} の Unreconciled Quantity`, signedInt),
       line_no: r.__line,

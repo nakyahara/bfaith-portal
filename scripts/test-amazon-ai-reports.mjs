@@ -17,7 +17,7 @@ import { gzipSync } from 'node:zlib';
 import iconv from 'iconv-lite';
 import Database from 'better-sqlite3';
 import {
-  fetchSpReport, fetchSpReportOrNoData, decodeReportBuffer, parseTsv, SpReportError, parseCommonArgs, looseDateToJst, isoToJstDate, numOrNull, gunzipText,
+  fetchSpReport, fetchSpReportOrNoData, createRateGate, decodeReportBuffer, parseTsv, SpReportError, parseCommonArgs, looseDateToJst, isoToJstDate, numOrNull, gunzipText,
 } from '../apps/warehouse/sp-api-report.js';
 import * as ST from '../apps/warehouse/fetch-amazon-sales-traffic.js';
 import * as RET from '../apps/warehouse/fetch-amazon-returns.js';
@@ -143,6 +143,19 @@ await t('引数: ふだんは JST の昨日まで直近 N 日・--from/--to・�
   throws(() => ST.parseArgs(['--concurrency', '0'], now), /concurrency/);
   throws(() => ST.parseArgs(['--boundary', 'pst'], now), /boundary/);
   assert.deepEqual(ST.dayWindow('2026-10-01'), { dataStartTime: '2026-10-01T00:00:00+09:00', dataEndTime: '2026-10-01T23:59:59+09:00' });
+});
+
+await t('レポートの種類ごとの上限の門: 5 分に 3 回 = 4 つ目は 1 つ目から 5 分 (+余裕) 待つ・同時に呼んでも順に通す・createReport の前に待つ', async () => {
+  let clock = 0; const waits = [];
+  const gate = createRateGate({ ...ST.CREATE_QUOTA, now: () => clock, sleepImpl: async (ms) => { waits.push(ms); clock += ms; } });
+  const at = [];
+  await Promise.all([1, 2, 3, 4, 5].map(async () => { await gate(); at.push(clock); }));
+  assert.deepEqual(at, [0, 0, 0, 315001, 315001]);
+  assert.equal(ST.CREATE_QUOTA.max, 3); assert.ok(ST.CREATE_QUOTA.windowMs >= 300000);
+  const order = []; const sp = fakeSp(); const orig = sp.callAPI.bind(sp);
+  sp.callAPI = async (p) => { order.push(p.operation); return orig(p); };
+  await fetchSpReport({ sp, reportType: 'X', fetchImpl: fakeFetch(Buffer.from('a\n')), ...base(), beforeCreate: async () => { order.push('gate'); } });
+  assert.deepEqual(order.slice(0, 2), ['gate', 'createReport']);
 });
 
 console.log('アクセス・転換率 (GET_SALES_AND_TRAFFIC_REPORT)');
