@@ -12,10 +12,12 @@
  *   image preflight / variation 整合 / lead_time preflight / variation_spec (バリ品のみ)
  */
 
+// '8%' は商品登録ハブの書式 (確定値の表は '10' / '8' にそろえて持つが、旧 Notion 値・直接の呼び出しにも備える)
 const TAX_RATE_MAP = {
   '10': 0.1,
   '10%': 0.1,
   '8': 0.08,
+  '8%': 0.08,
 };
 
 const NAME_MAX_LENGTH = 65;
@@ -110,7 +112,7 @@ export function extractRequiredAxes(rakutenItem) {
 export function evaluateReadiness(input) {
   const reasons = [];
 
-  // #1 name (Notion yahoo_title 強制)
+  // #1 name (確定値の Yahoo!タイトル強制。楽天の商品名へは fallback しない)
   //   Codex E-4 R1 H-1: 65 字超は blocked にせず field-mapper 側で truncate (仕様は「65 字 truncate」 であり、 ハード reject ではない)。
   //   ここでは「空文字」 のみ fail-closed。
   const yt = input.notionOverride?.yahoo_title;
@@ -123,9 +125,14 @@ export function evaluateReadiness(input) {
   // #3 path
   if (!input.path) reasons.push('path_unresolved');
 
-  // #4 price
+  // #4 price (2026-10-22 D-2: 確定した金額だけ。楽天の値へは fallback しない)
+  //   佐川売価の対象の配送方法で「佐川売価」も「通常売価と同額」も選ばれていないときは別の理由で止める
+  //   (通常売価が入っているのに「売価未入力」と出ると、何を直せばよいか分からない)
   if (input.resolvedPrice === null || input.resolvedPrice === undefined || !(input.resolvedPrice > 0)) {
-    reasons.push('price_invalid_or_zero');
+    const sagawaPending = input.notionOverride?.yahoo_price > 0
+      && input.deliveryRow?.applies_sagawa_price === 1
+      && input.notionOverride?.sagawa_mode !== 'same';
+    reasons.push(sagawaPending ? 'sagawa_price_unconfirmed' : 'price_invalid_or_zero');
   }
 
   // #5/#6 delivery / postage_set

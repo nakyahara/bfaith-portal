@@ -106,6 +106,7 @@ export async function runRysFullSync({
     const err = new Error(
       `runRysFullSync: baseline run did not establish (stale_rows=${result.baseline.staleRows}, ` +
       `anyIncomplete=${result.baseline.anyIncomplete}). Skip diff.`
+      + (result.baseline.pruneSkippedReason ? ` ${result.baseline.pruneSkippedReason}` : '')
     );
     err.stage = 'baseline_incomplete';
     err.statusCode = 412; // Codex R1 High-2: precondition 失敗は 412

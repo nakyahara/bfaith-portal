@@ -282,6 +282,27 @@ function audit(db, action, detail, { actor = 'http', result = 'success', errorMe
  * @param {object} [opts.publishOpts]      evaluateItemForPublish に渡す extras
  * @returns {Promise<{status, idempotencyKey, dedupe?, fields?, reasons?, executorResult?, error?}>}
  */
+/**
+ * 出品してはいけない商品なら理由コードを返す (出してよければ null)。
+ *   - migration_excluded: 移行除外が有効 (restored_at IS NULL)
+ *   - already_on_yahoo:   Yahoo で見えている商品で、このアプリで出品に成功したことが無い
+ *                         (= 手で出した / 元からある商品。上書きしない)。このアプリで出した商品の出し直し
+ *                         (全件再登録 = 楽天リンク除去の反映) は通す
+ */
+export function publishTargetGuard(db, itemCode) {
+  const has = (name) => !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?`).get(name);
+  if (has('migration_excluded')
+    && db.prepare('SELECT 1 FROM migration_excluded WHERE item_code = ? AND restored_at IS NULL').get(itemCode)) {
+    return 'migration_excluded';
+  }
+  if (has('yahoo_registered_items')
+    && db.prepare('SELECT 1 FROM yahoo_registered_items WHERE item_code = ?').get(itemCode)
+    && !db.prepare(`SELECT 1 FROM publish_idempotency WHERE item_code = ? AND status = 'success'`).get(itemCode)) {
+    return 'already_on_yahoo';
+  }
+  return null;
+}
+
 export async function executePublish({
   db, itemCode, manageNumber, createdBy = 'http',
   idempotencyKey: providedKey = null,
@@ -299,6 +320,15 @@ export async function executePublish({
       idempotencyKey: providedKey,
       error: 'RYS_PUBLISH_ENABLED is 0 (kill-switch). Real publish is disabled.',
     };
+  }
+
+  // 2026-10-22: 出してはいけない商品をここで止める (単品・一括・失敗の再実行・全件再登録の全部がここを通る)。
+  //   旧実装は出品の経路がどこも移行除外と Yahoo の実在を見ておらず、一度失敗した後に永続除外にした商品や
+  //   手で Yahoo に出した商品が「失敗中を再実行」で出品されていた。
+  const guardReason = publishTargetGuard(db, itemCode);
+  if (guardReason) {
+    audit(db, 'publish_execute_blocked_target', { itemCode, reason: guardReason }, { result: 'failed', errorMessage: guardReason });
+    return { status: 'readiness_blocked', idempotencyKey: providedKey, reasons: [guardReason], error: guardReason };
   }
 
   const idempotencyKey = providedKey || buildIdempotencyKey({ itemCode, manageNumber });

@@ -1,0 +1,52 @@
+/**
+ * 一括登録が途中で止まった (再起動など) batch を片付ける — 2026-10-22 修正の再発防止。
+ * 実行: node --test apps/rakuten-yahoo-sync/services/bulk-recover.test.mjs
+ */
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import Db from 'better-sqlite3';
+import { runMigrations } from '../db.js';
+import { recoverStaleBatches, STALE_BATCH_MS, getRunningBatch } from './bulk-publish.js';
+
+function freshDb() {
+  const db = new Db(':memory:');
+  runMigrations(db);
+  return db;
+}
+
+function insertRunning(db, startedAt, items) {
+  const id = Number(db.prepare(`INSERT INTO bulk_publish_batches (total, in_progress, status, triggered_by, started_at)
+    VALUES (?, ?, 'running', 'manual', ?)`).run(items.length, items.length, startedAt).lastInsertRowid);
+  for (const [code, status, at] of items) {
+    db.prepare(`INSERT INTO bulk_publish_batch_items (batch_id, item_code, status, started_at, finished_at) VALUES (?, ?, ?, ?, ?)`)
+      .run(id, code, status, at, status === 'success' ? at : null);
+  }
+  return id;
+}
+
+test('最後の動きから 35 分経った running の batch は aborted にして、残りの商品は failed にする', () => {
+  const db = freshDb();
+  const old = new Date(Date.now() - STALE_BATCH_MS - 60_000).toISOString();
+  const id = insertRunning(db, old, [['a', 'success', old], ['b', 'running', old], ['c', 'pending', null]]);
+  assert.equal(recoverStaleBatches(db), 1);
+  const b = db.prepare('SELECT * FROM bulk_publish_batches WHERE batch_id = ?').get(id);
+  assert.equal(b.status, 'aborted');
+  assert.ok(b.finished_at);
+  assert.equal(b.in_progress, 0);
+  assert.equal(b.failed, 2);
+  const items = db.prepare('SELECT item_code, status, error_message FROM bulk_publish_batch_items WHERE batch_id = ? ORDER BY id').all(id);
+  assert.deepEqual(items.map((i) => i.status), ['success', 'failed', 'failed']);
+  assert.match(items[1].error_message, /中断/);
+  // もう running は無い = 新しい batch を作れる (UNIQUE INDEX に当たらない)
+  assert.equal(getRunningBatch(db), null);
+  insertRunning(db, new Date().toISOString(), [['d', 'pending', null]]);
+});
+
+test('最近まで動いていた batch (デプロイの切り替え中に古いプロセスが回しているかもしれない) は閉じない', () => {
+  const db = freshDb();
+  const old = new Date(Date.now() - STALE_BATCH_MS - 60_000).toISOString();
+  const recent = new Date(Date.now() - 60_000).toISOString();
+  insertRunning(db, old, [['a', 'success', old], ['b', 'running', recent]]);
+  assert.equal(recoverStaleBatches(db), 0);
+  assert.ok(getRunningBatch(db));
+});

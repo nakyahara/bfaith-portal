@@ -22,7 +22,9 @@
 const SUBCODE_REGEX = /^[A-Za-z0-9-]+$/;
 // Yahoo editItem: オプション項目/値に 半角スペース と 半角記号 |;:&=#"\ は使用不可 (公式 spec)。
 // 半角スペースは全角に置換して救済、 他の禁止文字は fail-closed。
-const OPTION_FORBIDDEN = /[|;:&=#"\\]/;
+// 半角カンマも止める (2026-10-22): options は `軸名#値1,値2` の書式なので、値に `,` があると
+// `1,000ml` が「1」「000ml」の 2 つに割れて subcodes と食い違う (Yahoo で登録エラー or 誤った選択肢)。
+const OPTION_FORBIDDEN = /[|;:&=#,"\\]/;
 
 export function normalizeVariants(rakutenItem) {
   if (!rakutenItem) return [];

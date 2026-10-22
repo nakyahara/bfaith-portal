@@ -178,15 +178,22 @@ export async function executeRefreshPipeline({ db, runId, runToken, triggeredBy 
     // ── 2. genre backfill (進捗がある限り小 batch ループ) ──
     {
       const t0 = Date.now();
-      let updated = 0, rounds = 0, remaining = null;
+      // 2026-10-22: 楽天から読めなかった件数 (failed) と楽天側にジャンルが無い件数 (stillNull) も残す
+      //   (旧実装は捨てていたので、一部失敗しても「成功」としか見えなかった)。埋まらなかった行は試した時刻順で
+      //   後ろへ回る (migration 025) ので、翌日以降は別の行から試す
+      let updated = 0, rounds = 0, remaining = null, failed = 0, stillNull = 0;
+      const errorSamples = [];
       for (; rounds < GENRE_BACKFILL_MAX_ROUNDS; rounds++) {
         remaining = impl.countMissingRakutenGenre(db);
         if (remaining <= 0) break;
         const r = await impl.backfillRakutenGenre({ db, limit: 100 });
         updated += r.updated || 0;
+        failed += r.failed || 0;
+        stillNull += r.stillNull || 0;
+        for (const e of (r.errors || [])) if (errorSamples.length < 3) errorSamples.push(String(e).slice(0, 160));
         if ((r.updated || 0) === 0) break; // 進捗なし (楽天側に genre 無し等) → 打ち切り (エラーではない)
       }
-      steps.genre_backfill = { ok: true, ms: Date.now() - t0, updated, rounds, remaining };
+      steps.genre_backfill = { ok: true, ms: Date.now() - t0, updated, rounds, remaining, failed, stillNull, ...(errorSamples.length ? { errorSamples } : {}) };
       persistSteps('readiness_check'); // 3〜5 は skipped なので「次に走る」のは 6
     }
 

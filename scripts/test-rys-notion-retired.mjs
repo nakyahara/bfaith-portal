@@ -100,7 +100,9 @@ console.log('[2] Notion へ書く / 取り込む 4 経路は 410、読み取り�
     ok(r.status === 200, `GET / (dashboard) は 200 (実際 ${r.status})`);
     const h = r.body;
     ok(/js-notion-retired-notice/.test(h) && /Notion 連携は 2026-09-14 に廃止しました/.test(h), 'dashboard に廃止の告知が出る');
-    ok(/旧 Notion から引き継いだ <strong>0<\/strong> 商品分が残っています/.test(h) && /4 項目そろい <strong>0<\/strong>/.test(h), 'dashboard に残存する確定値の件数 (空 DB なら total 0 / 4 項目そろい 0) が出る');
+    // 2026-10-22: 告知は「確定値をどこで入れるか」+ 件数 (このアプリで確定 / ハブで確定 / 旧 Notion から継承) に変えた
+    ok(/旧 Notion から継承 <strong>0<\/strong> 商品/.test(h) && /4 項目そろい <strong>0<\/strong>/.test(h), 'dashboard に残存する確定値の件数 (空 DB なら total 0 / 4 項目そろい 0) が出る');
+    ok(/このアプリで確定 <strong>0<\/strong>/.test(h) && /商品登録ハブで確定 <strong>0<\/strong>/.test(h) && /この値で確定/.test(h), 'dashboard に確定値の入れ方と件数 (このアプリ / 商品登録ハブ) が出る');
     ok(!/Notion で修正|Notion で開く|Notion 取込のみ|Notion 新規作成|楽天から下書き|aburatoishi/.test(h), 'dashboard に Notion への導線 (ボタン・リンク) が無い');
     ok(!/api\/notion\/sync'|seed-notion-drafts|create-notion-pages-from-rakuten|seed-category/.test(h), 'dashboard の JS が廃止した 4 経路を呼ばない');
     ok(!/syncModal|runSync\(|seedNotionDrafts|createNotionPages\(|notionPageUrl|notionAppUrl/.test(h), 'dashboard に Notion 取込モーダル・関数・ページリンクが残っていない');

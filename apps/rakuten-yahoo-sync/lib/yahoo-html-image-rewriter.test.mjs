@@ -238,3 +238,17 @@ test('rewriteAndSanitizeYahooHtml: aburatoishioil100 のリアルケース (6 �
   assert.match(out, /b-faith01_aburatoishioil100_2/);
   assert.equal(out.includes('image.rakuten.co.jp'), false);
 });
+
+test('2026-10-22: 説明文の画像が全部除外対象なら、許可 host が空でも画像を消して通す', () => {
+  const out = rewriteAndSanitizeYahooHtml(
+    '<p>本文</p><img src="https://image.rakuten.co.jp/b-faith/cabinet/coupon.jpg">',
+    new Map(),
+    { allowedYahooHosts: [], excludedRakutenUrls: ['https://image.rakuten.co.jp/b-faith/cabinet/coupon.jpg'] },
+  );
+  assert.ok(!/<img/i.test(out));
+  assert.ok(out.includes('本文'));
+  // 置き換えが必要な画像があるのに許可 host が無ければ、従来どおり止める
+  assert.throws(() => rewriteAndSanitizeYahooHtml(
+    '<img src="https://image.rakuten.co.jp/b-faith/cabinet/a.jpg">', new Map(), { allowedYahooHosts: [] },
+  ), /allowedYahooHosts/);
+});

@@ -28,7 +28,12 @@ const SLEEP_MS = 150;
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-/** sweep 対象の候補 (「出せる/修正必要」に出うる = done/excluded 以外の candidate)。 */
+/**
+ * sweep 対象の候補 (「出せる/修正必要」に出うる = done/excluded 以外の candidate)。
+ * 2026-10-22: 並びを「まだ一度も検査していない → 検査が古い順」に変更。旧実装は item_code 順の先頭 400 件だけを
+ *   毎回検査していたので、候補が 400 件を超えると 401 件目以降は一度も実データ検査されなかった
+ *   (R8 の「出せるタブなのに出せない」がそのまま残る)。今は毎日 400 件ずつ回って全件を一巡する。
+ */
 export function pickSweepTargets(db, { limit = DEFAULT_LIMIT } = {}) {
   return db.prepare(`
     SELECT c.item_code, c.rakuten_manage_number
@@ -37,6 +42,8 @@ export function pickSweepTargets(db, { limit = DEFAULT_LIMIT } = {}) {
       ON e.item_code = c.item_code AND e.restored_at IS NULL
     LEFT JOIN yahoo_registered_items r
       ON r.item_code = c.item_code
+    LEFT JOIN jobs j
+      ON j.item_code = c.item_code
     WHERE c.status = 'candidate'
       AND e.item_code IS NULL
       AND r.item_code IS NULL
@@ -44,9 +51,20 @@ export function pickSweepTargets(db, { limit = DEFAULT_LIMIT } = {}) {
         SELECT 1 FROM publish_idempotency pi
         WHERE pi.item_code = c.item_code AND pi.status = 'success'
       )
-    ORDER BY c.item_code
+    ORDER BY (j.last_readiness_at IS NOT NULL), j.last_readiness_at, c.item_code
     LIMIT ?
   `).all(limit);
+}
+
+/**
+ * 商品の状態ではなく基盤の障害 (miniPC / 楽天 RMS / DB) で止まった理由か。
+ * evaluateItemForPublish はこれらを例外にせず blocked で返すので、数えないと「全件 取得失敗」の朝でも
+ * sweep が成功扱いになっていた (監視には ok が届く)。
+ */
+const INFRA_REASON_HEADS = new Set(['rakuten_fetch_failed', 'image_patterns_load_failed', 'persist_failed']);
+export function isInfraBlocked(result) {
+  const reasons = Array.isArray(result?.reasons) ? result.reasons : [];
+  return reasons.length > 0 && reasons.every((r) => INFRA_REASON_HEADS.has(String(r).split(':')[0]));
 }
 
 /**
@@ -60,7 +78,7 @@ export async function sweepReadiness({ db, limit = DEFAULT_LIMIT, deps = {} } = 
   const _sleepMs = deps.sleepMs ?? SLEEP_MS;
 
   const targets = pickSweepTargets(db, { limit });
-  const summary = { picked: targets.length, evaluated: 0, okCount: 0, blockedCount: 0, errors: 0, errorSamples: [] };
+  const summary = { picked: targets.length, evaluated: 0, okCount: 0, blockedCount: 0, infraBlocked: 0, errors: 0, errorSamples: [] };
   if (targets.length === 0) return summary;
 
   let mapping = null; // itemNumber → manageNumber (必要になったら 1 回だけ取得)
@@ -76,6 +94,10 @@ export async function sweepReadiness({ db, limit = DEFAULT_LIMIT, deps = {} } = 
       summary.evaluated++;
       if (r.status === 'ok') summary.okCount++;
       else summary.blockedCount++;
+      if (r.status !== 'ok' && isInfraBlocked(r)) {
+        summary.infraBlocked++;
+        if (summary.errorSamples.length < 5) summary.errorSamples.push(`${t.item_code}: ${String(r.reasons[0]).slice(0, 120)}`);
+      }
     } catch (e) {
       summary.errors++;
       if (summary.errorSamples.length < 5) {
@@ -91,6 +113,12 @@ export async function sweepReadiness({ db, limit = DEFAULT_LIMIT, deps = {} } = 
   }
   if (summary.errors > summary.evaluated) {
     throw new Error(`readiness sweep: エラー多数 (evaluated=${summary.evaluated}, errors=${summary.errors}) — miniPC/楽天RMS 側障害の可能性${summary.errorSamples[0] ? ` (例: ${summary.errorSamples[0]})` : ''}`);
+  }
+  // 楽天から読めなかった (基盤の障害) が過半数 = その朝の結果は信用できない → 失敗にして監視に出す。
+  //   書いた「取得失敗」の理由は次に成功した sweep で上書きされる
+  const infraTotal = summary.errors + summary.infraBlocked;
+  if (infraTotal * 2 > summary.picked) {
+    throw new Error(`readiness sweep: 楽天から読めなかった商品が過半数 (${infraTotal}/${summary.picked}) — miniPC/楽天RMS 側障害の可能性${summary.errorSamples[0] ? ` (例: ${summary.errorSamples[0]})` : ''}`);
   }
   return summary;
 }

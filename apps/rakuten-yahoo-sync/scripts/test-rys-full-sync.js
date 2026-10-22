@@ -101,7 +101,7 @@ async function testAll() {
       const start = offset + 1;
       const end = Math.min(offset + results, total);
       for (let i = start; i <= end; i++) items.push({ ItemCode: `${query}-${i}` });
-      return { ok: true, items, totalResultsAvailable: total, totalResultsReturned: items.length, firstResultPosition: start };
+      return { ok: true, items, totalResultsAvailable: 5, /* 5 件あると言いながら 4 件 = 取りこぼし (件数一致で消えた行は 2026-10-22 から台帳から外す) */ totalResultsReturned: items.length, firstResultPosition: start };
     };
     try {
       await runRysFullSync({ db, yahooDeps: { callApi: reducedMock }, rakutenItems: makeRakuten(['a-1', 'new-1']) });

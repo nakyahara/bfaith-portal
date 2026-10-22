@@ -3,7 +3,7 @@
  *
  * 設計原則:
  *   - 楽天 RMS は miniPC proxy 経由 (lib/rakuten-rms-proxy.js)
- *   - Notion override は専用 RYS DB から SELECT
+ *   - 確定値は専用 RYS DB から読む (confirmed-values.js: 確定値の表 → 無ければ旧 notion_overrides を継承)
  *   - 全 resolver → readiness → fields 構築までを実行
  *   - editItem 等の actual Yahoo API 呼び出しは E-5 で実装
  *   - dryRun=true なら jobs 行の readiness 更新もスキップ
@@ -18,10 +18,14 @@ import { imagePreflightStub } from '../lib/yahoo-image.js';
 import { getCustomPatternStrings } from '../lib/image-exclusion-patterns.js';
 import { resolveCategoryAndPath } from './category-resolver.js';
 import { buildYahooEditItemFields, resolvePrice } from './field-mapper.js';
+import { loadConfirmedValues } from './confirmed-values.js';
 
+/**
+ * 確定値 (2026-10-22〜: 確定値の表 → 無ければ旧 notion_overrides を「旧運用から継承」)。
+ * 返す形は旧 notion_overrides と同じ列名なので、変数名 notionOverride は互換のため据え置く。
+ */
 function loadNotionOverride(db, manageNumber) {
-  if (!manageNumber) return null;
-  return db.prepare(`SELECT * FROM notion_overrides WHERE rakuten_manage_number = ?`).get(manageNumber) || null;
+  return loadConfirmedValues(db, manageNumber);
 }
 
 /**
@@ -159,7 +163,7 @@ export async function evaluateItemForPublish({
   //   軽減税率 (8%) の商品のみ payment.taxRate が明示される (実測: aburatoishioil100 のみ '0.1' 明示、
   //   他 5 件 sample は省略)。 missing は 0.1 として readiness に渡し、 Notion 税率 '10%' と整合させる。
   const rakutenTaxRate = rakutenItem.payment?.taxRate ?? 0.1;
-  const resolvedPrice = resolvePrice({ notionOverride, deliveryRow, rakutenItem });
+  const resolvedPrice = resolvePrice({ notionOverride, deliveryRow });
   const readiness = evaluateReadiness({
     notionOverride,
     rakutenItem,
@@ -211,6 +215,8 @@ export async function evaluateItemForPublish({
     fields,
     debug: {
       notion_present: !!notionOverride,
+      value_source: notionOverride?.value_source ?? null,   // manual / portal / legacy_notion
+      value_version: notionOverride?.version ?? null,
       delivery_resolved: !!deliveryRow,
       variant_count: variationResult.variantCount,
       lead_time_ok: leadTimePreflight?.ok,

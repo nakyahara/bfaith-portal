@@ -57,7 +57,7 @@
     <div class="alert alert-info">
       各カテゴリの<strong>チェックリストの ❌ を埋めるだけ</strong>です。
       Yahoo!カテゴリは <strong>AI候補クリック / 検索 / 階層をたどって選択</strong>、
-      店の棚は <strong>実績のある棚から選ぶ / 楽天カテゴリに合わせる</strong> で入ります。保存すると該当カテゴリの商品が全部「出せる」候補に動きます。
+      店の棚は <strong>実績のある棚から選ぶ / 楽天カテゴリに合わせる</strong> で入ります。保存すると該当カテゴリの商品のカテゴリ不足が消えます (タイトル・売価などの確定値もそろっている商品が「出せる」に移ります)。
     </div>
 
     <div id="summary" class="mb-3 text-muted">読み込み中...</div>
@@ -387,7 +387,7 @@
               '<div><strong>紐付け完了</strong>: ' + (g.rakutenGenreName ? esc(g.rakutenGenreName) : 'genre ' + esc(g.genreId)) + '</div>' +
               '<div class="small">Yahoo!カテゴリ: <strong>' + esc(cat) + '</strong>' + (savedName ? ' (' + esc(savedName) + ')' : '') +
               (path ? ' ／ 店の棚: <strong>' + esc(path) + '</strong>' : ' ／ <span class="text-danger">店の棚は未設定 (棚が決まるまで出品は止まります)</span>') + '</div>' +
-              '<div class="small text-muted">' + g.count + ' 商品が「出せる」候補に動きます (次の一覧更新で反映)</div>' +
+              '<div class="small text-muted">' + g.count + ' 商品のカテゴリ不足が消えます (確定値もそろっている商品は次の一覧更新で「出せる」へ)</div>' +
             '</div>' +
           '</div>';
       } catch (e) {

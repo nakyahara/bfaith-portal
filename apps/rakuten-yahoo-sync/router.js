@@ -1,16 +1,16 @@
 /**
- * RakutenYahooSync (RYS) — bfaith-portal app router (Phase E-2: Notion sync 追加)
+ * RakutenYahooSync (RYS) — bfaith-portal app router
  *
  * 設計原則 (Codex Phase E R3/R4 確定):
  *   - 楽天 RMS は miniPC proxy 経由 (E-3 以降で実装)
  *   - Notion 連携は 2026-09-14 に廃止 (旧 Notion 商品マスターは削除済み。書込・取込の経路は 410)
+ *   - 確定値 (Yahoo!タイトル・売価・配送・税率・カテゴリ) は services/confirmed-values.js が唯一の入口 (2026-10-22〜)。
+ *     入力 = 商品詳細ドロワーの「この値で確定」(既存商品) / 商品登録ハブの「Yahoo!移行に確定」(新商品)
  *   - secret 値は UI / DB / log に出さない
  *   - RYS state は 専用 SQLite (rakuten-yahoo-sync.db)
  *   - 実 publish は RYS_PUBLISH_ENABLED=0 default
  *
- * E-2 で追加:
- *   - GET  /api/notion/sync/status  : sync_state + readiness summary
- *   - POST /api/notion/sync          : 手動 sync 実行 (body: {dryRun?, mode?})
+ * 旧 Notion 系 API: GET /api/notion/sync/status (残存件数の読み取りだけ) / POST の 4 経路は 410
  */
 
 import { Router } from 'express';
@@ -24,6 +24,13 @@ import { startRefreshRun, executeRefreshPipeline, getRefreshRun, NOTION_RETIRED_
 import { executePublish, isPublishEnabled, buildIdempotencyKey } from './services/publish-executor.js';
 import { translateReason, summarizeReasons, categorizeReason } from './lib/reason-translator.js';
 import { resolveCategoryAndPath } from './services/category-resolver.js';
+import { resolvePrice, pickRakutenMinPrice } from './services/field-mapper.js';
+import { TAX_RATE_MAP } from './services/readiness-check.js';
+import {
+  loadAllConfirmedRows, mergeConfirmedValues, loadConfirmedValues, loadConfirmedRow,
+  confirmValues, listConfirmHistory, listDeliveryOptions, ConfirmError, SOURCE_LABELS,
+} from './services/confirmed-values.js';
+import { suggestDeliveryLabelFromRakutenItem } from './services/delivery-label-map.js';
 import {
   excludeMigrationItem,
   restoreMigrationExclusion,
@@ -234,6 +241,29 @@ function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
     ORDER BY c.item_code
   `).all();
 
+  // 2026-10-22: 確定値 = 確定値の表 (このアプリ / 商品登録ハブで確定) → 無ければ旧 notion_overrides (継承)。
+  //   出品 (publish-pipeline の loadConfirmedValues) と同じ合成をここでもする (一覧と出品で判定がずれないように)
+  const confirmedMap = loadAllConfirmedRows(db);
+  const deliveryMap = new Map(db.prepare('SELECT * FROM delivery_mapping').all().map((d) => [d.notion_delivery_label, d]));
+  for (const r of candidateRows) {
+    const mn = String(r.rakuten_manage_number || r.item_code || '').trim().toLowerCase();
+    const legacy = r.notion_page_id ? {
+      yahoo_title: r.yahoo_title, yahoo_price: r.yahoo_price, yahoo_price_sagawa: r.yahoo_price_sagawa,
+      notion_delivery_label: r.notion_delivery_label, notion_tax_rate: r.notion_tax_rate,
+      notion_product_category: r.notion_product_category, notion_path: r.notion_path, synced_at: r.synced_at,
+    } : null;
+    const merged = mergeConfirmedValues(confirmedMap.get(mn) || null, legacy);
+    r.yahoo_title = merged?.yahoo_title ?? null;
+    r.yahoo_price = merged?.yahoo_price ?? null;
+    r.yahoo_price_sagawa = merged?.yahoo_price_sagawa ?? null;
+    r.notion_delivery_label = merged?.notion_delivery_label ?? null;
+    r.notion_tax_rate = merged?.notion_tax_rate ?? null;
+    r.notion_product_category = merged?.notion_product_category ?? null;
+    r.notion_path = merged?.notion_path ?? null;
+    r.synced_at = merged?.synced_at ?? null;
+    r._merged = merged;
+  }
+
   // status 計算 + reason 翻訳 (Codex R2 D-2 precedence: excluded > done > actionable > fixable > stale)
   const products = candidateRows.map((r) => {
     const isExcluded = r.exclusion_id !== null && r.exclusion_id !== undefined;
@@ -248,12 +278,18 @@ function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
     } else if (r.candidate_status === 'stale') {
       status = 'stale';
     } else {
-      // candidate / resolved 状態だがまだ done でない → Notion 必須 4 項目 + Yahoo カテゴリ 2 項目で判定
+      // candidate / resolved 状態だがまだ done でない → 確定値の必須 4 項目 + Yahoo カテゴリ 2 項目で判定
+      //   売価は出品と同じ resolvePrice (確定した金額だけ・佐川売価の扱いも同じ) で見る
       const missing = [];
+      const deliveryRow = r.notion_delivery_label ? (deliveryMap.get(String(r.notion_delivery_label).trim()) || null) : null;
       if (!r.yahoo_title)            missing.push('notion_title_missing');
-      if (!r.yahoo_price)            missing.push('price_invalid_or_zero');
-      if (!r.notion_delivery_label)  missing.push('delivery_mapping_unresolved');
+      if (!(resolvePrice({ notionOverride: r._merged, deliveryRow }) > 0)) {
+        const sagawaPending = r.yahoo_price > 0 && deliveryRow?.applies_sagawa_price === 1 && r._merged?.sagawa_mode !== 'same';
+        missing.push(sagawaPending ? 'sagawa_price_unconfirmed' : 'price_invalid_or_zero');
+      }
+      if (!deliveryRow)              missing.push('delivery_mapping_unresolved');
       if (!r.notion_tax_rate)        missing.push('notion_tax_rate_missing');
+      else if (TAX_RATE_MAP[r.notion_tax_rate] === undefined) missing.push(`notion_tax_rate_unknown_value:${r.notion_tax_rate}`);
       // Phase E-11-d: category-resolver と整合させる。 自動推定で取れるなら actionable、 取れないなら fixable
       let categoryResolved = null;
       try {
@@ -283,8 +319,8 @@ function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
       //   live 判定を正とする。 live で再計算できない項目 (画像/税率整合/バリエーション等、
       //   楽天実データが要るもの) だけ persist 値を残す。
       const LIVE_RECOMPUTED_HEADS = new Set([
-        'notion_title_missing', 'price_invalid_or_zero', 'delivery_mapping_unresolved',
-        'notion_tax_rate_missing', 'notion_category_partial',
+        'notion_title_missing', 'price_invalid_or_zero', 'sagawa_price_unconfirmed', 'delivery_mapping_unresolved',
+        'notion_tax_rate_missing', 'notion_tax_rate_unknown_value', 'notion_category_partial',
         'product_category_unresolved', 'path_unresolved',
       ]);
       existingReasons = existingReasons.filter((x) => !LIVE_RECOMPUTED_HEADS.has(String(x).split(':')[0]));
@@ -320,6 +356,10 @@ function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
       taxRate:            r.notion_tax_rate,
       notionStatus:       r.notion_status,
       syncedAt:           r.synced_at,
+      // 確定値の出所 (manual / portal / legacy_notion / null)。portal はハブの商品詳細へリンクする
+      valueSource:        r._merged?.value_source ?? null,
+      confirmedAt:        r._merged?.confirmed_at ?? null,
+      portalDraftId:      r._merged?.portal_draft_id ?? null,
       exclusionKind:      r.exclusion_kind,
       exclusionReason:    r.exclusion_reason,
       exclusionAt:        r.exclusion_at,
@@ -357,8 +397,29 @@ function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
     yahooTitle:   r.yahoo_title,
     notionStatus: r.notion_status,
     syncedAt:     r.synced_at,
+    valueSource:  'legacy_notion',
     status:       'orphan',
   }));
+  // 確定値の表にだけある商品 (商品登録ハブで楽天に出す前に確定した新商品など)。候補に現れたら通常の一覧へ移る
+  const candidateKeys = new Set();
+  for (const r of candidateRows) {
+    candidateKeys.add(String(r.item_code || '').toLowerCase());
+    if (r.rakuten_manage_number) candidateKeys.add(String(r.rakuten_manage_number).toLowerCase());
+  }
+  const orphanKeys = new Set(orphanProducts.map((p) => String(p.itemCode).toLowerCase()));
+  for (const [mn, row] of confirmedMap) {
+    if (candidateKeys.has(mn)) continue;
+    if (orphanKeys.has(mn)) {
+      const p = orphanProducts.find((x) => String(x.itemCode).toLowerCase() === mn);
+      Object.assign(p, { yahooTitle: row.yahoo_title, valueSource: row.source, syncedAt: row.confirmed_at, portalDraftId: row.portal_draft_id });
+      continue;
+    }
+    orphanProducts.push({
+      itemCode: mn, notionPageId: null, yahooTitle: row.yahoo_title, notionStatus: null,
+      syncedAt: row.confirmed_at, valueSource: row.source, portalDraftId: row.portal_draft_id, status: 'orphan',
+    });
+  }
+  orphanProducts.sort((a, b) => String(a.itemCode).localeCompare(String(b.itemCode)));
 
   // filter 適用
   let filtered = products;
@@ -369,12 +430,14 @@ function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
   else if (filter === 'stale')  filtered = products.filter((p) => p.status === 'stale');
   else if (filter === 'orphan') filtered = orphanProducts;
 
-  // 検索 (商品コード / タイトル 部分一致、 case-insensitive)
+  // 検索 (商品コード / Yahoo!タイトル / 楽天の商品名 部分一致、 case-insensitive)
+  //   確定値の無い商品はカードに楽天の商品名が出るので、それでも引けるようにする
   const term = String(search || '').trim().toLowerCase();
   if (term) {
     filtered = filtered.filter((p) =>
       (p.itemCode && p.itemCode.toLowerCase().includes(term))
       || (p.yahooTitle && p.yahooTitle.toLowerCase().includes(term))
+      || (p.rakutenTitle && String(p.rakutenTitle).toLowerCase().includes(term))
     );
   }
 
@@ -479,11 +542,17 @@ router.get('/', (req, res) => {
   //   syncState.last_successful_sync_at = 旧 Notion からの最終取込 (以後更新されない)
   let overrideStats = null;
   try { overrideStats = getNotionOverrideStats(getDB()); } catch (_) { /* DB 未初期化 */ }
+  // 2026-10-22: 確定値の表 (このアプリで確定 / 商品登録ハブで確定) の件数
+  let confirmedStats = null;
+  try {
+    confirmedStats = { manual: 0, portal: 0 };
+    for (const r of getDB().prepare('SELECT source, COUNT(*) AS n FROM yahoo_confirmed_values GROUP BY source').all()) confirmedStats[r.source] = r.n;
+  } catch (_) { confirmedStats = null; /* migration 023 未適用 */ }
 
   renderView(res, 'dashboard', {
     status,
     syncState,
-    notionRetired: { at: NOTION_RETIRED_AT, overrides: overrideStats },
+    notionRetired: { at: NOTION_RETIRED_AT, overrides: overrideStats, confirmed: confirmedStats },
     publishSummary,
     publishEnabled: isPublishEnabled(),
     products,
@@ -545,7 +614,7 @@ for (const [route, label] of NOTION_RETIRED_ENDPOINTS) {
     res.status(410).json({
       status: 'retired',
       retiredAt: NOTION_RETIRED_AT,
-      error: `${label}は ${NOTION_RETIRED_AT} に廃止しました (旧 Notion 商品マスターは削除済み)。確定値の入力は次の更新で追加される編集欄 / 商品登録ハブからの連携に移ります`,
+      error: `${label}は ${NOTION_RETIRED_AT} に廃止しました (旧 Notion 商品マスターは削除済み)。確定値は商品詳細の「この値で確定」か、商品登録ハブの「Yahoo!移行に確定」で入れてください`,
     });
   });
 }
@@ -928,13 +997,6 @@ router.post('/api/publish/evaluate/:itemCode', async (req, res) => {
  */
 router.post('/api/publish/execute/:itemCode', async (req, res) => {
   try {
-    // 受理時 dual check #1
-    if (!isPublishEnabled()) {
-      return res.status(403).json({
-        status: 'fail',
-        error: 'RYS_PUBLISH_ENABLED=0 (kill-switch). Set env to 1 to enable real publish.',
-      });
-    }
     const itemCode = req.params.itemCode;
     const body = req.body || {};
     const db = getDB();
@@ -958,6 +1020,21 @@ router.post('/api/publish/execute/:itemCode', async (req, res) => {
       return res.status(400).json({ error: 'manage_number_required', itemCode });
     }
 
+    // 本番スイッチ OFF (テストモード) = 出品前チェックだけ回して結果を返す (Yahoo には送らない)。
+    //   2026-10-22: 旧実装は即 403 {status:'fail'} を返し、画面の「🧪 登録テスト」は何も確かめずに
+    //   「⚠ 結果: fail」になっていた (画面の注意書きは「押しても本番に登録されません (確認のみ)」)
+    if (!isPublishEnabled()) {
+      const ev = await evaluateItemForPublish({ db, itemCode, manageNumber, dryRun: true });
+      const blocked = ev.status !== 'ok';
+      return res.status(blocked ? 422 : 200).json({
+        status: blocked ? 'readiness_blocked' : 'not_implemented',
+        testMode: true,
+        reasons: ev.reasons,
+        reasonsTranslated: summarizeReasons(ev.reasons || []).items,
+        error: blocked ? null : 'テストモード (RYS_PUBLISH_ENABLED=0) のため Yahoo には送っていません。出品前チェックは通りました',
+      });
+    }
+
     const result = await executePublish({
       db, itemCode, manageNumber,
       createdBy: 'http',
@@ -973,7 +1050,9 @@ router.post('/api/publish/execute/:itemCode', async (req, res) => {
     // status マッピング (Codex E-5b R1 H-3: publish_failed / lease_lost 追加)
     if (result.status === 'in_progress_conflict') return res.status(409).json(result);
     if (result.status === 'dedupe') return res.status(200).json(result);
-    if (result.status === 'readiness_blocked') return res.status(422).json(result);
+    if (result.status === 'readiness_blocked') {
+      return res.status(422).json({ ...result, reasonsTranslated: summarizeReasons(result.reasons || []).items });
+    }
     if (result.status === 'not_implemented') return res.status(501).json(result);
     if (result.status === 'flag_off') return res.status(403).json(result);
     if (result.status === 'publish_failed') return res.status(502).json(result);  // Yahoo / proxy 起因の publish 失敗
@@ -1008,7 +1087,7 @@ router.post('/api/publish/idempotency-key', (req, res) => {
  *   - exclusionHistory: listExclusionHistory (active + restored)
  *   - readiness: jobs.readiness_blocked_reasons + last_readiness_at
  *
- * itemCode が migration_candidates にない場合でも notion_overrides にあれば 「orphan」 として返す。
+ * itemCode が migration_candidates にない場合でも確定値 (表 or 旧 notion_overrides) にあれば 「orphan」 として返す。
  * どちらにもなければ 404。
  */
 router.get('/api/products/:itemCode/detail', (req, res) => {
@@ -1019,11 +1098,9 @@ router.get('/api/products/:itemCode/detail', (req, res) => {
 
     const candidate = db.prepare('SELECT * FROM migration_candidates WHERE item_code = ?').get(itemCode);
 
-    // notion_overrides は rakuten_manage_number が PK だが、 itemCode 直接 or candidate.rakuten_manage_number で検索
-    const notion = db.prepare(`
-      SELECT * FROM notion_overrides
-      WHERE rakuten_manage_number = COALESCE(?, ?)
-    `).get(candidate?.rakuten_manage_number || null, itemCode);
+    // 確定値 (確定値の表 → 無ければ旧 notion_overrides を継承)。キーは楽天の商品管理番号
+    const manageNumber = candidate?.rakuten_manage_number || itemCode;
+    const notion = loadConfirmedValues(db, manageNumber);
 
     if (!candidate && !notion) {
       return res.status(404).json({ status: 'fail', error: `product not found: ${itemCode}` });
@@ -1068,8 +1145,20 @@ router.get('/api/products/:itemCode/detail', (req, res) => {
 
     return res.json({
       itemCode,
+      manageNumber,
       candidate: candidate || null,
+      // 出品で使う確定値 (列名は旧 notion_overrides と同じ。value_source = manual / portal / legacy_notion)
       notion: notion || null,
+      confirmed: {
+        row: loadConfirmedRow(db, manageNumber),
+        history: listConfirmHistory(db, manageNumber, { limit: 10 }),
+        sourceLabels: SOURCE_LABELS,
+        deliveryOptions: listDeliveryOptions(db),
+        // 商品登録ハブで確定した商品はこのアプリでは読み取り専用 (D-5)
+        readOnly: notion?.value_source === 'portal',
+        portalUrl: notion?.value_source === 'portal' && notion.portal_draft_id
+          ? `/apps/product-hub/detail/${encodeURIComponent(notion.portal_draft_id)}` : null,
+      },
       yahoo: yahoo || null,
       publishHistory,
       exclusionHistory,
@@ -1085,6 +1174,95 @@ router.get('/api/products/:itemCode/detail', (req, res) => {
     });
   } catch (e) {
     return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+// ───────────────── 確定値の入力 (2026-10-22、方針案 20260914 D-2〜D-5 / PR 2) ─────────────────
+//   Notion 廃止後、既存商品 (商品登録ハブに無い楽天の商品) の Yahoo!タイトル・売価・配送・税率は
+//   ここ (商品詳細ドロワー) で確定する。楽天の値は「候補」として出すだけで、人が「この値で確定」を押した値だけ出品に使う。
+//   商品登録ハブで確定した商品 (source=portal) は読み取り専用 — 値はハブで直す (D-5)。
+
+const actorOf = (req) => req.session?.email || req.session?.displayName || null;
+
+function manageNumberOf(db, itemCode) {
+  const c = db.prepare('SELECT rakuten_manage_number FROM migration_candidates WHERE item_code = ?').get(itemCode);
+  return String(c?.rakuten_manage_number || itemCode).trim();
+}
+
+/** 楽天の今の値から候補を作る (確定はしない)。楽天 RMS を読むので非同期 */
+router.get('/api/products/:itemCode/confirm-candidates', async (req, res) => {
+  try {
+    const db = getDB();
+    const itemCode = String(req.params.itemCode || '').trim();
+    if (!itemCode) return res.status(400).json({ ok: false, error: 'itemCode required' });
+    const manageNumber = manageNumberOf(db, itemCode);
+    const current = loadConfirmedValues(db, manageNumber);
+    let rakuten = null;
+    let rakutenError = null;
+    try {
+      const r = await fetchItemDetail(manageNumber);
+      if (r?.status === 'failed') rakutenError = r.reason || '楽天 RMS から読めませんでした';
+      else if (!r?.item) rakutenError = '楽天 RMS に商品がありません';
+      else rakuten = r.item;
+    } catch (e) {
+      rakutenError = String(e.message || e);
+    }
+    const tax = rakuten ? (Number(rakuten.payment?.taxRate ?? 0.1) === 0.08 ? '8' : '10') : null;
+    const delivery = rakuten ? suggestDeliveryLabelFromRakutenItem(rakuten) : null;
+    res.json({
+      ok: true,
+      itemCode,
+      manageNumber,
+      current,
+      rakutenError,
+      candidates: rakuten ? {
+        // 送るときは 65 字に切り詰める (field-mapper)。候補は楽天の商品名そのまま
+        yahoo_title: String(rakuten.itemName || rakuten.title || '').trim() || null,
+        yahoo_price: pickRakutenMinPrice(rakuten),
+        tax_rate: tax,
+        delivery_label: delivery?.label ?? null,
+        rakutenShippingGroupName: delivery?.rakutenGroupName ?? null,
+        rakutenShippingMixed: !!delivery?.mixed,
+      } : null,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/** 「この値で確定」(既存商品。source=manual) */
+router.post('/api/products/:itemCode/confirm', (req, res) => {
+  const db = getDB();
+  const itemCode = String(req.params.itemCode || '').trim();
+  if (!itemCode) return res.status(400).json({ ok: false, error: 'itemCode required' });
+  const manageNumber = manageNumberOf(db, itemCode);
+  const b = req.body || {};
+  const ev = b.expectedVersion;
+  const expectedVersion = ev === null || ev === undefined || ev === '' ? null : Number(ev);
+  if (expectedVersion !== null && !Number.isInteger(expectedVersion)) {
+    return res.status(400).json({ ok: false, error: 'expectedVersion が不正です (画面を読み直してください)' });
+  }
+  try {
+    const r = confirmValues(db, {
+      manageNumber,
+      input: b.values || {},
+      source: 'manual',
+      actor: actorOf(req),
+      expectedVersion,
+    });
+    audit(db, 'confirm_values', { itemCode, manageNumber, version: r.row?.version, changed: r.changed, previousSource: r.previousSource },
+      { actor: actorOf(req) || 'http' });
+    // 出品前チェックを取り直す (古い理由が「修正必要」に残らないように)。楽天 RMS を読むので待たない・失敗は次の全部更新で直る
+    if (r.changed) {
+      evaluateItemForPublish({ db, itemCode, manageNumber, dryRun: false })
+        .catch((e) => console.warn(`[rys-confirm] readiness 再評価に失敗 ${itemCode}: ${e.message}`));
+    }
+    res.json({ ok: true, changed: r.changed, row: r.row });
+  } catch (e) {
+    if (e instanceof ConfirmError) {
+      return res.status(e.statusCode).json({ ok: false, code: e.code, error: e.message, errors: e.errors, current: e.current });
+    }
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
@@ -1236,7 +1414,7 @@ router.post('/api/publish/bulk/start', (req, res) => {
     if (e.statusCode === 400) return res.status(400).json({ status: 'fail', error: e.message });
     if (e.statusCode === 403) return res.status(403).json({ status: 'fail', error: e.message });
     if (/UNIQUE/.test(e.message) && /bulk_publish_batches/.test(e.message)) {
-      return res.status(409).json({ status: 'fail', error: 'A bulk publish batch is already running' });
+      return res.status(409).json({ status: 'fail', error: '前の一括登録がまだ動いています。終わるのを待ってください (アプリの再起動などで止まっていた場合は、最後の動きから 35 分で自動的に「中断」になり、また始められます)' });
     }
     return res.status(500).json({ status: 'fail', error: e.message });
   }
@@ -1262,7 +1440,7 @@ router.post('/api/publish/bulk/retry-failed', (req, res) => {
   } catch (e) {
     if (e.statusCode === 400) return res.status(400).json({ status: 'fail', error: e.message });
     if (e.statusCode === 403) return res.status(403).json({ status: 'fail', error: e.message });
-    if (/UNIQUE/.test(e.message)) return res.status(409).json({ status: 'fail', error: 'A bulk publish batch is already running' });
+    if (/UNIQUE/.test(e.message)) return res.status(409).json({ status: 'fail', error: '前の一括登録がまだ動いています。終わるのを待ってください (アプリの再起動などで止まっていた場合は、最後の動きから 35 分で自動的に「中断」になり、また始められます)' });
     return res.status(500).json({ status: 'fail', error: e.message });
   }
 });
@@ -1293,7 +1471,7 @@ router.post('/api/publish/bulk/republish-migrated', (req, res) => {
   } catch (e) {
     if (e.statusCode === 400) return res.status(400).json({ status: 'fail', error: e.message });
     if (e.statusCode === 403) return res.status(403).json({ status: 'fail', error: e.message });
-    if (/UNIQUE/.test(e.message)) return res.status(409).json({ status: 'fail', error: 'A bulk publish batch is already running' });
+    if (/UNIQUE/.test(e.message)) return res.status(409).json({ status: 'fail', error: '前の一括登録がまだ動いています。終わるのを待ってください (アプリの再起動などで止まっていた場合は、最後の動きから 35 分で自動的に「中断」になり、また始められます)' });
     return res.status(500).json({ status: 'fail', error: e.message });
   }
 });

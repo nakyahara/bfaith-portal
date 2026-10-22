@@ -148,10 +148,10 @@ async function run() {
   expect('list (9): c-4 stays done after later failed publish (success aggregation)', c4After.status === 'done' && c4After.publishStatus === 'success', JSON.stringify({ status: c4After.status, publishStatus: c4After.publishStatus }));
 
   // (10) Codex R1 High fix: jobs.item_code = c.item_code 結合確認
-  //   c-1 (actionable) に readiness_blocked_reasons を入れて fixable に降格するか確認
+  //   c-1 (actionable) に「一覧では再計算しない理由」(画像) を入れて fixable に降格するか確認 (カテゴリ等の再計算する理由は R10 で捨てる)
   db.prepare(`
     INSERT INTO jobs (item_code, current_state, readiness_status, readiness_blocked_reasons, last_readiness_at)
-    VALUES ('c-1', 'pending', 'blocked', '["product_category_unresolved"]', ?)
+    VALUES ('c-1', 'pending', 'blocked', '["image_upload_failed:boom"]', ?)
   `).run(new Date().toISOString());
   const all3 = listProductsForUI(db, { filter: 'all' });
   const c1After = all3.products.find((p) => p.itemCode === 'c-1');
