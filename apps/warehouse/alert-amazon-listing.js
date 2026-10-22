@@ -53,6 +53,15 @@ export function alertBaseline(db, kind, today, maxGap = MAX_PREV_GAP_DAYS) {
   const d = db.prepare(`SELECT MAX(date_jst) AS d FROM amazon_alert_runs WHERE kind = ? AND date_jst < ?`).get(kind, today)?.d || null;
   return d && d >= addDays(today, -maxGap) ? d : null;
 }
+/**
+ * 比べる元の日の並び (新しい順) = 今日より前・gap 日以内でアラートを済ませた日。
+ * 🚨 SKU ごとに「この並びの中で行があるいちばん新しい日」と比べる (Codex R4 P2): 済ませた日の写しが一部の SKU を取りこぼしていても
+ *   (失敗が 10% 以下で取得は成功扱い・カート価格の失敗した batch)、その SKU はもっと前に済ませた日の行と比べる = 取りこぼした日をはさんだ変化を落とさない
+ */
+export function alertBaselineDates(db, kind, today, maxGap = MAX_PREV_GAP_DAYS) {
+  ensureAlertTables(db);
+  return db.prepare(`SELECT date_jst AS d FROM amazon_alert_runs WHERE kind = ? AND date_jst < ? AND date_jst >= ? ORDER BY date_jst DESC`).all(kind, today, addDays(today, -maxGap)).map((r) => r.d);
+}
 export function markAlertDone(db, kind, date, { prev = null, items = 0, note = null, at = new Date().toISOString() } = {}) {
   ensureAlertTables(db);
   db.prepare(`INSERT INTO amazon_alert_runs (kind, date_jst, prev_date, items, note, finished_at) VALUES (?, ?, ?, ?, ?, ?)
@@ -67,30 +76,38 @@ const yen = (n) => (n == null ? '-' : `¥${Math.round(n).toLocaleString('ja-JP')
 /**
  * 出品のアラートの中身を作る (送らない)。戻り値 { state, today, prev, notBuyable: [...], newErrors: [...] }
  *   state: 'no_today' (今日の写しが無い) | 'first' (比べる元が無い) | 'ok'
- *   prev を渡さなければ alertBaseline (アラートを済ませた日) を使う
+ *   prevDates を渡さなければ alertBaselineDates (アラートを済ませた日・新しい順) を使う。SKU ごとに行があるいちばん新しい日と比べる
  */
-export function buildListingAlerts(db, { today, watch, prev: prevIn }) {
+export function buildListingAlerts(db, { today, watch, prevDates }) {
   if (!hasTable(db, 'amazon_listing_fetch_runs') || !db.prepare(`SELECT 1 FROM amazon_listing_fetch_runs WHERE date_jst = ?`).get(today)) return { state: 'no_today', today, prev: null, notBuyable: [], newErrors: [] };
-  const prev = prevIn === undefined ? alertBaseline(db, 'listing', today) : prevIn;
-  if (!prev || !db.prepare(`SELECT 1 FROM amazon_listing_fetch_runs WHERE date_jst = ?`).get(prev)) return { state: 'first', today, prev: null, notBuyable: [], newErrors: [] };
-  const rowsOf = (d) => new Map(db.prepare(`SELECT * FROM amazon_listing_status_daily WHERE date_jst = ?`).all(d).map((r) => [r.sku_key, r]));
-  const t = rowsOf(today), p = rowsOf(prev);
+  const dates = (prevDates ?? alertBaselineDates(db, 'listing', today)).filter((d) => db.prepare(`SELECT 1 FROM amazon_listing_fetch_runs WHERE date_jst = ?`).get(d));
+  if (!dates.length) return { state: 'first', today, prev: null, notBuyable: [], newErrors: [] };
+  const rowsOf = (d) => new Map(db.prepare(`SELECT * FROM amazon_listing_status_daily WHERE date_jst = ?`).all(d).filter((r) => watch.has(r.sku_key)).map((r) => [r.sku_key, r]));
   const issuesOf = (d, sev) => {
     const m = new Map();
     for (const r of db.prepare(`SELECT sku_key, issue_key, code, severity, message, enforcement_actions FROM amazon_listing_issue_daily WHERE date_jst = ?${sev ? ' AND severity = ?' : ''}`).all(...(sev ? [d, sev] : [d]))) {
+      if (!watch.has(r.sku_key)) continue;
       if (!m.has(r.sku_key)) m.set(r.sku_key, []);
       m.get(r.sku_key).push(r);
     }
     return m;
   };
-  const tErr = issuesOf(today, 'ERROR'), pAll = issuesOf(prev, null);
+  const t = rowsOf(today);
+  // SKU ごとの比べる元 = 済ませた日の新しい順で、行があるいちばん新しい日の行と issue
+  const p = new Map(), pIssues = new Map();
+  for (const d of dates) {
+    const rows = rowsOf(d);
+    const iss = issuesOf(d, null);
+    for (const [k, r] of rows) if (!p.has(k)) { p.set(k, r); pIssues.set(k, iss.get(k) || []); }
+  }
+  const tErr = issuesOf(today, 'ERROR');
   const notBuyable = [], newErrors = [];
   for (const [k, w] of watch) {
     const a = t.get(k), b = p.get(k);
     if (!a || !b) continue;
-    const ctx = { sku_key: k, seller_sku: a.seller_sku, asin: a.asin || b.asin, units: w.units, sales_jpy: w.sales_jpy, fba_qty: w.fba_qty };
+    const ctx = { sku_key: k, seller_sku: a.seller_sku, asin: a.asin || b.asin, units: w.units, sales_jpy: w.sales_jpy, fba_qty: w.fba_qty, prev_date: b.date_jst };
     if (b.is_buyable === 1 && a.is_buyable !== 1) notBuyable.push({ ...ctx, prev_status: b.status, status: a.status, suppressed: a.suppressed, reason: 'not_buyable' });
-    const before = new Set((pAll.get(k) || []).map((i) => i.issue_key));
+    const before = new Set(pIssues.get(k).map((i) => i.issue_key));
     for (const i of (tErr.get(k) || [])) {
       if (!before.has(i.issue_key)) newErrors.push({ ...ctx, issue_key: i.issue_key, code: i.code, message: i.message, actions: JSON.parse(i.enforcement_actions || '[]'), reason: `new_error:${i.issue_key}` });
     }
@@ -98,34 +115,38 @@ export function buildListingAlerts(db, { today, watch, prev: prevIn }) {
   const bySales = (x, y) => (y.sales_jpy - x.sales_jpy) || (y.fba_qty - x.fba_qty) || (x.sku_key < y.sku_key ? -1 : 1);
   notBuyable.sort(bySales);
   newErrors.sort(bySales);
-  return { state: 'ok', today, prev, notBuyable, newErrors };
+  return { state: 'ok', today, prev: dates[0], notBuyable, newErrors };
 }
 
 /**
  * カートを取られたアラートの中身を作る (送らない)。戻り値 { state, today, prev, lost: [...] }
  *   state: 'no_today' | 'first' | 'ok'
  */
-export function buildBuyboxAlerts(db, { today, watch, prev: prevIn }) {
+export function buildBuyboxAlerts(db, { today, watch, prevDates }) {
   if (!hasTable(db, 'fact_amazon_price_snapshot') || !db.prepare(`SELECT 1 FROM fact_amazon_price_snapshot WHERE date_jst = ? LIMIT 1`).get(today)) return { state: 'no_today', today, prev: null, lost: [] };
-  const prev = prevIn === undefined ? alertBaseline(db, 'buybox', today) : prevIn;
-  if (!prev || !db.prepare(`SELECT 1 FROM fact_amazon_price_snapshot WHERE date_jst = ? LIMIT 1`).get(prev)) return { state: 'first', today, prev: null, lost: [] };
-  // 🚨 = 0 / = 1 で比べる (NULL = カート不在・不明 は「取られた」にも「自社だった」にもしない)
-  const rows = db.prepare(`
-    SELECT t.seller_sku, t.asin, t.channel, t.my_price, t.buybox_price, p.buybox_price AS prev_buybox_price, p.my_price AS prev_my_price
-    FROM fact_amazon_price_snapshot t
-    JOIN fact_amazon_price_snapshot p ON p.date_jst = ? AND p.seller_sku = t.seller_sku
-    WHERE t.date_jst = ? AND t.buybox_is_mine = 0 AND p.buybox_is_mine = 1
-  `).all(prev, today);
+  const dates = (prevDates ?? alertBaselineDates(db, 'buybox', today)).filter((d) => db.prepare(`SELECT 1 FROM fact_amazon_price_snapshot WHERE date_jst = ? LIMIT 1`).get(d));
+  if (!dates.length) return { state: 'first', today, prev: null, lost: [] };
+  // SKU ごとの比べる元 = 済ませた日の新しい順で、行がある (取れた) いちばん新しい日の行 (NULL = カート不在も「取れた」)。失敗した batch の SKU は行が無い = もっと前の日と比べる
+  const prevOf = new Map();
+  for (const d of dates) {
+    for (const r of db.prepare(`SELECT seller_sku, buybox_is_mine, buybox_price, date_jst FROM fact_amazon_price_snapshot WHERE date_jst = ?`).all(d)) {
+      const k = String(r.seller_sku).trim().toLowerCase();
+      if (!prevOf.has(k)) prevOf.set(k, r);
+    }
+  }
   const lost = [];
-  for (const r of rows) {
+  // 🚨 = 0 / = 1 で比べる (NULL = カート不在・不明 は「取られた」にも「自社だった」にもしない)
+  for (const r of db.prepare(`SELECT seller_sku, asin, channel, my_price, buybox_price FROM fact_amazon_price_snapshot WHERE date_jst = ? AND buybox_is_mine = 0`).all(today)) {
     const k = String(r.seller_sku).trim().toLowerCase();
     const w = watch.get(k);
     if (!w || !(w.units > 0)) continue;   // 売れていない SKU は言わない (在庫だけでは足りない)
+    const p = prevOf.get(k);
+    if (!p || p.buybox_is_mine !== 1) continue;
     const diff = (r.my_price != null && r.buybox_price != null) ? Math.round((r.my_price - r.buybox_price) * 100) / 100 : null;
-    lost.push({ sku_key: k, seller_sku: r.seller_sku, asin: r.asin, channel: r.channel, my_price: r.my_price, buybox_price: r.buybox_price, prev_buybox_price: r.prev_buybox_price, diff, units: w.units, sales_jpy: w.sales_jpy, reason: 'buybox_lost' });
+    lost.push({ sku_key: k, seller_sku: r.seller_sku, asin: r.asin, channel: r.channel, my_price: r.my_price, buybox_price: r.buybox_price, prev_buybox_price: p.buybox_price, prev_date: p.date_jst, diff, units: w.units, sales_jpy: w.sales_jpy, reason: 'buybox_lost' });
   }
   lost.sort((x, y) => (y.sales_jpy - x.sales_jpy) || (x.sku_key < y.sku_key ? -1 : 1));
-  return { state: 'ok', today, prev, lost };
+  return { state: 'ok', today, prev: dates[0], lost };
 }
 
 /** 送った記録が無いものだけ残す */
@@ -152,7 +173,7 @@ export function formatListingMessage({ today, prev, notBuyable, newErrors }) {
   const out = [`🚨 *Amazon 出品の問題* (${today}・前の回 ${prev}・売れている / FBA 在庫のある SKU だけ)`];
   if (notBuyable.length) {
     out.push('', `*BUYABLE でなくなった ${notBuyable.length} 件*`);
-    out.push(...listLines(notBuyable, (i) => `• ${i.seller_sku}${i.asin ? ` (${i.asin})` : ''}: ${i.prev_status || '-'} → ${i.status || '(状態なし)'}${i.suppressed ? ' 【出品停止】' : ''} / ${salesNote(i)}`));
+    out.push(...listLines(notBuyable, (i) => `• ${i.seller_sku}${i.asin ? ` (${i.asin})` : ''}: ${i.prev_status || '-'}${i.prev_date && i.prev_date !== prev ? ` (${i.prev_date})` : ''} → ${i.status || '(状態なし)'}${i.suppressed ? ' 【出品停止】' : ''} / ${salesNote(i)}`));
   }
   if (newErrors.length) {
     out.push('', `*新しい ERROR ${newErrors.length} 件*`);

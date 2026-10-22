@@ -255,6 +255,20 @@ t('1 通にまとめて送る・送れた分を記録 = 同じ日に流し直し
   assert.equal(msgs.length, 1);
 });
 
+t('🚨 済ませた日の写しが SKU を取りこぼしていたら、その SKU はもっと前に済ませた日の行と比べる (取りこぼした日をはさんだ変化を落とさない。Codex R4 P2)', async () => {
+  const db = openDb();
+  sold(db, 'A'); sold(db, 'B');
+  snap(db, '2026-10-20', [item('A'), item('B', { issues: [issue('1')] })]);
+  markAlertDone(db, 'listing', '2026-10-20');
+  snap(db, PREV, [item('B', { issues: [issue('1')] })], 'partial');   // A を取りこぼした (失敗は 10% 以下 = アラートは流れて済ませた)
+  markAlertDone(db, 'listing', PREV);
+  snap(db, TODAY, [item('A', { status: [], issues: [issue('9')] }), item('B', { issues: [issue('1')] })]);
+  const r = buildListingAlerts(db, { today: TODAY, watch: loadWatchSkus(db, { today: TODAY }) });
+  assert.equal(r.prev, PREV);
+  assert.deepEqual(r.notBuyable.map((x) => [x.sku_key, x.prev_date]), [['a', '2026-10-20']]);
+  assert.deepEqual(r.newErrors.map((x) => [x.sku_key, x.code]), [['a', '9']]);   // B の ERROR 1 は前の日からある
+});
+
 section('カートを取られたアラート');
 function priceRow(db, date, sku, mine, my = 1000, bb = 1000) {
   db.prepare(`INSERT INTO fact_amazon_price_snapshot (date_jst, seller_sku, asin, channel, my_price, buybox_price, buybox_is_mine, fetched_at) VALUES (?, ?, 'B000000001', 'FBA', ?, ?, ?, 'T')`).run(date, sku, my, bb, mine);
@@ -275,6 +289,17 @@ t('前の回 自社 (1) → 今日 他社 (0) で売れた SKU だけ・🚨 カ
   const m = formatBuyboxMessage({ today: TODAY, prev: PREV, lost: r.lost });
   assert.match(m, /差 \+¥100/);
   assert.match(m, /差 -¥50/);
+});
+t('🚨 カート: 済ませた日に行が無い SKU (価格の失敗した batch) はもっと前に済ませた日と比べる (Codex R4 P2)', () => {
+  const db = openDb();
+  sold(db, 'a'); sold(db, 'b');
+  priceRow(db, '2026-10-20', 'a', 1); priceRow(db, '2026-10-20', 'b', 1);
+  markAlertDone(db, 'buybox', '2026-10-20');
+  priceRow(db, PREV, 'b', null);   // a は失敗した batch (行なし)・b はカート不在 (取れた)
+  markAlertDone(db, 'buybox', PREV);
+  priceRow(db, TODAY, 'a', 0); priceRow(db, TODAY, 'b', 0);
+  const r = buildBuyboxAlerts(db, { today: TODAY, watch: loadWatchSkus(db, { today: TODAY }) });
+  assert.deepEqual(r.lost.map((x) => [x.sku_key, x.prev_date]), [['a', '2026-10-20']]);   // b は前の回 NULL = 取られたにしない
 });
 t('比べる元が無い = 通知しない (前の日の写しがあっても)・今日の写しが無い = ⚠️ (比べない)・送った分は二重に鳴らない', async () => {
   const db = openDb();
