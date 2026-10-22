@@ -11,7 +11,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { createRateGate, callWithRetry, loadWatchSkus, resolveSellerId, businessDate, addDays } from '../apps/warehouse/amazon-listing-common.js';
-import { parseListingItem, notFoundRow, scanAllListings, lookupSkus, saveListingSnapshot, lookupTargets, ensureListingTables, MAX_PAGEABLE } from '../apps/warehouse/fetch-amazon-listing-issues.js';
+import { parseListingItem, notFoundRow, scanAllListings, lookupSkus, saveListingSnapshot, lookupTargets, missingRows, ensureListingTables, MAX_PAGEABLE } from '../apps/warehouse/fetch-amazon-listing-issues.js';
 import { buildListingAlerts, buildBuyboxAlerts, runAlert, formatBuyboxMessage } from '../apps/warehouse/alert-amazon-listing.js';
 import { parseSalesRanks, saveRanks, fetchBatch, fetchAllRanks, loadTargetAsins, ensureRankTables } from '../apps/warehouse/fetch-amazon-bsr.js';
 
@@ -128,12 +128,21 @@ t('SKU の引き直し: 20 件ずつ・返らない = 見つからない・失�
   assert.deepEqual([[...r.found.keys()], r.notFound.length, r.failed, r.skipped, r.calls], [['aa1'], 19, ['f18', 'f19'], ['x,y'], 2]);
   assert.deepEqual([f.calls[0].identifiersType, f.calls[0].identifiers.length], ['SKU', 20]);
 });
-t('引き直しの対象 = アラートの対象 + amazon_sku_fees − 走査に出た SKU・送る形は注文に出てきた登録どおり', () => {
+t('引き直しの対象 = アラートの対象 + amazon_sku_fees − 走査に出た SKU・🚨 綴りは前の日までの写しで Amazon が返した形 (trusted)・無ければ手元の小文字 (trusted でない)', () => {
   const db = openDb();
-  sold(db, 'Pr_Sold');
+  sold(db, 'pr_sold'); sold(db, 'pr_new');   // sp-api-orders.js は小文字にそろえて入れる
   db.prepare(`INSERT INTO amazon_sku_fees (seller_sku, asin) VALUES ('fee-only', 'B1'), ('pr_sold', 'B1'), ('scanned', 'B1')`).run();
+  snap(db, '2026-10-01', [item('PR_Sold')]);
+  snap(db, PREV, [item('Pr_Sold'), { sku: 'pr_new', __notFound: true }]);   // 見つからない行の綴りは使わない
   const watch = loadWatchSkus(db, { today: TODAY });
-  assert.deepEqual(lookupTargets(db, watch, new Set(['scanned'])), [{ key: 'fee-only', raw: 'fee-only' }, { key: 'pr_sold', raw: 'Pr_Sold' }]);
+  assert.deepEqual(lookupTargets(db, watch, new Set(['scanned'])), [
+    { key: 'fee-only', raw: 'fee-only', trusted: false }, { key: 'pr_new', raw: 'pr_new', trusted: false }, { key: 'pr_sold', raw: 'Pr_Sold', trusted: true }]);
+});
+t('🚨 引いても返らない SKU: 走査が全部終わった or 綴りが確か = NOT_FOUND・綴りが分からず走査も途中 = 分からない (書かない = 偽の「BUYABLE でなくなった」を出さない)', () => {
+  const nf = [{ key: 'a', raw: 'A', trusted: true }, { key: 'b', raw: 'b', trusted: false }];
+  const p = missingRows(nf, { scanComplete: false, marketplaceId: MP });
+  assert.deepEqual([p.rows.map((r) => [r.sku_key, r.seller_sku, r.status]), p.unknown], [[['a', 'A', 'NOT_FOUND']], ['b']]);
+  assert.deepEqual(missingRows(nf, { scanComplete: true, marketplaceId: MP }).rows.map((r) => r.sku_key), ['a', 'b']);
 });
 
 section('写しの保存');

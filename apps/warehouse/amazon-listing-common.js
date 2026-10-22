@@ -77,7 +77,7 @@ const hasTable = (db, name) => !!db.prepare(`SELECT 1 FROM sqlite_master WHERE t
 
 /**
  * アラートの対象 = 直近 WATCH_DAYS 日に売れた SKU (raw_sp_orders・取消を除く) か、FBA の在庫がある SKU (inv_daily_detail の fba_warehouse・qty > 0)。
- * 戻り値 Map(sku_key → { raw: 注文に出てきた登録どおりの SKU | null, units, sales_jpy, fba_qty, fba_date })
+ * 戻り値 Map(sku_key → { raw: 注文の SKU (sp-api-orders.js が小文字にそろえている = 登録の綴りとは限らない) | null, units, sales_jpy, fba_qty, fba_date })
  *   表が無い (新しい DB・試験) ときは空として扱う
  */
 export function loadWatchSkus(db, { today, days = WATCH_DAYS, stockMaxAgeDays = FBA_STOCK_MAX_AGE_DAYS } = {}) {

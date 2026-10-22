@@ -196,8 +196,8 @@ export async function scanAllListings(call, { fromIso = SCAN_FROM, toIso, limit 
 }
 
 /**
- * 走査に出てこなかった SKU を identifiers で引き直す。wanted = [{ key, raw }] (raw = Amazon に送る SKU)
- * 戻り値 { found: Map(sku_key → item), notFound: [raw], failed: [raw], skipped: [raw (カンマ入りで送れない)], calls, errors }
+ * 走査に出てこなかった SKU を identifiers で引き直す。wanted = [{ key, raw, trusted }] (raw = Amazon に送る SKU・trusted = 登録どおりの綴りと分かっている)
+ * 戻り値 { found: Map(sku_key → item), notFound: [wanted の要素], failed: [raw], skipped: [raw (カンマ入りで送れない)], calls, errors }
  */
 export async function lookupSkus(call, wanted, { log = () => {} } = {}) {
   const found = new Map();
@@ -211,7 +211,7 @@ export async function lookupSkus(call, wanted, { log = () => {} } = {}) {
       calls++;
       const res = await call({ identifiers: batch.map((w) => w.raw), identifiersType: 'SKU', pageSize: PAGE_SIZE });
       const got = new Map(arr(res?.items).map((it) => [skuKey(it?.sku), it]));
-      for (const w of batch) { if (got.has(w.key)) found.set(w.key, got.get(w.key)); else notFound.push(w.raw); }
+      for (const w of batch) { if (got.has(w.key)) found.set(w.key, got.get(w.key)); else notFound.push(w); }
     } catch (e) {
       errors++;
       failed.push(...batch.map((w) => w.raw));
@@ -262,7 +262,11 @@ export function saveListingSnapshot(db, { date, rows, run, fetchedAt = new Date(
   return { skipped: null, saved, issues };
 }
 
-/** 引き直しの対象 = アラートの対象 + amazon_sku_fees の SKU のうち、走査に出てこなかったもの。送る SKU は注文に出てきた登録どおりの形を優先 */
+/**
+ * 引き直しの対象 = アラートの対象 + amazon_sku_fees の SKU のうち、走査に出てこなかったもの。
+ * 🚨 注文 (sp-api-orders.js)・手数料・在庫の表の SKU は小文字にそろえてある = Amazon の登録の綴りではない (Codex R1 P2)。
+ *   綴り = 前の日までの出品の写しで Amazon が返した seller_sku (trusted = true) → 無ければ手元の綴り (trusted = false = 引いても返らなくても「無い」とは言わない)
+ */
 export function lookupTargets(db, watch, scannedKeys) {
   const want = new Map();
   for (const [k, w] of watch) want.set(k, w.raw || k);
@@ -271,7 +275,23 @@ export function lookupTargets(db, watch, scannedKeys) {
     const k = skuKey(r.seller_sku);
     if (!want.has(k)) want.set(k, String(r.seller_sku).trim());
   }
-  return [...want].filter(([k]) => !scannedKeys.has(k)).map(([key, raw]) => ({ key, raw })).sort((x, y) => (x.key < y.key ? -1 : 1));
+  const spelled = new Map();
+  ensureListingTables(db);
+  for (const r of db.prepare(`SELECT sku_key, seller_sku FROM amazon_listing_status_daily WHERE source != 'not_found' ORDER BY date_jst`).all()) spelled.set(r.sku_key, r.seller_sku);
+  return [...want].filter(([k]) => !scannedKeys.has(k))
+    .map(([key, raw]) => (spelled.has(key) ? { key, raw: spelled.get(key), trusted: true } : { key, raw, trusted: false }))
+    .sort((x, y) => (x.key < y.key ? -1 : 1));
+}
+
+/**
+ * 引いても返らなかった SKU のうち「出品が無い」と言えるものだけ NOT_FOUND の行にする。
+ *   走査が全部終わった (窓の失敗・上限・途中で止めた が無い) = 走査に出なかった時点で無い / 綴りが確か (trusted) = 引いて返らなければ無い。
+ *   それ以外 (綴りが分からない) = 分からない = 書かない (差を出さない)
+ */
+export function missingRows(notFound, { scanComplete, marketplaceId }) {
+  const rows = [], unknown = [];
+  for (const w of notFound) (scanComplete || w.trusted ? rows.push(notFoundRow(w.raw, marketplaceId)) : unknown.push(w.raw));
+  return { rows, unknown };
 }
 
 export function parseArgs(argv = process.argv.slice(2)) {
@@ -314,7 +334,9 @@ async function main() {
   const rows = [];
   for (const it of scan.items.values()) rows.push(parseListingItem(it, mp, { source: 'scan' }));
   for (const it of look.found.values()) rows.push(parseListingItem(it, mp, { source: 'sku_lookup' }));
-  for (const raw of look.notFound) rows.push(notFoundRow(raw, mp));
+  const scanComplete = scan.errors === 0 && scan.capped === 0 && !scan.stopped;
+  const missing = missingRows(look.notFound, { scanComplete, marketplaceId: mp });
+  rows.push(...missing.rows);
   const calls = scan.calls + look.calls;
   const errors = scan.errors + look.errors;
   const complete = errors === 0 && scan.capped === 0 && !scan.stopped && args.limit === 0;
@@ -322,6 +344,7 @@ async function main() {
   if (scan.capped) notes.push(`上限に当たった窓 ${scan.capped}`);
   if (args.limit) notes.push(`--limit ${args.limit}`);
   if (look.skipped.length) notes.push(`カンマ入り SKU ${look.skipped.length}`);
+  if (missing.unknown.length) notes.push(`綴りが分からず無いと言えない SKU ${missing.unknown.length}`);
   if (rows.filter(Boolean).length === 0) { console.error('[ListingIssues] FATAL: 0 件 (書かない)'); process.exitCode = 1; return; }
 
   const run = { status: complete ? 'complete' : 'partial', windows: scan.windows, capped: scan.capped, calls, errors, lookupRequested: wanted.length, note: notes.join(' / ') || null, startedAt, finishedAt: new Date().toISOString() };
@@ -329,7 +352,7 @@ async function main() {
   const buyable = rows.filter((x) => x?.is_buyable).length;
   const withErr = rows.filter((x) => x?.error_count > 0).length;
   const head = r.skipped ? '⚠️' : (complete ? '✓' : '⚠️');
-  console.log(`${head} [出品の状態] ${today} ${run.status}${r.skipped ? ' (その日に complete の写しがあるので置き換えない)' : ''}: 出品 ${r.skipped ? rows.length : r.saved} (BUYABLE ${buyable}・ERROR あり ${withErr}・見つからない ${look.notFound.length}) / 呼び出し ${calls} / 失敗 ${errors}${notes.length ? ` / ${notes.join(' / ')}` : ''}`);
+  console.log(`${head} [出品の状態] ${today} ${run.status}${r.skipped ? ' (その日に complete の写しがあるので置き換えない)' : ''}: 出品 ${r.skipped ? rows.length : r.saved} (BUYABLE ${buyable}・ERROR あり ${withErr}・見つからない ${missing.rows.length}) / 呼び出し ${calls} / 失敗 ${errors}${notes.length ? ` / ${notes.join(' / ')}` : ''}`);
   if (errors > calls * ERROR_RATE_LIMIT) {
     console.error(`[ListingIssues] FATAL: 呼び出しの失敗が多い (${errors}/${calls})`);
     process.exitCode = 1;
