@@ -5,7 +5,8 @@
  *
  * 見るもの (しきい値は下の定数):
  *   A. 返品が多い SKU: 直近 30 日 (JST) の返品数量が 3 個以上 かつ 返品率 (返品数量 / FBA の販売数量) が 10% 以上
- *      - 販売数量 = raw_sp_orders の FBA (fulfillment_channel = 'Amazon')・取り消し以外・同じ 30 日の購入日 (目安。返品は前の月の販売のこともある)
+ *      - 販売数量 = raw_sp_orders の FBA (fulfillment_channel = 'Amazon') かつ Amazon.co.jp の注文 (sales_channel。マルチチャネル発送 = 他モールの注文を FBA から出しただけ は数えない)・
+ *        取り消し以外・同じ 30 日の購入日 (目安。返品は前の月の販売のこともある)
  *      - 販売が 0 (分母が無い) の SKU は返品率を出せないので A には出さない
  *   B. 同じ理由が急に増えた SKU: 直近 7 日の同じ理由の返品数量が 3 個以上 かつ その前の 28 日の 1 週あたりの 3 倍以上
  *      (前の 28 日が 0 なら 3 個以上で出す)
@@ -22,6 +23,9 @@ import 'dotenv/config';
 import { initDB, getDB } from './db.js';
 import { addDays, jstToday, isDirectRun } from './sp-api-report.js';
 import { ensureReturnsTable } from './fetch-amazon-returns.js';
+
+/** Amazon の売上の注文 (mall-orders-transform.mjs の AMAZON_SALES_CHANNEL と同じ値) */
+const AMAZON_SALES_CHANNEL = 'Amazon.co.jp';
 
 export const THRESHOLDS = Object.freeze({
   WINDOW_DAYS: 30,          // A: 見る期間
@@ -57,7 +61,8 @@ export function evaluateReturnAlerts(db, { today = jstToday(), t = THRESHOLDS } 
   // 販売数量 (FBA)。purchase_date は UTC の ISO = JST の日付より 9 時間ずれる (目安なので許す)
   const sold = db.prepare(`
     SELECT COALESCE(SUM(quantity), 0) AS units FROM raw_sp_orders
-    WHERE seller_sku = ? COLLATE NOCASE AND fulfillment_channel = 'Amazon' AND order_status NOT IN ('Cancelled', 'Canceled')
+    WHERE seller_sku = ? COLLATE NOCASE AND fulfillment_channel = 'Amazon' AND sales_channel = '${AMAZON_SALES_CHANNEL}'
+      AND order_status NOT IN ('Cancelled', 'Canceled')
       AND substr(purchase_date, 1, 10) >= ? AND substr(purchase_date, 1, 10) <= ?`);
   const topReason = db.prepare(`
     SELECT reason, SUM(quantity) AS units FROM amazon_fba_returns
@@ -92,6 +97,11 @@ export function evaluateReturnAlerts(db, { today = jstToday(), t = THRESHOLDS } 
 }
 
 export const alertKey = { rate: (a) => `rate|${a.sku}`, reason: (a) => `reason|${a.sku}|${a.reason ?? ''}` };
+
+/** 1 通に載せる分 (それぞれ上から TOP_N)。送った記録はこの分だけに残す (載せなかった分は次の朝にまた候補) */
+export function shownInMessage({ highRate, reasonSpikes }, { t = THRESHOLDS } = {}) {
+  return { highRate: highRate.slice(0, t.TOP_N), reasonSpikes: reasonSpikes.slice(0, t.TOP_N) };
+}
 
 /** 送ってから COOLDOWN_DAYS 未満のものを外す */
 export function filterCooldown(db, { highRate, reasonSpikes }, { today = jstToday(), t = THRESHOLDS } = {}) {
@@ -156,7 +166,7 @@ async function main() {
   if (!msg) { console.log('[ReturnsAlert] ✅ 新しく出すアラートなし'); return; }
   if (!process.env.GCHAT_WEBHOOK) { console.log('[ReturnsAlert] ⚠️ GCHAT_WEBHOOK が無いので送らない (送った記録も残さない)'); return; }
   const sent = await sendGChat(msg);
-  if (sent) markSent(db, toSend, { today });
+  if (sent) markSent(db, shownInMessage(toSend), { today });   // 載せた分だけ (TOP_N を超えて載せなかった分は記録しない)
   console.log(`[ReturnsAlert] ${sent ? '✅ 通知した' : '⚠️ 通知を送れなかった (次の朝にまた出す)'} (返品が多い ${toSend.highRate.length}・理由が急に増えた ${toSend.reasonSpikes.length})`);
 }
 

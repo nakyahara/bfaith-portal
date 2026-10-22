@@ -331,18 +331,19 @@ console.log('返品のアラート (monitor-amazon-returns.js)');
 function alertDb() {
   const db = memDb();
   RET.ensureReturnsTable(db);
-  db.exec('CREATE TABLE raw_sp_orders (seller_sku TEXT, quantity INTEGER, fulfillment_channel TEXT, order_status TEXT, purchase_date TEXT)');
+  db.exec('CREATE TABLE raw_sp_orders (seller_sku TEXT, quantity INTEGER, fulfillment_channel TEXT, order_status TEXT, purchase_date TEXT, sales_channel TEXT)');
   const ins = db.prepare(`INSERT INTO amazon_fba_returns (order_id, seller_sku, fnsku, return_date, license_plate_number, occurrence, return_date_jst, asin, quantity, reason, report_id, generation, first_seen_at, fetched_at)
     VALUES (?, ?, '', ?, '', 1, ?, 'B', ?, ?, 'R', 1, 'T', 'T')`);
   let n = 0;
   const ret = (sku, d, qty, reason) => ins.run(`O${n++}`, sku, `${d}T00:00:00+09:00`, d, qty, reason);
-  const sale = (sku, d, qty, ch = 'Amazon', st = 'Shipped') => db.prepare('INSERT INTO raw_sp_orders VALUES (?, ?, ?, ?, ?)').run(sku, qty, ch, st, `${d}T01:00:00Z`);
+  const sale = (sku, d, qty, ch = 'Amazon', st = 'Shipped', sc = 'Amazon.co.jp') => db.prepare('INSERT INTO raw_sp_orders VALUES (?, ?, ?, ?, ?, ?)').run(sku, qty, ch, st, `${d}T01:00:00Z`, sc);
   return { db, ret, sale };
 }
 const TODAY = '2026-10-22';
 await t('A: 30 日で 3 個以上かつ返品率 10% 以上だけ (販売 0・2 個・率 10% 未満・FBM と取り消しの販売は数えない・31 日前は外)', () => {
   const { db, ret, sale } = alertDb();
   ret('HIGH', '2026-10-20', 2, 'DEFECTIVE'); ret('HIGH', '2026-10-01', 1, 'UNWANTED_ITEM'); sale('high', '2026-10-05', 20);   // 3/20 = 15% (SKU の大文字小文字は無視)
+  sale('HIGH', '2026-10-06', 80, 'Amazon', 'Shipped', 'Non-Amazon JP');                                                    // マルチチャネル発送は分母に入れない (Codex R1)
   ret('LOW', '2026-10-20', 3, 'DEFECTIVE'); sale('LOW', '2026-10-05', 40);                                                // 7.5%
   ret('TWO', '2026-10-20', 2, 'DEFECTIVE'); sale('TWO', '2026-10-05', 2);                                                 // 2 個
   ret('NOSALE', '2026-10-20', 5, 'DEFECTIVE'); sale('NOSALE', '2026-10-05', 9, 'Merchant'); sale('NOSALE', '2026-10-06', 9, 'Amazon', 'Cancelled');
@@ -372,6 +373,11 @@ await t('再通知の間隔: 送った記録から 7 日のあいだは外す・
   const msg = MON.buildMessage(cand, { today: TODAY });
   assert.match(msg, /返品が多い SKU/); assert.match(msg, /A \(B\): 返品 3 \/ 販売 10 = 30%/); assert.match(msg, /DEFECTIVE 直近 3 個/);
   assert.equal(MON.buildMessage({ highRate: [], reasonSpikes: [] }), null);
+  // 1 通に載せるのは上から TOP_N だけ = 送った記録もその分だけ (載せなかった 11 件目は次の朝にまた出る。Codex R1)
+  const many = { highRate: Array.from({ length: 11 }, (_, i) => ({ sku: `S${i}`, returnUnits: 3, soldUnits: 10, rate: 0.3 })), reasonSpikes: [] };
+  assert.equal(MON.buildMessage(many, { today: TODAY }).includes('S10:'), false);
+  MON.markSent(db, MON.shownInMessage(many), { today: TODAY });
+  assert.deepEqual(MON.filterCooldown(db, many, { today: '2026-10-23' }).highRate.map((a) => a.sku), ['S10']);
 });
 
 console.log('daily-sync への組み込み');
