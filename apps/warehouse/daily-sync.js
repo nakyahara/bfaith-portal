@@ -1790,19 +1790,19 @@ async function main() {
   //   createReport / getReportDocument は 1 分に 1 回 (burst 15)。アクセスのレポートだけは別に「5 分に 3 回」= 直近 5 日は 3 つ → 5 分待って 2 つ (約 10 分)。timeout は polling の上限 (15〜25 分) より長く
   if (spResult.success) {
     const salesTrafficResult = runScript('apps/warehouse/fetch-amazon-sales-traffic.js --days 5', 'Amazonアクセス・転換率', 2700000);
-    results.push({ name: 'Amazonアクセス・転換率', ...salesTrafficResult });
+    results.push({ name: 'Amazonアクセス・転換率', ...salesTrafficResult, warn: salesTrafficResult.success && isWarnSummary(salesTrafficResult.summary) });
     const returnsResult = runScript('apps/warehouse/fetch-amazon-returns.js --days 60', 'Amazon返品', 1800000);
-    results.push({ name: 'Amazon返品', ...returnsResult });
+    results.push({ name: 'Amazon返品', ...returnsResult, warn: returnsResult.success && isWarnSummary(returnsResult.summary) });
     if (returnsResult.success) {
       const returnsAlertResult = runScript('apps/warehouse/monitor-amazon-returns.js --daily', 'Amazon返品アラート', 120000);
-      results.push({ name: 'Amazon返品アラート', ...returnsAlertResult });
+      results.push({ name: 'Amazon返品アラート', ...returnsAlertResult, warn: returnsAlertResult.success && isWarnSummary(returnsAlertResult.summary) });
     } else {
       console.log('[DailySync] Amazon返品 の取得が失敗したため 返品アラートをスキップ (古い明細で判定しない)');
     }
     const reimbResult = runScript('apps/warehouse/fetch-amazon-reimbursements.js --days 60', 'Amazon補てん', 1800000);
-    results.push({ name: 'Amazon補てん', ...reimbResult });
+    results.push({ name: 'Amazon補てん', ...reimbResult, warn: reimbResult.success && isWarnSummary(reimbResult.summary) });
     const ledgerResult = runScript('apps/warehouse/fetch-amazon-ledger.js --days 30', 'Amazon在庫台帳', 2100000);
-    results.push({ name: 'Amazon在庫台帳', ...ledgerResult });
+    results.push({ name: 'Amazon在庫台帳', ...ledgerResult, warn: ledgerResult.success && isWarnSummary(ledgerResult.summary) });
   } else {
     console.log('[DailySync] SP-API 失敗のため Amazon のアクセス・返品・補てん・在庫台帳の取得をスキップ');
     for (const name of ['Amazonアクセス・転換率', 'Amazon返品', 'Amazon補てん', 'Amazon在庫台帳']) {

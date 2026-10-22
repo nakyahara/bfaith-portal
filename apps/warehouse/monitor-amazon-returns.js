@@ -167,7 +167,8 @@ async function main() {
   if (!process.env.GCHAT_WEBHOOK) { console.log('[ReturnsAlert] ⚠️ GCHAT_WEBHOOK が無いので送らない (送った記録も残さない)'); return; }
   const sent = await sendGChat(msg);
   if (sent) markSent(db, shownInMessage(toSend), { today });   // 載せた分だけ (TOP_N を超えて載せなかった分は記録しない)
-  console.log(`[ReturnsAlert] ${sent ? '✅ 通知した' : '⚠️ 通知を送れなかった (次の朝にまた出す)'} (返品が多い ${toSend.highRate.length}・理由が急に増えた ${toSend.reasonSpikes.length})`);
+  // 最後の 1 行 = daily-sync の要約。送れなかったときは ⚠️ で始める (isWarnSummary = warn。Codex 統合レビュー P2)
+  console.log(sent ? `[ReturnsAlert] ✅ 通知した (返品が多い ${toSend.highRate.length}・理由が急に増えた ${toSend.reasonSpikes.length})` : `⚠️ [ReturnsAlert] 通知を送れなかった (次の朝にまた出す・返品が多い ${toSend.highRate.length}・理由が急に増えた ${toSend.reasonSpikes.length})`);
 }
 
 if (await isDirectRun(import.meta.url)) {
