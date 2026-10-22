@@ -1775,6 +1775,36 @@ async function main() {
     results.push({ name: 'Amazon BSR', success: false, summary: '⏭️ skipped (SP-API失敗のため)' });
   }
   // ── Amazon AI 分析用の出品・カート・BSR ここまで ──────────────────────────────
+  // ── Amazon AI 分析用のレポート (設計 28 の外・2026-10-22) ──────────────────────────────
+  // sp-api-report.js の共通の部品で createReport → polling → 文書。毎朝 10〜25 分かかる = 今ある工程 (FBA在庫スナップショット・Render同期・照合など) を
+  // 遅らせないように、見張りの後・DBバックアップの前に置く (バックアップに新しい表が入る)。publish-gate.js では「止めない工程」(m_products を読まない)
+  //   アクセス・転換率 = GET_SALES_AND_TRAFFIC_REPORT (1 日 = 1 レポート・直近 5 日を毎朝取り直す・日ごとに置き換え)
+  //   返品 = GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA (直近 60 日を UPSERT) → 取れた朝だけ返品のアラート (控えめ・GCHAT_WEBHOOK が無ければ送らない・exit 0)
+  //   補てん = GET_FBA_REIMBURSEMENTS_DATA (直近 60 日を UPSERT)・在庫の台帳 = GET_LEDGER_DETAIL_VIEW_DATA (直近 30 日を日ごとに置き換え) = 保存まで
+  //   SP-API の主取得が失敗した朝は全部スキップ (カート価格と同じ)。どれかが失敗しても後ろは続ける。🚨 引数を必ず渡す (runScript は引数なしだと '7' を足す)
+  //   createReport / getReportDocument は 1 分に 1 回 (burst 15)。アクセスのレポートだけは別に「5 分に 3 回」= 直近 5 日は 3 つ → 5 分待って 2 つ (約 10 分)。timeout は polling の上限 (15〜25 分) より長く
+  if (spResult.success) {
+    const salesTrafficResult = runScript('apps/warehouse/fetch-amazon-sales-traffic.js --days 5', 'Amazonアクセス・転換率', 2700000);
+    results.push({ name: 'Amazonアクセス・転換率', ...salesTrafficResult });
+    const returnsResult = runScript('apps/warehouse/fetch-amazon-returns.js --days 60', 'Amazon返品', 1800000);
+    results.push({ name: 'Amazon返品', ...returnsResult });
+    if (returnsResult.success) {
+      const returnsAlertResult = runScript('apps/warehouse/monitor-amazon-returns.js --daily', 'Amazon返品アラート', 120000);
+      results.push({ name: 'Amazon返品アラート', ...returnsAlertResult });
+    } else {
+      console.log('[DailySync] Amazon返品 の取得が失敗したため 返品アラートをスキップ (古い明細で判定しない)');
+    }
+    const reimbResult = runScript('apps/warehouse/fetch-amazon-reimbursements.js --days 60', 'Amazon補てん', 1800000);
+    results.push({ name: 'Amazon補てん', ...reimbResult });
+    const ledgerResult = runScript('apps/warehouse/fetch-amazon-ledger.js --days 30', 'Amazon在庫台帳', 2100000);
+    results.push({ name: 'Amazon在庫台帳', ...ledgerResult });
+  } else {
+    console.log('[DailySync] SP-API 失敗のため Amazon のアクセス・返品・補てん・在庫台帳の取得をスキップ');
+    for (const name of ['Amazonアクセス・転換率', 'Amazon返品', 'Amazon補てん', 'Amazon在庫台帳']) {
+      results.push({ name, success: false, summary: '⏭️ skipped (SP-API失敗のため)' });
+    }
+  }
+  // ── ここまで Amazon AI 分析用のレポート ──────────────────────────────────────────
 
   // ─── warehouse.db 日次バックアップ (VACUUM INTO → gzip → rclone offsite → 世代管理) ───
   // 一番最後の段 (2026-10-11 中原さん Q1 = a。前は見張り・照合の前 = 照合 ② と新商品の許可がバックアップ (約 93 分) を待っていた)。中身は変えない。
