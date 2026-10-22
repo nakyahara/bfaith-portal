@@ -15,7 +15,7 @@ import {
 } from '../apps/warehouse/fba-planning-history.js';
 import { runFbaReportSnapshot } from '../apps/warehouse/fba-report-snapshot.js';
 import {
-  runAgedAlert, pickAgedCandidates, buildAgedAlertMessage, weekKeyJst, jstWeekday, ALERT_WEEKDAY_JST, AGED_MIN_QTY, MAX_LIST,
+  runAgedAlert, pickAgedCandidates, buildAgedAlertMessage, weekKeyJst, jstWeekday, ensureAlertLog, ALERT_WEEKDAY_JST, AGED_MIN_QTY, MAX_LIST,
 } from '../apps/warehouse/alert-fba-aged-inventory.js';
 
 let ok = 0, ng = 0;
@@ -205,7 +205,7 @@ await t('対象の選び方: 181 日以上が N 個以上かつ金額が大き�
   const many = Array.from({ length: MAX_LIST + 5 }, (_, i) => ({ ...c[0], sku: `s${i}` }));
   assert.match(buildAgedAlertMessage(many, '2026-10-26'), /ほか 5 件/);
 });
-await t('🚨 控えめ: 月曜だけ・同じ週に 2 回送らない (記録)。送れなかった回は記録しない (翌朝にもう一度)。webhook が無ければ送らない', async () => {
+await t('🚨 控えめ: 月曜だけ・同じ週に 2 回送らない (記録)。送れなかった回は「送った」にしない。webhook が無ければ送らない', async () => {
   const db = openDb();
   seed(db, '2026-10-26', agedRows());
   const sent = [];
@@ -220,6 +220,37 @@ await t('🚨 控えめ: 月曜だけ・同じ週に 2 回送らない (記録)�
   assert.equal((await runAgedAlert(db, { nowMs: MON, webhook: 'https://x', send, force: true, log: quiet })).status, 'sent');   // --force は送る
   assert.equal((await runAgedAlert(db, { nowMs: TUE, webhook: 'https://x', send, dryRun: true, log: quiet })).status, 'dry_run');
   assert.equal(sent.length, 2);
+});
+await t('🚨 同時に 2 つ走っても 1 通 (送る前に週の権利を取る。Codex R1)・送っている途中の印が古ければ (落ちた) 取り直す', async () => {
+  const db = openDb();
+  seed(db, '2026-10-26', agedRows());
+  let n = 0, release;
+  const gate = new Promise((r) => { release = r; });
+  const slowSend = async () => { n++; await gate; return true; };
+  const p1 = runAgedAlert(db, { nowMs: MON, webhook: 'https://x', send: slowSend, log: quiet });
+  const p2 = runAgedAlert(db, { nowMs: MON, webhook: 'https://x', send: slowSend, log: quiet });
+  release();
+  const rs = (await Promise.all([p1, p2])).map((r) => r.status).sort();
+  assert.deepEqual([rs, n], [['in_progress', 'sent'], 1]);
+  const db2 = openDb();
+  seed(db2, '2026-10-26', agedRows());
+  ensureAlertLog(db2);
+  db2.prepare(`INSERT INTO fba_aged_alert_log (week_key, status, claimed_at, snapshot_date, sku_count) VALUES ('2026-10-26', 'sending', ?, '2026-10-26', 1)`).run(new Date(MON - 3600000).toISOString());
+  assert.equal((await runAgedAlert(db2, { nowMs: MON, webhook: 'https://x', send: async () => true, log: quiet })).status, 'sent');
+});
+await t('送れなかった週は、同じ週のうちは曜日を問わず翌朝もう一度 (次の週には持ち越さない)', async () => {
+  const db = openDb();
+  seed(db, '2026-10-26', agedRows());
+  seed(db, '2026-10-27', agedRows());
+  assert.equal((await runAgedAlert(db, { nowMs: MON, webhook: 'https://x', send: async () => false, log: quiet })).status, 'send_failed');
+  assert.equal(db.prepare(`SELECT status FROM fba_aged_alert_log`).get().status, 'failed');
+  assert.equal((await runAgedAlert(db, { nowMs: TUE, webhook: 'https://x', send: async () => { throw new Error('ECONNRESET'); }, log: quiet })).status, 'send_failed');
+  assert.equal((await runAgedAlert(db, { nowMs: TUE, webhook: 'https://x', send: async () => true, log: quiet })).status, 'sent');
+  const db2 = openDb();
+  seed(db2, '2026-11-03', agedRows());
+  ensureAlertLog(db2);
+  db2.prepare(`INSERT INTO fba_aged_alert_log (week_key, status, claimed_at, snapshot_date, sku_count) VALUES ('2026-10-26', 'failed', '2026-10-26T00:00:00Z', '2026-10-26', 1)`).run();
+  assert.equal((await runAgedAlert(db2, { nowMs: Date.parse('2026-11-03T00:00:00Z'), webhook: 'https://x', send: async () => true, log: quiet })).status, 'not_today');   // 11/03 (火) = 次の週
 });
 await t('履歴が無い・古い (最新が 3 日より前) → 送らない。該当なし → 送らない', async () => {
   const send = async () => { throw new Error('送ってはいけない'); };

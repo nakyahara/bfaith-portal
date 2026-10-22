@@ -5,7 +5,8 @@
  *   API は呼ばない。JP だけ。
  *
  * 控えめにする:
- *   - 送るのは ALERT_WEEKDAY_JST の曜日 (既定 = 月曜) だけ。同じ週に 2 回は送らない (fba_aged_alert_log に記録。daily-sync の再試行・手での再実行でも 1 通)
+ *   - 送るのは ALERT_WEEKDAY_JST の曜日 (既定 = 月曜) だけ。同じ週に 2 回は送らない (fba_aged_alert_log に記録。daily-sync の再試行・手での再実行でも 1 通。
+ *     送る前に週の権利を取る = 同時に 2 つ走っても 1 通)。送れなかった週は、同じ週のうちは翌朝もう一度試す
  *   - 1 通にまとめる (上位 MAX_LIST 件 + 合計)。該当が無ければ送らない
  *   - 対象 = 181 日以上の在庫が AGED_MIN_QTY 個以上 かつ その在庫金額 (個数 × 自分の価格) が AGED_MIN_VALUE_YEN 以上 (価格が分からなければ個数だけで)、
  *     または 長期保管料 (AIS) の見込みが AIS_MIN_YEN 以上
@@ -44,13 +45,35 @@ export function weekKeyJst(nowMs = Date.now()) {
 const fmt = (n) => Math.round(n).toLocaleString('ja-JP');
 const sumKnown = (vals) => { const k = vals.filter((v) => v !== null && v !== undefined); return k.length ? k.reduce((a, b) => a + b, 0) : null; };
 
+/** 送っている途中の印 (status = 'sending') がこれより古ければ、途中で落ちたとみなして取り直してよい */
+export const CLAIM_STALE_MS = 10 * 60 * 1000;
+
+/** 週ごとの送信の記録。status = 'sending' (送っている途中 = ほかの実行は送らない) / 'sent' (送った) / 'failed' (送れなかった = 同じ週のうちに翌朝もう一度) */
 export function ensureAlertLog(db) {
   db.exec(`CREATE TABLE IF NOT EXISTS fba_aged_alert_log (
     week_key      TEXT PRIMARY KEY,
-    sent_at       TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    claimed_at    TEXT NOT NULL,
+    sent_at       TEXT,
     snapshot_date TEXT NOT NULL,
     sku_count     INTEGER NOT NULL
   )`);
+}
+
+/**
+ * その週の送信の権利を取る (確かめる → 印を付ける を 1 つの書き込みの取引で = 同時に走った 2 つ目は送らない。Codex R1)
+ * @returns {{ ok: true } | { ok: false, status: 'already_sent'|'in_progress', row }}
+ */
+export function claimWeek(db, { week, snapshotDate, skuCount, nowMs, force = false }) {
+  return db.transaction(() => {
+    const row = db.prepare('SELECT status, claimed_at, sent_at FROM fba_aged_alert_log WHERE week_key = ?').get(week);
+    if (row && row.status === 'sending' && nowMs - Date.parse(row.claimed_at) < CLAIM_STALE_MS) return { ok: false, status: 'in_progress', row };
+    if (row && row.status === 'sent' && !force) return { ok: false, status: 'already_sent', row };
+    db.prepare(`INSERT INTO fba_aged_alert_log (week_key, status, claimed_at, sent_at, snapshot_date, sku_count) VALUES (?, 'sending', ?, NULL, ?, ?)
+      ON CONFLICT(week_key) DO UPDATE SET status = 'sending', claimed_at = excluded.claimed_at, sent_at = NULL, snapshot_date = excluded.snapshot_date, sku_count = excluded.sku_count`)
+      .run(week, new Date(nowMs).toISOString(), snapshotDate, skuCount);
+    return { ok: true };
+  }).immediate();
 }
 
 /** 最新の JP の日 (今日まで)。無ければ null */
@@ -129,9 +152,11 @@ export async function runAgedAlert(db, { nowMs = Date.now(), webhook = process.e
   ensureAlertLog(db);
   const today = jstDate(nowMs);
   const week = weekKeyJst(nowMs);
-  if (!force && !dryRun && jstWeekday(nowMs) !== ALERT_WEEKDAY_JST) return { status: 'not_today', lastLine: `⏭️ 長期在庫アラート: 送る曜日ではない (${'日月火水木金土'[ALERT_WEEKDAY_JST]}曜だけ)` };
+  // 送る曜日でなくても、同じ週に送れなかった回 ('failed') があれば、もう一度試す
+  const retryFailed = !!db.prepare(`SELECT 1 AS x FROM fba_aged_alert_log WHERE week_key = ? AND status = 'failed'`).get(week);
+  if (!force && !dryRun && !retryFailed && jstWeekday(nowMs) !== ALERT_WEEKDAY_JST) return { status: 'not_today', lastLine: `⏭️ 長期在庫アラート: 送る曜日ではない (${'日月火水木金土'[ALERT_WEEKDAY_JST]}曜だけ)` };
   if (!force && !dryRun) {
-    const sent = db.prepare('SELECT sent_at FROM fba_aged_alert_log WHERE week_key = ?').get(week);
+    const sent = db.prepare(`SELECT sent_at FROM fba_aged_alert_log WHERE week_key = ? AND status = 'sent'`).get(week);
     if (sent) return { status: 'already_sent', lastLine: `⏭️ 長期在庫アラート: 今週 (${week}〜) は送った (${sent.sent_at})` };
   }
   const snap = latestSnapshotDate(db, today);
@@ -143,9 +168,17 @@ export async function runAgedAlert(db, { nowMs = Date.now(), webhook = process.e
   log(message);
   if (dryRun) return { status: 'dry_run', candidates: cands.length, message, lastLine: `ℹ️ 長期在庫アラート: --dry-run (送らない) 該当 ${cands.length} 件 (${snap})` };
   if (!webhook) return { status: 'no_webhook', candidates: cands.length, message, lastLine: `⚠️ 長期在庫アラート: GCHAT_WEBHOOK 未設定のため送らない (該当 ${cands.length} 件)` };
-  const ok = await send(webhook, message);
-  if (!ok) return { status: 'send_failed', candidates: cands.length, message, lastLine: `⚠️ 長期在庫アラート: GChat に送れなかった (該当 ${cands.length} 件。明日の朝にもう一度試す)` };
-  db.prepare('INSERT OR REPLACE INTO fba_aged_alert_log (week_key, sent_at, snapshot_date, sku_count) VALUES (?, ?, ?, ?)').run(week, new Date(nowMs).toISOString(), snap, cands.length);
+  // 送る前に、その週の権利を取る (同時に走った手での実行と朝の daily-sync が 2 通送らない)
+  const claim = claimWeek(db, { week, snapshotDate: snap, skuCount: cands.length, nowMs, force });
+  if (!claim.ok) return { status: claim.status, candidates: cands.length, lastLine: claim.status === 'in_progress' ? `⏭️ 長期在庫アラート: ほかの実行が送っている途中 (${claim.row.claimed_at})` : `⏭️ 長期在庫アラート: 今週 (${week}〜) は送った (${claim.row.sent_at})` };
+  let ok = false;
+  try { ok = await send(webhook, message); } catch (e) { console.error(`[GChat] 通知失敗: ${e.message}`); ok = false; }
+  if (!ok) {
+    // 送れなかった = 'failed' にして権利を手放す (同じ週のうちは、曜日を問わず翌朝にもう一度試す)
+    db.prepare(`UPDATE fba_aged_alert_log SET status = 'failed' WHERE week_key = ? AND status = 'sending'`).run(week);
+    return { status: 'send_failed', candidates: cands.length, message, lastLine: `⚠️ 長期在庫アラート: GChat に送れなかった (該当 ${cands.length} 件。明日の朝にもう一度試す)` };
+  }
+  db.prepare(`UPDATE fba_aged_alert_log SET status = 'sent', sent_at = ? WHERE week_key = ?`).run(new Date(nowMs).toISOString(), week);
   return { status: 'sent', candidates: cands.length, message, lastLine: `✅ 長期在庫アラート: 送った (該当 ${cands.length} 件・${snap})` };
 }
 
