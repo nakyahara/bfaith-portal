@@ -454,7 +454,7 @@ export const JOBS_REGISTRY = [
       + '🆕 2026-10-22 (AI の分析とアラート): 「CompanyDB見張り」の後・「DBバックアップ」の前に 4 段 (今ある工程を遅らせない。新しい定期実行は無い・retry には載せない・写しの反映の門で止めない・この台帳の ping に乗る)。'
       + '①「Amazon出品の状態」(apps/warehouse/fetch-amazon-listing-issues.js。Listings Items searchListingsItems を作成日時の窓に分けて全部 (1 回の検索は 1,000 件まで) + 売れている SKU を SKU で引き直す・4 回/秒。'
       + '表 = amazon_listing_status_daily / amazon_listing_issue_daily / amazon_listing_fetch_runs (90 日)。セラーID = expected-profit.db の覚え書き → env SP_API_SELLER_ID (無い = ❌)) → '
-      + '取れた朝だけ ②「Amazon出品アラート」(alert-amazon-listing.js --kind listing。30 日に売れた or FBA 在庫の SKU が BUYABLE でなくなった / 新しい ERROR を GChat 1 通 (GCHAT_WEBHOOK)・初回は鳴らさない・同じ日の同じ理由は 1 回 = amazon_alert_sent)。'
+      + '取れた朝だけ ②「Amazon出品アラート」(alert-amazon-listing.js --kind listing。30 日に売れた or FBA 在庫の SKU が BUYABLE でなくなった / 新しい ERROR を GChat 1 通 (GCHAT_WEBHOOK)・比べる元 = アラートを済ませた日の写し (amazon_alert_runs。取得が失敗した朝・送れなかった日は元にしない = 変化を落とさない)・初回は鳴らさない・同じ日の同じ理由は 1 回 = amazon_alert_sent)。'
       + '③「Amazonカートアラート」(--kind buybox。「Amazonカート価格」が取れた朝だけ・fact_amazon_price_snapshot の前の回は自社 → 今日は他社 で 30 日に売れた SKU・API は呼ばない)。'
       + '④「Amazon BSR」(fetch-amazon-bsr.js。Catalog Items searchCatalogItems 20 ASIN ずつ・2 回/秒の枠 → amazon_catalog_rank_daily / amazon_catalog_rank_fetch (400 日)。列は Company DB の snapshots.catalog_asin_rank_daily にそろえた・送るのは後)。'
       + '①④ は SP-API の注文の取込が失敗した朝は見送る。止まると出品停止・カートを取られたことに朝の通知で気づけない (セラーセントラルでは見える)。'

@@ -8,8 +8,10 @@
  *                    差 = 自社価格 − カート価格 (今日)。🚨 カート不在 (NULL) は「取られた」にしない
  *
  * 決め:
- *   - 前の回が無い (初回) = 通知しない (全件を「新しい」と言わない)。比べるのは両方の日に行がある SKU だけ (片方に無い = 分からない = 言わない)
- *   - 前の回 = 今日より前でいちばん新しい日 (7 日より古ければ比べない = 長く止まっていた後の差は今日の変化と言えない)
+ *   - 前の回 (比べる元) = **アラートを最後まで済ませた日** (amazon_alert_runs。送れた・送るものが無かった・webhook が無かった日) の写し。
+ *     🚨 写しの「今日より前でいちばん新しい日」にしない (Codex R3 P2 × 2): 取得が失敗した朝 (アラートを流さなかった) の写しや、GChat に送れなかった日の写しを
+ *     元にすると、その日に起きた変化が翌日の差から消えて二度と知らせられない。済ませていない日は飛ばし、済ませた日と比べ直す
+ *   - 済ませた日が無い (初回) or 7 日より古い = 通知しない (全件を「新しい」と言わない) で、今日を「済ませた日」にする。比べるのは両方の日に行がある SKU だけ (片方に無い = 分からない = 言わない)
  *   - 同じ日・同じ SKU・同じ理由は 1 回だけ送る (amazon_alert_sent。送れたときだけ記録 = 手で流し直しても二重に鳴らない)
  *   - env GCHAT_WEBHOOK が無ければ送らない (要約に出すだけ)。終了コードは 0 (見つけたことは失敗ではない)・読めない = 1
  *   - 🚨 送った後に process.exit() しない (Windows node の libuv assertion・#439)
@@ -34,25 +36,43 @@ export function ensureAlertTables(db) {
     sent_at   TEXT NOT NULL,
     PRIMARY KEY (date_jst, kind, sku_key, reason)
   )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS amazon_alert_runs (
+    kind        TEXT NOT NULL,      -- listing | buybox
+    date_jst    TEXT NOT NULL,      -- この日の写しでアラートを済ませた (次の日からの比べる元)
+    prev_date   TEXT,               -- 比べた元 (初回 = NULL)
+    items       INTEGER NOT NULL,   -- 見つけた件数
+    note        TEXT,
+    finished_at TEXT NOT NULL,
+    PRIMARY KEY (kind, date_jst)
+  )`);
+}
+
+/** 比べる元 = 今日より前でアラートを済ませたいちばん新しい日 (gap 日以内)。無ければ null */
+export function alertBaseline(db, kind, today, maxGap = MAX_PREV_GAP_DAYS) {
+  ensureAlertTables(db);
+  const d = db.prepare(`SELECT MAX(date_jst) AS d FROM amazon_alert_runs WHERE kind = ? AND date_jst < ?`).get(kind, today)?.d || null;
+  return d && d >= addDays(today, -maxGap) ? d : null;
+}
+export function markAlertDone(db, kind, date, { prev = null, items = 0, note = null, at = new Date().toISOString() } = {}) {
+  ensureAlertTables(db);
+  db.prepare(`INSERT INTO amazon_alert_runs (kind, date_jst, prev_date, items, note, finished_at) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(kind, date_jst) DO UPDATE SET prev_date = excluded.prev_date, items = excluded.items, note = excluded.note, finished_at = excluded.finished_at`)
+    .run(kind, date, prev, items, note, at);
 }
 
 const hasTable = (db, name) => !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name);
 const yen = (n) => (n == null ? '-' : `¥${Math.round(n).toLocaleString('ja-JP')}`);
 
-/** 今日より前でいちばん新しい日 (gap 日以内)。無ければ null */
-function prevDate(db, sql, today, maxGap = MAX_PREV_GAP_DAYS) {
-  const d = db.prepare(sql).get(today)?.d || null;
-  return d && d >= addDays(today, -maxGap) ? d : null;
-}
 
 /**
  * 出品のアラートの中身を作る (送らない)。戻り値 { state, today, prev, notBuyable: [...], newErrors: [...] }
- *   state: 'no_today' (今日の写しが無い) | 'first' (前の回が無い) | 'ok'
+ *   state: 'no_today' (今日の写しが無い) | 'first' (比べる元が無い) | 'ok'
+ *   prev を渡さなければ alertBaseline (アラートを済ませた日) を使う
  */
-export function buildListingAlerts(db, { today, watch }) {
+export function buildListingAlerts(db, { today, watch, prev: prevIn }) {
   if (!hasTable(db, 'amazon_listing_fetch_runs') || !db.prepare(`SELECT 1 FROM amazon_listing_fetch_runs WHERE date_jst = ?`).get(today)) return { state: 'no_today', today, prev: null, notBuyable: [], newErrors: [] };
-  const prev = prevDate(db, `SELECT MAX(date_jst) AS d FROM amazon_listing_fetch_runs WHERE date_jst < ?`, today);
-  if (!prev) return { state: 'first', today, prev: null, notBuyable: [], newErrors: [] };
+  const prev = prevIn === undefined ? alertBaseline(db, 'listing', today) : prevIn;
+  if (!prev || !db.prepare(`SELECT 1 FROM amazon_listing_fetch_runs WHERE date_jst = ?`).get(prev)) return { state: 'first', today, prev: null, notBuyable: [], newErrors: [] };
   const rowsOf = (d) => new Map(db.prepare(`SELECT * FROM amazon_listing_status_daily WHERE date_jst = ?`).all(d).map((r) => [r.sku_key, r]));
   const t = rowsOf(today), p = rowsOf(prev);
   const issuesOf = (d, sev) => {
@@ -85,10 +105,10 @@ export function buildListingAlerts(db, { today, watch }) {
  * カートを取られたアラートの中身を作る (送らない)。戻り値 { state, today, prev, lost: [...] }
  *   state: 'no_today' | 'first' | 'ok'
  */
-export function buildBuyboxAlerts(db, { today, watch }) {
+export function buildBuyboxAlerts(db, { today, watch, prev: prevIn }) {
   if (!hasTable(db, 'fact_amazon_price_snapshot') || !db.prepare(`SELECT 1 FROM fact_amazon_price_snapshot WHERE date_jst = ? LIMIT 1`).get(today)) return { state: 'no_today', today, prev: null, lost: [] };
-  const prev = prevDate(db, `SELECT MAX(date_jst) AS d FROM fact_amazon_price_snapshot WHERE date_jst < ?`, today);
-  if (!prev) return { state: 'first', today, prev: null, lost: [] };
+  const prev = prevIn === undefined ? alertBaseline(db, 'buybox', today) : prevIn;
+  if (!prev || !db.prepare(`SELECT 1 FROM fact_amazon_price_snapshot WHERE date_jst = ? LIMIT 1`).get(prev)) return { state: 'first', today, prev: null, lost: [] };
   // 🚨 = 0 / = 1 で比べる (NULL = カート不在・不明 は「取られた」にも「自社だった」にもしない)
   const rows = db.prepare(`
     SELECT t.seller_sku, t.asin, t.channel, t.my_price, t.buybox_price, p.buybox_price AS prev_buybox_price, p.my_price AS prev_my_price
@@ -149,36 +169,45 @@ export function formatBuyboxMessage({ today, prev, lost }) {
   return out.join('\n');
 }
 
-/** 1 回分 (作る → 送っていないものだけ → 送る → 記録)。戻り値 { summary, exitCode } */
+/**
+ * 1 回分 (作る → 送っていないものだけ → 送る → 記録)。戻り値 { summary, exitCode }
+ * 済ませた日 (amazon_alert_runs) にするのは: 初回 (比べる元が無い)・見つけたものが無い / もう送ってある・送れた・webhook が無い (送る先が無い)。
+ * 🚨 GChat に送れなかった日・--dry-run は済ませた日にしない = 次の回も同じ比べる元から差を出す (その日の変化を落とさない)
+ */
 export async function runAlert(db, { kind, today, dryRun = false, send = sendGChat, webhook = process.env.GCHAT_WEBHOOK }) {
+  if (kind !== 'listing' && kind !== 'buybox') return { exitCode: 1, summary: `❌ --kind が違う (${kind}) = listing | buybox` };
   ensureAlertTables(db);
   const watch = loadWatchSkus(db, { today });
   const label = kind === 'listing' ? '出品アラート' : 'カートアラート';
-  let built, items, message;
+  const done = (prev, n, note) => { if (!dryRun) markAlertDone(db, kind, today, { prev, items: n, note }); };
+  const built = kind === 'listing' ? buildListingAlerts(db, { today, watch }) : buildBuyboxAlerts(db, { today, watch });
+  if (built.state === 'no_today') return { exitCode: 0, summary: `⚠️ ${label}: 今日 (${today}) の${kind === 'listing' ? '出品' : 'カート'}の写しが無い = 比べない` };
+  if (built.state === 'first') {
+    done(null, 0, 'first');
+    return { exitCode: 0, summary: `✓ ${label}: 比べる元 (7 日以内にアラートを済ませた日の写し) が無い (初回) = 通知しない・今日を比べる元にする` };
+  }
+  let items, message;
   if (kind === 'listing') {
-    built = buildListingAlerts(db, { today, watch });
-    if (built.state !== 'ok') return { exitCode: 0, summary: built.state === 'first' ? `✓ ${label}: 前の回の写しが無い (初回) = 通知しない` : `⚠️ ${label}: 今日 (${today}) の出品の写しが無い = 比べない` };
     const nb = filterUnsent(db, kind, today, built.notBuyable);
     const ne = filterUnsent(db, kind, today, built.newErrors);
     items = [...nb, ...ne];
     if (items.length) message = formatListingMessage({ today, prev: built.prev, notBuyable: nb, newErrors: ne });
-  } else if (kind === 'buybox') {
-    built = buildBuyboxAlerts(db, { today, watch });
-    if (built.state !== 'ok') return { exitCode: 0, summary: built.state === 'first' ? `✓ ${label}: 前の回のカートの写しが無い = 通知しない` : `⚠️ ${label}: 今日 (${today}) のカートの写しが無い = 比べない` };
+  } else {
     items = filterUnsent(db, kind, today, built.lost);
     if (items.length) message = formatBuyboxMessage({ today, prev: built.prev, lost: items });
-  } else {
-    return { exitCode: 1, summary: `❌ --kind が違う (${kind}) = listing | buybox` };
   }
+  const found = kind === 'listing' ? built.notBuyable.length + built.newErrors.length : built.lost.length;
   const counts = kind === 'listing' ? `BUYABLE でなくなった ${built.notBuyable.length}・新しい ERROR ${built.newErrors.length}` : `カートを取られた ${built.lost.length}`;
-  if (!items.length) return { exitCode: 0, summary: `✓ ${label} (${today} vs ${built.prev}): ${counts} / 新しく送るもの無し` };
+  const head = `${label} (${today} vs ${built.prev}): ${counts}`;
+  if (!items.length) { done(built.prev, found, 'nothing_new'); return { exitCode: 0, summary: `✓ ${head} / 新しく送るもの無し` }; }
   console.log(message);
-  if (dryRun) return { exitCode: 0, summary: `✓ ${label} (${today} vs ${built.prev}): ${counts} / --dry-run = 送らない` };
-  if (!webhook) return { exitCode: 0, summary: `⚠️ ${label} (${today} vs ${built.prev}): ${counts} / GCHAT_WEBHOOK が無い = 送らない` };
+  if (dryRun) return { exitCode: 0, summary: `✓ ${head} / --dry-run = 送らない` };
+  if (!webhook) { done(built.prev, found, 'no_webhook'); return { exitCode: 0, summary: `⚠️ ${head} / GCHAT_WEBHOOK が無い = 送らない` }; }
   const ok = await send(message, { webhook });
-  if (!ok) return { exitCode: 0, summary: `⚠️ ${label} (${today} vs ${built.prev}): ${counts} / GChat に送れなかった (次の回にまた送る)` };
+  if (!ok) return { exitCode: 0, summary: `⚠️ ${head} / GChat に送れなかった (済ませた日にしない = 次の回も ${built.prev} と比べてまた送る)` };
   markSent(db, kind, today, items);
-  return { exitCode: 0, summary: `✓ ${label} (${today} vs ${built.prev}): ${counts} / ${items.length} 件を通知` };
+  done(built.prev, found, 'sent');
+  return { exitCode: 0, summary: `✓ ${head} / ${items.length} 件を通知` };
 }
 
 async function main() {

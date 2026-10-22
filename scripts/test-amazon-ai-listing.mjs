@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { createRateGate, callWithRetry, loadWatchSkus, resolveSellerId, businessDate, addDays } from '../apps/warehouse/amazon-listing-common.js';
 import { parseListingItem, notFoundRow, scanAllListings, lookupSkus, saveListingSnapshot, lookupTargets, missingRows, ensureListingTables, MAX_PAGEABLE } from '../apps/warehouse/fetch-amazon-listing-issues.js';
-import { buildListingAlerts, buildBuyboxAlerts, runAlert, formatBuyboxMessage } from '../apps/warehouse/alert-amazon-listing.js';
+import { buildListingAlerts, buildBuyboxAlerts, runAlert, formatBuyboxMessage, markAlertDone, alertBaseline } from '../apps/warehouse/alert-amazon-listing.js';
 import { parseSalesRanks, saveRanks, fetchBatch, fetchAllRanks, loadTargetAsins, ensureRankTables } from '../apps/warehouse/fetch-amazon-bsr.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -180,6 +180,7 @@ function listingFixture() {
     item('Err', { issues: [issue('1'), issue('2')] }), item('Same', { status: [], issues: [issue('9')] }), { sku: 'Gone', __notFound: true },
     item('Warn2Err', { issues: [issue('5', 'ERROR')] }), item('OnlyToday', { status: [], issues: [issue('7')] }),
     item('Unsold', { status: [], issues: [issue('3')] }), item('Cancelled1', { status: [] }), item('OldSale', { status: [] }), item('StockOnly', { status: [] })]);
+  markAlertDone(db, 'listing', PREV);   // 前の日にアラートを済ませた (= 比べる元)
   return db;
 }
 t('売れた / FBA 在庫の SKU だけ: BUYABLE でなくなった (見つからないを含む)・新しい ERROR (WARNING → ERROR も新しい)・前からある ERROR と片方の日に無い SKU は言わない', () => {
@@ -190,17 +191,50 @@ t('売れた / FBA 在庫の SKU だけ: BUYABLE でなくなった (見つか�
   assert.deepEqual(r.notBuyable.map((x) => [x.sku_key, x.status, x.suppressed]).sort(), [['gone', 'NOT_FOUND', 0], ['lost', 'DISCOVERABLE', 1], ['stockonly', '', 0]]);
   assert.deepEqual(r.newErrors.map((x) => [x.sku_key, x.code]).sort(), [['err', '2'], ['lost', '18027'], ['warn2err', '5']]);
 });
-t('🚨 初回 (前の回の写しが無い) は通知しない・今日の写しが無い = 比べない・前の回が 7 日より古い = 初回と同じ', async () => {
+t('🚨 初回 (アラートを済ませた日が無い) は通知しない (前の写しがあっても)・今日を比べる元にする・今日の写しが無い = 比べない・済ませた日が 7 日より古い = 初回と同じ', async () => {
   const db = openDb();
   sold(db, 'A');
   assert.equal(buildListingAlerts(db, { today: TODAY, watch: loadWatchSkus(db, { today: TODAY }) }).state, 'no_today');
+  snap(db, PREV, [item('A')]);
   snap(db, TODAY, [item('A', { status: [], issues: [issue('1')] })]);
   let sent = 0;
   const r = await runAlert(db, { kind: 'listing', today: TODAY, webhook: 'https://x', send: async () => { sent++; return true; } });
   assert.match(r.summary, /初回/);
   assert.equal(sent, 0);
-  snap(db, '2026-10-10', [item('A')]);
-  assert.equal(buildListingAlerts(db, { today: TODAY, watch: loadWatchSkus(db, { today: TODAY }) }).state, 'first');
+  assert.equal(alertBaseline(db, 'listing', '2026-10-23'), TODAY);
+  const db2 = openDb();
+  sold(db2, 'A');
+  snap(db2, '2026-10-10', [item('A')]);
+  snap(db2, TODAY, [item('A', { status: [] })]);
+  markAlertDone(db2, 'listing', '2026-10-10');
+  assert.equal(buildListingAlerts(db2, { today: TODAY, watch: loadWatchSkus(db2, { today: TODAY }) }).state, 'first');
+});
+t('🚨 取得が失敗した朝 (写しはあるがアラートを流さなかった) は比べる元にしない = その日の変化を翌日に知らせる (Codex R3 P2)', async () => {
+  const db = openDb();
+  sold(db, 'A');
+  snap(db, '2026-10-20', [item('A')]);
+  markAlertDone(db, 'listing', '2026-10-20');
+  snap(db, PREV, [item('A', { status: [] })], 'partial');   // 10/21: 取得が失敗 (exit 1) = アラートは流れていない
+  snap(db, TODAY, [item('A', { status: [] })]);
+  const msgs = [];
+  const r = await runAlert(db, { kind: 'listing', today: TODAY, webhook: 'https://x', send: async (m) => { msgs.push(m); return true; } });
+  assert.match(r.summary, /vs 2026-10-20.*BUYABLE でなくなった 1/);
+  assert.equal(msgs.length, 1);
+});
+t('🚨 GChat に送れなかった日は済ませた日にしない = 翌日も同じ比べる元から差を出して送る (Codex R3 P2)・--dry-run も済ませた日にしない', async () => {
+  const db = openDb();
+  sold(db, 'A');
+  snap(db, '2026-10-20', [item('A')]);
+  markAlertDone(db, 'listing', '2026-10-20');
+  snap(db, PREV, [item('A', { status: [] })]);
+  assert.match((await runAlert(db, { kind: 'listing', today: PREV, webhook: 'https://x', send: async () => false })).summary, /^⚠️.*送れなかった/);
+  await runAlert(db, { kind: 'listing', today: PREV, dryRun: true, webhook: 'https://x' });
+  assert.equal(alertBaseline(db, 'listing', TODAY), '2026-10-20');
+  snap(db, TODAY, [item('A', { status: [] })]);
+  const msgs = [];
+  const r = await runAlert(db, { kind: 'listing', today: TODAY, webhook: 'https://x', send: async (m) => { msgs.push(m); return true; } });
+  assert.match(r.summary, /vs 2026-10-20.*1 件を通知/);
+  assert.equal(alertBaseline(db, 'listing', '2026-10-23'), TODAY);
 });
 t('1 通にまとめて送る・送れた分を記録 = 同じ日に流し直しても二重に鳴らない・送れない / webhook 無し = 記録しない (次の回にまた送る)', async () => {
   const db = listingFixture();
@@ -235,19 +269,21 @@ t('前の回 自社 (1) → 今日 他社 (0) で売れた SKU だけ・🚨 カ
   priceRow(db, PREV, 'stillmine', 1); priceRow(db, TODAY, 'stillmine', 1);
   priceRow(db, PREV, 'unsold', 1); priceRow(db, TODAY, 'unsold', 0);
   priceRow(db, PREV, 'pr_upper', 1); priceRow(db, TODAY, 'pr_upper', 0, 900, 950);
+  markAlertDone(db, 'buybox', PREV);
   const r = buildBuyboxAlerts(db, { today: TODAY, watch: loadWatchSkus(db, { today: TODAY }) });
   assert.deepEqual(r.lost.map((x) => [x.sku_key, x.diff, x.units]), [['pr_upper', -50, 2], ['lost', 100, 1]]);
   const m = formatBuyboxMessage({ today: TODAY, prev: PREV, lost: r.lost });
   assert.match(m, /差 \+¥100/);
   assert.match(m, /差 -¥50/);
 });
-t('前の回が無い = 通知しない・今日の写しが無い = ⚠️ (比べない)・送った分は二重に鳴らない', async () => {
+t('比べる元が無い = 通知しない (前の日の写しがあっても)・今日の写しが無い = ⚠️ (比べない)・送った分は二重に鳴らない', async () => {
   const db = openDb();
   sold(db, 'a');
+  priceRow(db, PREV, 'a', 1);
   priceRow(db, TODAY, 'a', 0);
   assert.match((await runAlert(db, { kind: 'buybox', today: TODAY, webhook: 'https://x', send: async () => true })).summary, /通知しない/);
   assert.match((await runAlert(db, { kind: 'buybox', today: '2026-10-23', webhook: 'https://x', send: async () => true })).summary, /^⚠️/);
-  priceRow(db, PREV, 'a', 1);
+  markAlertDone(db, 'buybox', PREV);
   let n = 0;
   const send = async () => { n++; return true; };
   assert.match((await runAlert(db, { kind: 'buybox', today: TODAY, webhook: 'https://x', send })).summary, /1 件を通知/);
