@@ -154,9 +154,10 @@ export function parseSalesTrafficDay(json, date) {
   if (!json || typeof json !== 'object' || Array.isArray(json)) throw new Error('レポートの形が想定外 (JSON の項目の形でない)');
   const byDate = json.salesAndTrafficByDate;
   const byAsin = json.salesAndTrafficByAsin;
-  if (byDate !== undefined && !Array.isArray(byDate)) throw new Error('salesAndTrafficByDate が配列でない');
-  if (byAsin !== undefined && !Array.isArray(byAsin)) throw new Error('salesAndTrafficByAsin が配列でない');
-  const dates = (byDate || []).map((x) => x?.date);
+  // 🚨 どちらの配列も必須 (公式の schema)。無い = 途中までのレポート = 失敗 (SKU の行を空で置き換えない。Codex R2)。空の配列 [] は受ける
+  if (!Array.isArray(byDate)) throw new Error('salesAndTrafficByDate が無い・配列でない');
+  if (!Array.isArray(byAsin)) throw new Error('salesAndTrafficByAsin が無い・配列でない');
+  const dates = byDate.map((x) => x?.date);
   // 🚨 店全体の行は頼んだ日の 1 行だけ。無い (まだ集計されていない?) / 別の日がある (期間の書き方の時差のずれ) = 失敗 (空で置き換えない)
   if (dates.length !== 1 || dates[0] !== date) {
     throw new Error(`店全体の行 (salesAndTrafficByDate) の日付が頼んだ日 ${date} の 1 行でない: ${JSON.stringify(dates.slice(0, 5))}${dates.length > 5 ? ' …' : ''}`);
@@ -205,7 +206,7 @@ export function parseSalesTrafficDay(json, date) {
   };
 
   const seen = new Set();
-  const skus = (byAsin || []).map((r, i) => {
+  const skus = byAsin.map((r, i) => {
     const at = `salesAndTrafficByAsin[${i}]`;
     if (!r || typeof r !== 'object') throw new Error(`${at} が行の形でない`);
     const sku = strOrNull(r.sku);
@@ -235,6 +236,10 @@ export function parseSalesTrafficDay(json, date) {
       total_order_items: I(sa, 'totalOrderItems', at), total_order_items_b2b: I(sa, 'totalOrderItemsB2B', at),
     };
   });
+  // 店全体では注文があるのに SKU の行が 0 = 食い違い (途中のレポートを疑う) = 失敗 (今の SKU の行を消さない)
+  if (skus.length === 0 && ((store.units_ordered || 0) > 0 || (store.sessions || 0) > 0)) {
+    throw new Error(`SKU の行が 0 なのに店全体は注文 ${store.units_ordered} 個・セッション ${store.sessions} = 食い違い (書かない)`);
+  }
   return { store, skus };
 }
 

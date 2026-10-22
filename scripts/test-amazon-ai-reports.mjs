@@ -183,6 +183,12 @@ await t('🚨 検査: 店全体の行の日付が頼んだ日でない・行が�
   throws(() => ST.parseSalesTrafficDay(j({ sku: 'S', childAsin: 'B', salesByAsin: { orderedProductSales: { amount: 'abc' } } }), D), /orderedProductSales/);
   throws(() => ST.parseSalesTrafficDay(j({ sku: 'S', childAsin: 'B', salesByAsin: { orderedProductSales: 100 } }), D), /金額の形/);
   throws(() => ST.parseSalesTrafficDay([], D), /想定外/);
+  // SKU の配列が無い = 途中のレポート (Codex R2) / 店全体に注文があるのに SKU が 0 行 = 食い違い。どちらも書かない。注文もセッションも 0 の日の [] は受ける
+  const noAsin = stJson(); delete noAsin.salesAndTrafficByAsin;
+  throws(() => ST.parseSalesTrafficDay(noAsin, D), /salesAndTrafficByAsin が無い/);
+  throws(() => ST.parseSalesTrafficDay(stJson({ salesAndTrafficByAsin: [] }), D), /食い違い/);
+  const quiet0 = stJson({ salesAndTrafficByAsin: [] }); quiet0.salesAndTrafficByDate[0].salesByDate.unitsOrdered = 0; quiet0.salesAndTrafficByDate[0].trafficByDate.sessions = 0;
+  assert.equal(ST.parseSalesTrafficDay(quiet0, D).skus.length, 0);
 });
 await t('保存: 日ごとに置き換え (減った SKU は消える)・元の JSON を gzip で残す・取得の記録・同じ取得の再実行は冪等', () => {
   const db = memDb();
@@ -201,7 +207,7 @@ await t('保存: 日ごとに置き換え (減った SKU は消える)・元の 
 await t('🚨 古い取得 (世代が小さい) では戻さない・壊れたレポートは何も書かない (前の行も記録も残る)・同じ世代の別のレポートは失敗', () => {
   const db = memDb();
   ST.saveSalesTrafficDay(db, { date: D, json: stJson(), generation: 2000, reportId: 'R2' });
-  assert.equal(ST.saveSalesTrafficDay(db, { date: D, json: stJson({ salesAndTrafficByAsin: [] }), generation: 1500, reportId: 'R1' }).status, 'older');
+  assert.equal(ST.saveSalesTrafficDay(db, { date: D, json: stJson(), generation: 1500, reportId: 'R1' }).status, 'older');
   throws(() => ST.saveSalesTrafficDay(db, { date: D, json: stJson({ salesAndTrafficByAsin: [{ sku: 'X' }] }), generation: 3000, reportId: 'R3' }), /childAsin/);
   throws(() => ST.saveSalesTrafficDay(db, { date: D, json: stJson(), generation: 2000, reportId: 'R9' }), /同じ世代/);
   assert.equal(db.prepare('select count(*) n from amazon_sales_traffic_sku_daily').get().n, 2);
