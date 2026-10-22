@@ -1547,6 +1547,11 @@ async function main() {
   const monitorFeeResult = runScript('apps/warehouse/monitor-fee-coverage.js', '手数料カバー率監視', 60000);
   results.push({ name: '手数料カバー率監視', ...monitorFeeResult });
 
+  // FBA の長期在庫 (181 日以上) を週 1 回 (月曜)・1 通で GChat へ (材料 = FBA在庫スナップショットが残す在庫計画の履歴。API は呼ばない)。
+  // 曜日でない・今週は送った = 何もしない。送れない・履歴が古いも exit 0 (朝を赤くしない)。再試行に載せない
+  const agedAlertResult = runScript('apps/warehouse/alert-fba-aged-inventory.js', 'FBA長期在庫アラート', 60000);
+  results.push({ name: 'FBA長期在庫アラート', ...agedAlertResult, warn: agedAlertResult.success && isWarnSummary(agedAlertResult.summary) });
+
   // 売上分類別粗利集計 (mgmt-accounting) の売上自動同期は Render 完結（server.js の常駐
   // スケジューラが in-process で実行）に移行したため、daily-sync(miniPC)からの起動は撤去。
 

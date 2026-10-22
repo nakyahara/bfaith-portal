@@ -272,6 +272,7 @@ export const PUBLISH_UNGATED_SCRIPTS = Object.freeze({
   'apps/warehouse/import-qoo10-data.js': 'モールの数値だけ',
   'apps/warehouse/sync-qoo10-data-daily.js': 'モールの数値だけ',
   'apps/warehouse/monitor-fee-coverage.js': '注文と手数料だけ',
+  'apps/warehouse/alert-fba-aged-inventory.js': 'FBA の在庫計画の履歴 (fba_planning_daily) だけ',
   'apps/warehouse/notify-yahoo-token-expiry.js': '期限の知らせだけ',
   'apps/warehouse/notify-rakuten-license-expiry.js': '期限の知らせだけ',
   'apps/rakuten-unshipped/notify-job.js': '注文の知らせだけ',
