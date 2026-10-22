@@ -269,6 +269,29 @@ t('🚨 済ませた日の写しが SKU を取りこぼしていたら、その 
   assert.deepEqual(r.newErrors.map((x) => [x.sku_key, x.code]), [['a', '9']]);   // B の ERROR 1 は前の日からある
 });
 
+t('🚨 同じ日に写しを置き換えたら、その日のアラートを済ませた印を消す = 置き換えた後の変化を送れなくても翌日に知らせる (Codex R5 P2)・カート価格の取得も同じ', async () => {
+  const db = openDb();
+  sold(db, 'A');
+  snap(db, PREV, [item('A')]);
+  markAlertDone(db, 'listing', PREV);
+  snap(db, TODAY, [item('A')]);
+  await runAlert(db, { kind: 'listing', today: TODAY, webhook: 'https://x', send: async () => true });   // 朝: 変化なし = 済ませた
+  assert.equal(alertBaseline(db, 'listing', '2026-10-23'), TODAY);
+  snap(db, TODAY, [item('A', { status: [] })]);   // 昼に取り直し: BUYABLE でなくなった
+  assert.equal(alertBaseline(db, 'listing', '2026-10-23'), PREV);
+  await runAlert(db, { kind: 'listing', today: TODAY, webhook: 'https://x', send: async () => false });   // 送れない
+  snap(db, '2026-10-23', [item('A', { status: [] })]);
+  const msgs = [];
+  const r = await runAlert(db, { kind: 'listing', today: '2026-10-23', webhook: 'https://x', send: async (m) => { msgs.push(m); return true; } });
+  assert.match(r.summary, /vs 2026-10-21.*1 件を通知/);
+  // partial で置き換えなかった回は印を消さない
+  markAlertDone(db, 'listing', '2026-10-23');
+  assert.equal(snap(db, '2026-10-23', [item('A')], 'partial').skipped, 'complete_exists');
+  assert.equal(alertBaseline(db, 'listing', '2026-10-24'), '2026-10-23');
+  const prices = fs.readFileSync(path.join(ROOT, 'apps/warehouse/fetch-amazon-prices.js'), 'utf8');
+  assert.match(prices, /DELETE FROM amazon_alert_runs WHERE kind = 'buybox' AND date_jst = ?/);
+});
+
 section('カートを取られたアラート');
 function priceRow(db, date, sku, mine, my = 1000, bb = 1000) {
   db.prepare(`INSERT INTO fact_amazon_price_snapshot (date_jst, seller_sku, asin, channel, my_price, buybox_price, buybox_is_mine, fetched_at) VALUES (?, ?, 'B000000001', 'FBA', ?, ?, ?, 'T')`).run(date, sku, my, bb, mine);

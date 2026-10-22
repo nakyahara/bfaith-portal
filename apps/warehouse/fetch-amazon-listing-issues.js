@@ -225,6 +225,11 @@ export async function lookupSkus(call, wanted, { log = () => {} } = {}) {
  * その日の写しを置き換える (1 取引)。🚨 その日に complete があり今回が partial なら置き換えない (= { skipped: 'complete_exists' })
  * rows = parseListingItem / notFoundRow の行
  */
+/** アラートを済ませた印 (alert-amazon-listing.js の amazon_alert_runs) を消す。表がまだ無ければ何もしない */
+export function invalidateAlertDone(db, kind, date) {
+  if (db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'amazon_alert_runs'`).get()) db.prepare(`DELETE FROM amazon_alert_runs WHERE kind = ? AND date_jst = ?`).run(kind, date);
+}
+
 export function saveListingSnapshot(db, { date, rows, run, fetchedAt = new Date().toISOString(), keepDays = KEEP_DAYS }) {
   ensureListingTables(db);
   const existing = db.prepare(`SELECT status FROM amazon_listing_fetch_runs WHERE date_jst = ?`).get(date);
@@ -238,6 +243,9 @@ export function saveListingSnapshot(db, { date, rows, run, fetchedAt = new Date(
   db.transaction(() => {
     db.prepare(`DELETE FROM amazon_listing_issue_daily WHERE date_jst = ?`).run(date);
     db.prepare(`DELETE FROM amazon_listing_status_daily WHERE date_jst = ?`).run(date);
+    // 🚨 その日の写しでアラートを済ませた印を消す (Codex R5 P2): 写しを置き換えたのに印が残ると、置き換えた後の変化を送れなかった日でも
+    //   翌日がこの新しい写しと比べてしまい、変化を二度と知らせられない。印を消す = 次のアラートの回がもう一度この日を済ませる (送った分は amazon_alert_sent で二重にしない)
+    invalidateAlertDone(db, 'listing', date);
     const seen = new Set();
     for (const r of rows) {
       if (!r || seen.has(r.sku_key)) continue;

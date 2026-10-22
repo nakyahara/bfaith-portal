@@ -208,6 +208,11 @@ async function main() {
         myPriceMap.get(String(t.seller_sku).trim().toLowerCase()) ?? null, bb.price, bb.isMine, fetchedAt);
       saved++;
     }
+    // その日のカートの写しでアラートを済ませた印を消す (alert-amazon-listing.js --kind buybox。2026-10-22・Codex R5 P2):
+    //   同じ日に取り直して写しが変わったのに印が残ると、変化を送れなかった日でも翌日がこの新しい写しと比べてしまう
+    if (saved > 0 && db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'amazon_alert_runs'`).get()) {
+      db.prepare(`DELETE FROM amazon_alert_runs WHERE kind = 'buybox' AND date_jst = ?`).run(today);
+    }
     const pruneBefore = new Date(Date.now() + 9 * 3600 * 1000 - 90 * 86400000).toISOString().slice(0, 10);
     db.prepare(`DELETE FROM fact_amazon_price_snapshot WHERE date_jst < ?`).run(pruneBefore);
   });
