@@ -283,6 +283,12 @@ export const PUBLISH_UNGATED_SCRIPTS = Object.freeze({
   'apps/company-db/master-compare/run.mjs': '比べて知らせる側 (② と ②b が壊れを朝の要約に出す)',
   'apps/company-db/master-compare/new-entry-gate.mjs': 'Company DB の新商品の許可だけ (照合の証跡と DB の関数を読む)',
   'apps/company-db/watch/run.mjs': 'Company DB だけを見る',
+  // Amazon AI 分析用のレポート (2026-10-22・見張りの後・DBバックアップの前)。SP-API のレポートを自分の表に入れるだけ・返品のアラートは返品の明細と raw_sp_orders だけを読む
+  'apps/warehouse/fetch-amazon-sales-traffic.js': 'SP-API のアクセス・転換率のレポートだけ',
+  'apps/warehouse/fetch-amazon-returns.js': 'SP-API の返品のレポートだけ',
+  'apps/warehouse/monitor-amazon-returns.js': '返品の明細と注文だけ',
+  'apps/warehouse/fetch-amazon-reimbursements.js': 'SP-API の補てんのレポートだけ',
+  'apps/warehouse/fetch-amazon-ledger.js': 'SP-API の在庫の台帳のレポートだけ',
 });
 
 /** 止めた朝に fail の ping を代わりに打つ工程 (自分で ping を打つ = 台帳に項目がある) */

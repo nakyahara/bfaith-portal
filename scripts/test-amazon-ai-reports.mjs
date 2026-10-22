@@ -399,22 +399,43 @@ await t('再通知の間隔: 送った記録から 7 日のあいだは外す・
   assert.deepEqual(MON.filterCooldown(db, many, { today: '2026-10-23' }).highRate.map((a) => a.sku), ['S10']);
 });
 
-console.log('daily-sync への組み込み');
-await t('SP-API の主取得が成功した朝だけ・カート価格の後・引数つき・返品のアラートは返品の取得が成功した朝だけ・失敗の朝は ⏭️', () => {
+console.log('daily-sync への組み込み (見張りの後・DBバックアップの前)');
+const AI_FILES = ['fetch-amazon-sales-traffic.js', 'fetch-amazon-returns.js', 'fetch-amazon-reimbursements.js', 'fetch-amazon-ledger.js', 'monitor-amazon-returns.js'];
+await t('1 つの塊 (見出しのコメントで囲む) で 見張りの後・DBバックアップの前 (あいだに別の段なし)・前の置き場所 (カート価格の後) に残っていない・spResult はその位置で見える', () => {
   const ds = fs.readFileSync(path.join(ROOT, 'apps/warehouse/daily-sync.js'), 'utf8').replace(/\r\n/g, '\n');
-  const iPrices = ds.indexOf("runScript('apps/warehouse/fetch-amazon-prices.js'");
-  const iBlock = ds.indexOf('if (spResult.success) {', iPrices + 1);
-  const iElse = ds.indexOf("} else {\n    console.log('[DailySync] SP-API 失敗のため Amazon のアクセス", iBlock);
-  const block = ds.slice(iBlock, iElse);
-  const iFba = ds.indexOf("runScript('apps/warehouse/snapshot-fba-stock.js'");
-  assert.ok(iPrices > 0 && iBlock > iPrices && iElse < iFba);
+  const iHead = ds.indexOf('  // ── Amazon AI 分析用のレポート (設計 28 の外・2026-10-22)');
+  const iTail = ds.indexOf('  // ── ここまで Amazon AI 分析用のレポート');
+  const iWatch = ds.indexOf("results.push({ name: 'CompanyDB見張り', ...watchResult");
+  const iBackup = ds.indexOf("const backupResult = runScript('apps/warehouse/backup-warehouse.js'");
+  assert.ok(iWatch > 0 && iWatch < iHead && iHead < iTail && iTail < iBackup, [iWatch, iHead, iTail, iBackup].join(','));
+  assert.doesNotMatch(ds.slice(iWatch, iHead).split('\n').slice(1).join('\n'), /runScript\(|results\.push\(/);
+  assert.doesNotMatch(ds.slice(iTail, iBackup), /runScript\(|results\.push\(/);
+  for (const f of AI_FILES) assert.equal(ds.split(`'apps/warehouse/${f}`).length - 1, 1, `${f} が塊の外にもある / 無い`);
+  // spResult は main の同じ深さ (塊の位置まで括弧が閉じない) で宣言されている
+  const iSp = ds.indexOf("const spResult = runScript('apps/warehouse/sp-api-orders.js'");
+  assert.ok(iSp > 0 && iSp < iHead);
+  const code = ds.slice(iSp, iHead).replace(/\/\/[^\n]*/g, '').replace(/`(?:\\.|[^`\\])*`/g, '""').replace(/'(?:\\.|[^'\\\n])*'/g, '""').replace(/"(?:\\.|[^"\\\n])*"/g, '""');
+  let depth = 0, min = 0;
+  for (const c of code) { if (c === '{') depth++; else if (c === '}') { depth--; min = Math.min(min, depth); } }
+  assert.deepEqual([depth, min], [0, 0]);
+});
+await t('SP-API の主取得が成功した朝だけ・引数つき・返品のアラートは返品の取得が成功した朝だけ・失敗の朝は ⏭️・写しの反映が違う朝も止めない工程 (publish-gate)', async () => {
+  const ds = fs.readFileSync(path.join(ROOT, 'apps/warehouse/daily-sync.js'), 'utf8').replace(/\r\n/g, '\n');
+  const all = ds.slice(ds.indexOf('  // ── Amazon AI 分析用のレポート'), ds.indexOf('  // ── ここまで Amazon AI 分析用のレポート'));
+  const iBlock = all.indexOf('if (spResult.success) {');
+  const iElse = all.indexOf("} else {\n    console.log('[DailySync] SP-API 失敗のため Amazon のアクセス");
+  assert.ok(iBlock > 0 && iElse > iBlock);
+  const block = all.slice(iBlock, iElse);
   for (const s of ['fetch-amazon-sales-traffic.js --days 5', 'fetch-amazon-returns.js --days 60', 'fetch-amazon-reimbursements.js --days 60', 'fetch-amazon-ledger.js --days 30', 'monitor-amazon-returns.js --daily']) {
     assert.ok(block.includes(`'apps/warehouse/${s}'`), s);
   }
   assert.ok(block.indexOf('if (returnsResult.success)') < block.indexOf('monitor-amazon-returns.js'));
-  assert.match(ds.slice(iElse, iFba), /'Amazonアクセス・転換率', 'Amazon返品', 'Amazon補てん', 'Amazon在庫台帳'/);
-  for (const f of ['fetch-amazon-sales-traffic.js', 'fetch-amazon-returns.js', 'fetch-amazon-reimbursements.js', 'fetch-amazon-ledger.js', 'monitor-amazon-returns.js']) {
+  assert.match(all.slice(iElse), /'Amazonアクセス・転換率', 'Amazon返品', 'Amazon補てん', 'Amazon在庫台帳'/);
+  const G = await import('../apps/warehouse/publish-gate.js');
+  for (const f of AI_FILES) {
     assert.ok(fs.existsSync(path.join(ROOT, 'apps/warehouse', f)), f);
+    assert.ok(Object.hasOwn(G.PUBLISH_UNGATED_SCRIPTS, `apps/warehouse/${f}`), f);
+    assert.equal(G.publishGateDecision(`apps/warehouse/${f} --days 5`, { broken: true }).skip, false, f);
   }
 });
 
