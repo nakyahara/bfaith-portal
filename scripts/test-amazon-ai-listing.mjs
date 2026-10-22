@@ -355,17 +355,32 @@ t('業務日付 = env WAREHOUSE_BUSINESS_DATE → JST (朝 7:00 JST = UTC の前
 });
 
 section('daily-sync の段');
-t('「Amazonカート価格」の後に 出品の状態 → 出品アラート → カートアラート → BSR・アラートは取得が取れた朝だけ・retry に載せない', () => {
-  const ds = fs.readFileSync(path.join(ROOT, 'apps/warehouse/daily-sync.js'), 'utf8');
-  const at = (s) => { const i = ds.indexOf(s); assert.ok(i > 0, `無い: ${s}`); return i; };
+t('「CompanyDB見張り」の後・「DBバックアップ」の前の 1 つの塊 (見出しで囲む) に 出品の状態 → 出品アラート → カートアラート → BSR・アラートは取得が取れた朝だけ・retry に載せない・写しの反映の門で止めない', async () => {
+  const ds = fs.readFileSync(path.join(ROOT, 'apps/warehouse/daily-sync.js'), 'utf8').replace(/\r\n/g, '\n');
+  const at = (s) => { const i = ds.indexOf(s); assert.ok(i > 0, `無い: ${s}`); assert.equal(ds.indexOf(s, i + 1), -1, `2 か所にある: ${s}`); return i; };
+  const iSp = at("\n  const spResult = runScript('apps/warehouse/sp-api-orders.js'");   // main の直下 (塊の位置から見える)
   const iPrices = at("runScript('apps/warehouse/fetch-amazon-prices.js'");
+  const iWatch = at("results.push({ name: 'CompanyDB見張り', ...watchResult");
+  const iHead = at('// ── Amazon AI 分析用の出品・カート・BSR (2026-10-22)');
   const iList = at("runScript('apps/warehouse/fetch-amazon-listing-issues.js'");
   const iListAlert = at("runScript('apps/warehouse/alert-amazon-listing.js --kind listing'");
   const iBb = at("runScript('apps/warehouse/alert-amazon-listing.js --kind buybox'");
   const iBsr = at("runScript('apps/warehouse/fetch-amazon-bsr.js'");
-  assert.ok(iPrices < iList && iList < iListAlert && iListAlert < iBb && iBb < iBsr);
+  const iTail = at('// ── Amazon AI 分析用の出品・カート・BSR ここまで');
+  const iBackup = at("runScript('apps/warehouse/backup-warehouse.js'");
+  assert.ok(iSp < iPrices && iPrices < iWatch && iWatch < iHead && iHead < iList && iList < iListAlert && iListAlert < iBb && iBb < iBsr && iBsr < iTail && iTail < iBackup);
+  // 塊の中は自分の段だけ (ほかの runScript を挟まない)
+  assert.deepEqual([...ds.slice(iHead, iTail).matchAll(/runScript\('([^' ]+)/g)].map((m) => m[1]),
+    ['apps/warehouse/fetch-amazon-listing-issues.js', 'apps/warehouse/alert-amazon-listing.js', 'apps/warehouse/alert-amazon-listing.js', 'apps/warehouse/fetch-amazon-bsr.js']);
+  assert.match(ds.slice(iHead, iList), /if \(spResult\.success\)/);
   assert.match(ds.slice(iList, iListAlert), /if \(listingResult\.success\)/);
   assert.match(ds.slice(iListAlert, iBb), /r\.name === 'Amazonカート価格' && r\.success/);
+  assert.match(ds.slice(iBb, iBsr), /if \(spResult\.success\)/);
+  const G = await import('../apps/warehouse/publish-gate.js');
+  for (const f of ['apps/warehouse/fetch-amazon-listing-issues.js', 'apps/warehouse/alert-amazon-listing.js', 'apps/warehouse/fetch-amazon-bsr.js']) {
+    assert.ok(Object.hasOwn(G.PUBLISH_UNGATED_SCRIPTS, f), f);
+    assert.equal(G.publishGateDecision(f, { broken: true }).skip, false, f);
+  }
   const retryable = ds.match(/const RETRYABLE_JOBS = \[([^\]]*)\]/)[1];
   for (const n of ['Amazon出品の状態', 'Amazon出品アラート', 'Amazonカートアラート', 'Amazon BSR']) assert.ok(!retryable.includes(`'${n}'`), n);
   const reg = fs.readFileSync(path.join(ROOT, 'config/jobs-registry.mjs'), 'utf8');

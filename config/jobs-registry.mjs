@@ -451,7 +451,7 @@ export const JOBS_REGISTRY = [
       + '同じ「FBA在庫スナップショット」の中で、米国の RESTOCK / PLANNING を取れたままの行で DATA_DIR/fba-us-reports/ にも残す (apps/warehouse/fba-us-reports-store.js。YYYY-MM-DD.json = その日の行・400 日で消す / last-attempt.json = 最後の取得の成否と保存の失敗。fba.db の外)。'
       + '米国FBA在庫補充 (/apps/fba-replenishment-us) が miniPC の GET /service-api/fba/us/reports/latest で読む。保存に失敗しても朝のスナップショットは失敗にしない (最後の行の末尾に「取れたままのレポートを残せなかった」)。'
       + '止まると米国の画面に「RESTOCK が古い」「最新の取得で失敗」の赤帯。見る所 = そのフォルダの last-attempt.json と logs/daily-sync-*.log の [fba-stock-snapshot:us]。新しい定期実行は無い。'
-      + '🆕 2026-10-22 (AI の分析とアラート): 「Amazonカート価格」の後に 4 段 (新しい定期実行は無い・retry には載せない・この台帳の ping に乗る)。'
+      + '🆕 2026-10-22 (AI の分析とアラート): 「CompanyDB見張り」の後・「DBバックアップ」の前に 4 段 (今ある工程を遅らせない。新しい定期実行は無い・retry には載せない・写しの反映の門で止めない・この台帳の ping に乗る)。'
       + '①「Amazon出品の状態」(apps/warehouse/fetch-amazon-listing-issues.js。Listings Items searchListingsItems を作成日時の窓に分けて全部 (1 回の検索は 1,000 件まで) + 売れている SKU を SKU で引き直す・4 回/秒。'
       + '表 = amazon_listing_status_daily / amazon_listing_issue_daily / amazon_listing_fetch_runs (90 日)。セラーID = expected-profit.db の覚え書き → env SP_API_SELLER_ID (無い = ❌)) → '
       + '取れた朝だけ ②「Amazon出品アラート」(alert-amazon-listing.js --kind listing。30 日に売れた or FBA 在庫の SKU が BUYABLE でなくなった / 新しい ERROR を GChat 1 通 (GCHAT_WEBHOOK)・初回は鳴らさない・同じ日の同じ理由は 1 回 = amazon_alert_sent)。'
