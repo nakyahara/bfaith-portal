@@ -112,7 +112,12 @@ async function snapshotDirect(businessDate, log) {
   try {
     const db = await import('../fba-replenishment/db.js');
     await db.initDb();
-    return { mode: 'direct', result: await runFbaReportSnapshot({ db, businessDate, log }) };
+    // 在庫計画の履歴 (warehouse.db)。開けなくても fba.db の保存は今までどおり (履歴は残さないだけ)
+    const [wh, { makePlanningHistorySaver }] = await Promise.all([import('./db.js'), import('./fba-planning-history.js')]);
+    let planningHistory = null;
+    try { await wh.initDB(); planningHistory = makePlanningHistorySaver(wh.getDB, { log }); }
+    catch (e) { log(`[fba-stock-snapshot] warehouse.db を開けない (在庫計画の履歴は残さない): ${e.message}`); }
+    return { mode: 'direct', result: await runFbaReportSnapshot({ db, businessDate, log, planningHistory }) };
   } finally {
     releaseFbaFetchLock(lock);   // lock オブジェクト全体を渡して所有権 (ownerToken) チェックを有効化
   }
