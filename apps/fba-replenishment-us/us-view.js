@@ -20,7 +20,7 @@ export const RESTOCK_FIELDS = {
   working: ['Working', 'working', '進行中'],
   shipped: ['Shipped', 'shipped', '出荷済み'],
   receiving: ['Receiving', 'receiving', '受領中'],
-  fc_transfer: ['FC Transfer', 'fc-transfer', 'FC移管中'],
+  fc_transfer: ['FC transfer', 'FC Transfer', 'fc-transfer', 'FC移管中'], // 実物の列名は 'FC transfer' (t が小文字)
   fc_processing: ['FC Processing', 'fc-processing', '入出荷作業中 - FC処理中'],
   customer_order: ['Customer Order', 'customer-order', '入出荷作業中 - 出荷待ち'],
   unfulfillable: ['Unfulfillable', 'unfulfillable', '販売不可'],

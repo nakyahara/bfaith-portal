@@ -134,6 +134,14 @@ t('🚨 RESTOCK の解析: 列が無い/空なら null (0 と混ぜない)', () 
   assert.equal(noCol.amazon_recommended_qty, null);
 });
 
+t('🚨 RESTOCK の解析: FC 移管中は実物の列名 FC transfer (t が小文字) で読める', () => {
+  // 2026-10-22: 'FC Transfer' だけで探していて移管中が全 SKU で 0 だった (kinuksf130 の 3個セット 13 セットが FBA在庫数から漏れた)
+  const r = normalizeRestockRow({ 'Merchant SKU': 'a', Available: '3', 'FC transfer': '13', 'FC Processing': '0', 'Customer Order': '2' });
+  assert.equal(r.fba_fc_transfer, 13);
+  assert.equal(r.fba_available + r.fba_fc_transfer + r.fba_fc_processing + r.fba_customer_order, 18, 'セラーセントラルの手持ち在庫 16 + 入出荷作業中 2');
+  assert.equal(normalizeRestockRow({ 'Merchant SKU': 'a', 'FC Transfer': '4' }).fba_fc_transfer, 4, '大文字の T も今までどおり読める');
+});
+
 t('🚨 PLANNING の解析: 7 日販売も同じ', () => {
   assert.equal(normalizePlanningRow({ sku: 'a', 'units-shipped-t7': '7' }).units_sold_7d, 7);
   assert.equal(normalizePlanningRow({ sku: 'a', 'units-shipped-t7': '0' }).units_sold_7d, 0);
