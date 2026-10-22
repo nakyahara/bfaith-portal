@@ -1,0 +1,198 @@
+/**
+ * alert-amazon-listing.js — Amazon の出品とカートのアラート (2026-10-22・AI の分析とアラート)。新しい API は呼ばない (warehouse.db を読むだけ)
+ *
+ *   --kind listing : 出品の状態の写し (fetch-amazon-listing-issues.js) の今日と前の回を比べ、
+ *                    「直近 30 日に売れた or FBA の在庫がある SKU」が ① BUYABLE でなくなった (出品が見つからない を含む) ② 新しい ERROR の issue が出た を 1 通にまとめて GChat
+ *   --kind buybox  : カート価格の写し fact_amazon_price_snapshot (fetch-amazon-prices.js) の今日と前の回を比べ、
+ *                    「前の回は自社がカート (buybox_is_mine = 1) → 今日は他社 (= 0)」の SKU のうち直近 30 日に売れたものを 1 通にまとめて GChat。
+ *                    差 = 自社価格 − カート価格 (今日)。🚨 カート不在 (NULL) は「取られた」にしない
+ *
+ * 決め:
+ *   - 前の回が無い (初回) = 通知しない (全件を「新しい」と言わない)。比べるのは両方の日に行がある SKU だけ (片方に無い = 分からない = 言わない)
+ *   - 前の回 = 今日より前でいちばん新しい日 (7 日より古ければ比べない = 長く止まっていた後の差は今日の変化と言えない)
+ *   - 同じ日・同じ SKU・同じ理由は 1 回だけ送る (amazon_alert_sent。送れたときだけ記録 = 手で流し直しても二重に鳴らない)
+ *   - env GCHAT_WEBHOOK が無ければ送らない (要約に出すだけ)。終了コードは 0 (見つけたことは失敗ではない)・読めない = 1
+ *   - 🚨 送った後に process.exit() しない (Windows node の libuv assertion・#439)
+ *
+ * 使い方:
+ *   node apps/warehouse/alert-amazon-listing.js --kind listing [--dry-run]   (--dry-run = 送らない・記録しない)
+ *   node apps/warehouse/alert-amazon-listing.js --kind buybox  [--dry-run]
+ */
+import 'dotenv/config';
+import { initDB, getDB } from './db.js';
+import { businessDate, addDays, loadWatchSkus, sendGChat, isMainModule } from './amazon-listing-common.js';
+
+export const MAX_PREV_GAP_DAYS = 7;
+export const MAX_LINES = 25;
+
+export function ensureAlertTables(db) {
+  db.exec(`CREATE TABLE IF NOT EXISTS amazon_alert_sent (
+    date_jst  TEXT NOT NULL,
+    kind      TEXT NOT NULL,    -- listing | buybox
+    sku_key   TEXT NOT NULL,
+    reason    TEXT NOT NULL,    -- not_buyable / new_error:<issue_key> / buybox_lost
+    sent_at   TEXT NOT NULL,
+    PRIMARY KEY (date_jst, kind, sku_key, reason)
+  )`);
+}
+
+const hasTable = (db, name) => !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name);
+const yen = (n) => (n == null ? '-' : `¥${Math.round(n).toLocaleString('ja-JP')}`);
+
+/** 今日より前でいちばん新しい日 (gap 日以内)。無ければ null */
+function prevDate(db, sql, today, maxGap = MAX_PREV_GAP_DAYS) {
+  const d = db.prepare(sql).get(today)?.d || null;
+  return d && d >= addDays(today, -maxGap) ? d : null;
+}
+
+/**
+ * 出品のアラートの中身を作る (送らない)。戻り値 { state, today, prev, notBuyable: [...], newErrors: [...] }
+ *   state: 'no_today' (今日の写しが無い) | 'first' (前の回が無い) | 'ok'
+ */
+export function buildListingAlerts(db, { today, watch }) {
+  if (!hasTable(db, 'amazon_listing_fetch_runs') || !db.prepare(`SELECT 1 FROM amazon_listing_fetch_runs WHERE date_jst = ?`).get(today)) return { state: 'no_today', today, prev: null, notBuyable: [], newErrors: [] };
+  const prev = prevDate(db, `SELECT MAX(date_jst) AS d FROM amazon_listing_fetch_runs WHERE date_jst < ?`, today);
+  if (!prev) return { state: 'first', today, prev: null, notBuyable: [], newErrors: [] };
+  const rowsOf = (d) => new Map(db.prepare(`SELECT * FROM amazon_listing_status_daily WHERE date_jst = ?`).all(d).map((r) => [r.sku_key, r]));
+  const t = rowsOf(today), p = rowsOf(prev);
+  const issuesOf = (d, sev) => {
+    const m = new Map();
+    for (const r of db.prepare(`SELECT sku_key, issue_key, code, severity, message, enforcement_actions FROM amazon_listing_issue_daily WHERE date_jst = ?${sev ? ' AND severity = ?' : ''}`).all(...(sev ? [d, sev] : [d]))) {
+      if (!m.has(r.sku_key)) m.set(r.sku_key, []);
+      m.get(r.sku_key).push(r);
+    }
+    return m;
+  };
+  const tErr = issuesOf(today, 'ERROR'), pAll = issuesOf(prev, null);
+  const notBuyable = [], newErrors = [];
+  for (const [k, w] of watch) {
+    const a = t.get(k), b = p.get(k);
+    if (!a || !b) continue;
+    const ctx = { sku_key: k, seller_sku: a.seller_sku, asin: a.asin || b.asin, units: w.units, sales_jpy: w.sales_jpy, fba_qty: w.fba_qty };
+    if (b.is_buyable === 1 && a.is_buyable !== 1) notBuyable.push({ ...ctx, prev_status: b.status, status: a.status, suppressed: a.suppressed, reason: 'not_buyable' });
+    const before = new Set((pAll.get(k) || []).map((i) => i.issue_key));
+    for (const i of (tErr.get(k) || [])) {
+      if (!before.has(i.issue_key)) newErrors.push({ ...ctx, issue_key: i.issue_key, code: i.code, message: i.message, actions: JSON.parse(i.enforcement_actions || '[]'), reason: `new_error:${i.issue_key}` });
+    }
+  }
+  const bySales = (x, y) => (y.sales_jpy - x.sales_jpy) || (y.fba_qty - x.fba_qty) || (x.sku_key < y.sku_key ? -1 : 1);
+  notBuyable.sort(bySales);
+  newErrors.sort(bySales);
+  return { state: 'ok', today, prev, notBuyable, newErrors };
+}
+
+/**
+ * カートを取られたアラートの中身を作る (送らない)。戻り値 { state, today, prev, lost: [...] }
+ *   state: 'no_today' | 'first' | 'ok'
+ */
+export function buildBuyboxAlerts(db, { today, watch }) {
+  if (!hasTable(db, 'fact_amazon_price_snapshot') || !db.prepare(`SELECT 1 FROM fact_amazon_price_snapshot WHERE date_jst = ? LIMIT 1`).get(today)) return { state: 'no_today', today, prev: null, lost: [] };
+  const prev = prevDate(db, `SELECT MAX(date_jst) AS d FROM fact_amazon_price_snapshot WHERE date_jst < ?`, today);
+  if (!prev) return { state: 'first', today, prev: null, lost: [] };
+  // 🚨 = 0 / = 1 で比べる (NULL = カート不在・不明 は「取られた」にも「自社だった」にもしない)
+  const rows = db.prepare(`
+    SELECT t.seller_sku, t.asin, t.channel, t.my_price, t.buybox_price, p.buybox_price AS prev_buybox_price, p.my_price AS prev_my_price
+    FROM fact_amazon_price_snapshot t
+    JOIN fact_amazon_price_snapshot p ON p.date_jst = ? AND p.seller_sku = t.seller_sku
+    WHERE t.date_jst = ? AND t.buybox_is_mine = 0 AND p.buybox_is_mine = 1
+  `).all(prev, today);
+  const lost = [];
+  for (const r of rows) {
+    const k = String(r.seller_sku).trim().toLowerCase();
+    const w = watch.get(k);
+    if (!w || !(w.units > 0)) continue;   // 売れていない SKU は言わない (在庫だけでは足りない)
+    const diff = (r.my_price != null && r.buybox_price != null) ? Math.round((r.my_price - r.buybox_price) * 100) / 100 : null;
+    lost.push({ sku_key: k, seller_sku: r.seller_sku, asin: r.asin, channel: r.channel, my_price: r.my_price, buybox_price: r.buybox_price, prev_buybox_price: r.prev_buybox_price, diff, units: w.units, sales_jpy: w.sales_jpy, reason: 'buybox_lost' });
+  }
+  lost.sort((x, y) => (y.sales_jpy - x.sales_jpy) || (x.sku_key < y.sku_key ? -1 : 1));
+  return { state: 'ok', today, prev, lost };
+}
+
+/** 送った記録が無いものだけ残す */
+export function filterUnsent(db, kind, date, items) {
+  ensureAlertTables(db);
+  const q = db.prepare(`SELECT 1 FROM amazon_alert_sent WHERE date_jst = ? AND kind = ? AND sku_key = ? AND reason = ?`);
+  return items.filter((i) => !q.get(date, kind, i.sku_key, i.reason));
+}
+export function markSent(db, kind, date, items, sentAt = new Date().toISOString()) {
+  ensureAlertTables(db);
+  const ins = db.prepare(`INSERT OR IGNORE INTO amazon_alert_sent (date_jst, kind, sku_key, reason, sent_at) VALUES (?, ?, ?, ?, ?)`);
+  db.transaction(() => { for (const i of items) ins.run(date, kind, i.sku_key, i.reason, sentAt); })();
+}
+
+const cut = (s, n) => { const x = String(s ?? '').replace(/\s+/g, ' ').trim(); return x.length > n ? `${x.slice(0, n - 1)}…` : x; };
+const salesNote = (i) => `30日 ${i.units || 0}個 ${yen(i.sales_jpy)}${i.fba_qty ? ` / FBA在庫 ${i.fba_qty}` : ''}`;
+function listLines(items, fmt) {
+  const lines = items.slice(0, MAX_LINES).map(fmt);
+  if (items.length > MAX_LINES) lines.push(`  …ほか ${items.length - MAX_LINES} 件`);
+  return lines;
+}
+
+export function formatListingMessage({ today, prev, notBuyable, newErrors }) {
+  const out = [`🚨 *Amazon 出品の問題* (${today}・前の回 ${prev}・売れている / FBA 在庫のある SKU だけ)`];
+  if (notBuyable.length) {
+    out.push('', `*BUYABLE でなくなった ${notBuyable.length} 件*`);
+    out.push(...listLines(notBuyable, (i) => `• ${i.seller_sku}${i.asin ? ` (${i.asin})` : ''}: ${i.prev_status || '-'} → ${i.status || '(状態なし)'}${i.suppressed ? ' 【出品停止】' : ''} / ${salesNote(i)}`));
+  }
+  if (newErrors.length) {
+    out.push('', `*新しい ERROR ${newErrors.length} 件*`);
+    out.push(...listLines(newErrors, (i) => `• ${i.seller_sku}: [${i.code}] ${cut(i.message, 80)}${i.actions?.length ? ` 【${i.actions.join(',')}】` : ''} / ${salesNote(i)}`));
+  }
+  out.push('', '見る所: セラーセントラル「在庫 > 出品情報の品質管理」/ warehouse.db の amazon_listing_status_daily・amazon_listing_issue_daily');
+  return out.join('\n');
+}
+
+export function formatBuyboxMessage({ today, prev, lost }) {
+  const out = [`⚠️ *Amazon カートを取られた ${lost.length} 件* (${today}・前の回 ${prev} は自社がカート・直近 30 日に売れた SKU だけ)`];
+  out.push(...listLines(lost, (i) => `• ${i.seller_sku}${i.asin ? ` (${i.asin})` : ''}: 自社 ${yen(i.my_price)} / カート ${yen(i.buybox_price)}${i.diff != null ? ` (差 ${i.diff > 0 ? '+' : ''}${yen(i.diff).replace('¥-', '-¥')})` : ''} / 30日 ${i.units}個 ${yen(i.sales_jpy)}`));
+  out.push('', '差 = 自社価格 − カート価格 (税込・landed)。見る所: /apps/amazon-pricing・warehouse.db の fact_amazon_price_snapshot');
+  return out.join('\n');
+}
+
+/** 1 回分 (作る → 送っていないものだけ → 送る → 記録)。戻り値 { summary, exitCode } */
+export async function runAlert(db, { kind, today, dryRun = false, send = sendGChat, webhook = process.env.GCHAT_WEBHOOK }) {
+  ensureAlertTables(db);
+  const watch = loadWatchSkus(db, { today });
+  const label = kind === 'listing' ? '出品アラート' : 'カートアラート';
+  let built, items, message;
+  if (kind === 'listing') {
+    built = buildListingAlerts(db, { today, watch });
+    if (built.state !== 'ok') return { exitCode: 0, summary: built.state === 'first' ? `✓ ${label}: 前の回の写しが無い (初回) = 通知しない` : `⚠️ ${label}: 今日 (${today}) の出品の写しが無い = 比べない` };
+    const nb = filterUnsent(db, kind, today, built.notBuyable);
+    const ne = filterUnsent(db, kind, today, built.newErrors);
+    items = [...nb, ...ne];
+    if (items.length) message = formatListingMessage({ today, prev: built.prev, notBuyable: nb, newErrors: ne });
+  } else if (kind === 'buybox') {
+    built = buildBuyboxAlerts(db, { today, watch });
+    if (built.state !== 'ok') return { exitCode: 0, summary: built.state === 'first' ? `✓ ${label}: 前の回のカートの写しが無い = 通知しない` : `⚠️ ${label}: 今日 (${today}) のカートの写しが無い = 比べない` };
+    items = filterUnsent(db, kind, today, built.lost);
+    if (items.length) message = formatBuyboxMessage({ today, prev: built.prev, lost: items });
+  } else {
+    return { exitCode: 1, summary: `❌ --kind が違う (${kind}) = listing | buybox` };
+  }
+  const counts = kind === 'listing' ? `BUYABLE でなくなった ${built.notBuyable.length}・新しい ERROR ${built.newErrors.length}` : `カートを取られた ${built.lost.length}`;
+  if (!items.length) return { exitCode: 0, summary: `✓ ${label} (${today} vs ${built.prev}): ${counts} / 新しく送るもの無し` };
+  console.log(message);
+  if (dryRun) return { exitCode: 0, summary: `✓ ${label} (${today} vs ${built.prev}): ${counts} / --dry-run = 送らない` };
+  if (!webhook) return { exitCode: 0, summary: `⚠️ ${label} (${today} vs ${built.prev}): ${counts} / GCHAT_WEBHOOK が無い = 送らない` };
+  const ok = await send(message, { webhook });
+  if (!ok) return { exitCode: 0, summary: `⚠️ ${label} (${today} vs ${built.prev}): ${counts} / GChat に送れなかった (次の回にまた送る)` };
+  markSent(db, kind, today, items);
+  return { exitCode: 0, summary: `✓ ${label} (${today} vs ${built.prev}): ${counts} / ${items.length} 件を通知` };
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  const ki = argv.indexOf('--kind');
+  const kind = ki >= 0 ? argv[ki + 1] : null;
+  await initDB();
+  const db = getDB();
+  const r = await runAlert(db, { kind, today: businessDate(), dryRun: argv.includes('--dry-run') });
+  console.log(r.summary);   // 最後の 1 行 = daily-sync の朝の通知 (⚠️ で始まれば warn)
+  process.exitCode = r.exitCode;
+}
+
+if (isMainModule(import.meta.url)) main().catch((e) => {
+  console.error(`[AmazonAlert] FATAL: ${e.message}`);
+  process.exitCode = 1;
+});

@@ -686,6 +686,39 @@ async function main() {
     results.push({ name: 'Amazonカート価格', success: false, summary: '⏭️ skipped (SP-API失敗のため)' });
   }
 
+  // Amazon の出品・カート・BSR (2026-10-22・AI の分析とアラート)。retry には載せない (翌朝また取れば足りる・アラートを二重に鳴らさない)
+  //   ① 出品の状態と問題 (Listings Items searchListingsItems・作成日時の窓で全部 + 売れている SKU の引き直し。5 回/秒の枠を 4 回/秒で) → 写し amazon_listing_status_daily / amazon_listing_issue_daily
+  //   ② 出品アラート (①が取れた朝だけ・30 日に売れた or FBA 在庫の SKU が BUYABLE でなくなった / 新しい ERROR。初回は鳴らさない)
+  //   ③ カートを取られたアラート (「Amazonカート価格」が取れた朝だけ・API を呼ばない)
+  //   ④ BSR の履歴 (Catalog Items searchCatalogItems・20 ASIN ずつ・2 回/秒の枠) → amazon_catalog_rank_daily
+  //   ①④ は SP-API の注文の取込が失敗した朝は見送る (カート価格と同じ)
+  if (spResult.success) {
+    const listingResult = runScript('apps/warehouse/fetch-amazon-listing-issues.js', 'Amazon出品の状態', 1800000);
+    results.push({ name: 'Amazon出品の状態', ...listingResult, warn: listingResult.success && isWarnSummary(listingResult.summary) });
+    if (listingResult.success) {
+      const listingAlert = runScript('apps/warehouse/alert-amazon-listing.js --kind listing', 'Amazon出品アラート', 300000);
+      results.push({ name: 'Amazon出品アラート', ...listingAlert, warn: listingAlert.success && isWarnSummary(listingAlert.summary) });
+    } else {
+      console.log('[DailySync] Amazon出品の状態 失敗のため Amazon出品アラートをスキップ');
+    }
+  } else {
+    console.log('[DailySync] SP-API 失敗のため Amazon出品の状態の取得をスキップ');
+    results.push({ name: 'Amazon出品の状態', success: false, summary: '⏭️ skipped (SP-API失敗のため)' });
+  }
+  if (results.some(r => r.name === 'Amazonカート価格' && r.success)) {
+    const buyboxAlert = runScript('apps/warehouse/alert-amazon-listing.js --kind buybox', 'Amazonカートアラート', 300000);
+    results.push({ name: 'Amazonカートアラート', ...buyboxAlert, warn: buyboxAlert.success && isWarnSummary(buyboxAlert.summary) });
+  } else {
+    console.log('[DailySync] Amazonカート価格 失敗のため Amazonカートアラートをスキップ');
+  }
+  if (spResult.success) {
+    const bsrResult = runScript('apps/warehouse/fetch-amazon-bsr.js', 'Amazon BSR', 1200000);
+    results.push({ name: 'Amazon BSR', ...bsrResult, warn: bsrResult.success && isWarnSummary(bsrResult.summary) });
+  } else {
+    console.log('[DailySync] SP-API 失敗のため Amazon BSR の取得をスキップ');
+    results.push({ name: 'Amazon BSR', success: false, summary: '⏭️ skipped (SP-API失敗のため)' });
+  }
+
   // FBA 在庫スナップショット (RESTOCK + PLANNING) — daily_snapshots に履歴蓄積
   // 手動 /fetch-reports と lockfile で排他、既に走ってればスキップ (失敗扱いにしない)
   // SP-API レポート polling のため最大 15 分余裕
