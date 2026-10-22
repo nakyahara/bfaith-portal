@@ -114,7 +114,7 @@ export const PLANNING_HISTORY_COLUMNS = [
 
 /** 「在庫がある」の判定に使う列 (どれかが 1 以上なら残す。どれも 0 なら残さない。どれも分からなければ残す) */
 const STOCK_COLS = ['available', 'reserved_qty', 'unfulfillable_qty', 'pending_removal_qty', 'inbound_qty', 'inbound_working', 'inbound_shipped', 'inbound_received',
-  'inv_age_0_90', 'inv_age_91_180', 'inv_age_181_270', 'inv_age_271_365', 'inv_age_365_plus',
+  'inv_age_0_90', 'inv_age_91_180', 'inv_age_181_270', 'inv_age_271_365', 'inv_age_365_plus', 'inv_age_0_30', 'inv_age_31_60', 'inv_age_61_90', 'inv_age_181_330', 'inv_age_331_365',
   'ais_qty_181_210', 'ais_qty_211_240', 'ais_qty_241_270', 'ais_qty_271_300', 'ais_qty_301_330', 'ais_qty_331_365', 'ais_qty_365_plus'];
 
 const COL_NAMES = PLANNING_HISTORY_COLUMNS.map(([c]) => c);

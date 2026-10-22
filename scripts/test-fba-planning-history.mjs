@@ -15,7 +15,7 @@ import {
 } from '../apps/warehouse/fba-planning-history.js';
 import { runFbaReportSnapshot } from '../apps/warehouse/fba-report-snapshot.js';
 import {
-  runAgedAlert, pickAgedCandidates, buildAgedAlertMessage, weekKeyJst, jstWeekday, ensureAlertLog, ALERT_WEEKDAY_JST, AGED_MIN_QTY, MAX_LIST,
+  runAgedAlert, pickAgedCandidates, agedOver180, buildAgedAlertMessage, weekKeyJst, jstWeekday, ensureAlertLog, ALERT_WEEKDAY_JST, AGED_MIN_QTY, MAX_LIST,
 } from '../apps/warehouse/alert-fba-aged-inventory.js';
 
 let ok = 0, ng = 0;
@@ -195,6 +195,7 @@ const agedRows = () => [
   raw('ais', { 'inv-age-181-to-270-days': '1', 'inv-age-271-to-365-days': '0', 'inv-age-365-plus-days': '0', 'estimated-ais-181-210-days': '800', 'estimated-ais-211-240-days': '700' }),   // 長期保管料の見込み 1,500
   raw('noprice', { 'inv-age-181-to-270-days': '12', 'inv-age-271-to-365-days': '', 'inv-age-365-plus-days': '', 'your-price': '' }),   // 価格が分からない = 個数だけで
   raw('unknown', { 'inv-age-181-to-270-days': '', 'inv-age-271-to-365-days': '', 'inv-age-365-plus-days': '' }),   // 年齢の列が無い = 対象にしない
+  raw('alt', { 'inv-age-181-to-270-days': '', 'inv-age-271-to-365-days': '', 'inv-age-365-plus-days': '0', 'inv-age-181-to-330-days': '20', 'inv-age-331-to-365-days': '0', 'your-price': '2000' }),   // 別の区分だけ (Codex R3) = 20 個 × 2000 = 40,000
 ];
 await t('週の鍵 = JST の月曜・曜日 (朝 7 時の JST は UTC の前日)', () => {
   assert.equal(jstWeekday(MON), 1);
@@ -207,11 +208,15 @@ await t('対象の選び方: 181 日以上が N 個以上かつ金額が大き�
   const db = openDb();
   seed(db, '2026-10-26', agedRows());
   const c = pickAgedCandidates(db, '2026-10-26');
-  assert.deepEqual(c.map((x) => x.sku), ['big', 'ais', 'noprice']);
-  assert.deepEqual([c[0].aged181, c[0].over365, c[0].agedValue, c[1].aisEst, c[2].aged181, c[2].agedValue], [45, 5, 90000, 1500, 12, null]);
+  assert.deepEqual(c.map((x) => x.sku), ['big', 'alt', 'ais', 'noprice']);
+  // 区分の組は重ねない: 181-270/271-365 があればそれ・無ければ 181-330/331-365・365 日超は足す
+  assert.equal(agedOver180({ inv_age_181_270: 5, inv_age_271_365: null, inv_age_181_330: 9, inv_age_331_365: 9, inv_age_365_plus: 1 }), 6);
+  assert.equal(agedOver180({ inv_age_181_270: null, inv_age_271_365: null, inv_age_181_330: 9, inv_age_331_365: 2, inv_age_365_plus: 1 }), 12);
+  assert.equal(agedOver180({ inv_age_181_270: null, inv_age_271_365: null, inv_age_181_330: null, inv_age_331_365: null, inv_age_365_plus: null }), null);
+  assert.deepEqual([c[0].aged181, c[0].over365, c[0].agedValue, c[1].aged181, c[1].agedValue, c[2].aisEst, c[3].aged181, c[3].agedValue], [45, 5, 90000, 20, 40000, 1500, 12, null]);
   assert.ok(AGED_MIN_QTY === 10);
   const msg = buildAgedAlertMessage(c, '2026-10-26');
-  assert.match(msg, /3 件/);
+  assert.match(msg, /4 件/);
   assert.match(msg, /• big — 181日以上 45個 \(365日超 5\)/);
   assert.match(msg, /長期保管料の見込み ¥1,500/);
   const many = Array.from({ length: MAX_LIST + 5 }, (_, i) => ({ ...c[0], sku: `s${i}` }));
@@ -226,7 +231,7 @@ await t('🚨 控えめ: 月曜だけ・同じ週に 2 回送らない (記録)�
   assert.equal((await runAgedAlert(db, { nowMs: MON, webhook: '', send, log: quiet })).status, 'no_webhook');
   assert.equal((await runAgedAlert(db, { nowMs: MON, webhook: 'https://x', send: async () => false, log: quiet })).status, 'send_failed');
   const r = await runAgedAlert(db, { nowMs: MON, webhook: 'https://x', send, log: quiet });
-  assert.deepEqual([r.status, r.candidates, sent.length], ['sent', 3, 1]);
+  assert.deepEqual([r.status, r.candidates, sent.length], ['sent', 4, 1]);
   assert.equal((await runAgedAlert(db, { nowMs: MON + 3600000, webhook: 'https://x', send, log: quiet })).status, 'already_sent');
   assert.equal(sent.length, 1);
   assert.equal((await runAgedAlert(db, { nowMs: MON, webhook: 'https://x', send, force: true, log: quiet })).status, 'sent');   // --force は送る

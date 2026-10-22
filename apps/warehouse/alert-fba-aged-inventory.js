@@ -84,18 +84,30 @@ export function latestSnapshotDate(db, todayJst) {
 }
 
 /**
+ * 181 日以上の個数。区分の組は重ならないように 1 つだけ使う (Codex R3):
+ *   181-270 + 271-365 のどちらかが分かる → それ / 無ければ 181-330 + 331-365 / どちらも無ければ 365 日超だけ。365 日超は足す。全部分からなければ null
+ */
+export function agedOver180(r) {
+  const main = [r.inv_age_181_270, r.inv_age_271_365];
+  const alt = [r.inv_age_181_330, r.inv_age_331_365];
+  const known = (xs) => xs.some((v) => v !== null && v !== undefined);
+  const mid = known(main) ? main : known(alt) ? alt : [];
+  return sumKnown([...mid, r.inv_age_365_plus]);
+}
+
+/**
  * その日の対象 SKU (金額の大きい順)
  * @returns {{ sku, available, aged181, over365, agedValue, aisEst, storageNext, units30, action, removalQty }[]}
  */
 export function pickAgedCandidates(db, snapshotDate) {
   ensurePlanningHistoryTables(db);
-  const rows = db.prepare(`SELECT amazon_sku, available, your_price, inv_age_181_270, inv_age_271_365, inv_age_365_plus,
+  const rows = db.prepare(`SELECT amazon_sku, available, your_price, inv_age_181_270, inv_age_271_365, inv_age_365_plus, inv_age_181_330, inv_age_331_365,
       ais_est_181_210, ais_est_211_240, ais_est_241_270, ais_est_271_300, ais_est_301_330, ais_est_331_365, ais_est_365_plus,
       estimated_storage_cost_next_month, units_shipped_t30, recommended_action, recommended_removal_qty
     FROM fba_planning_daily WHERE snapshot_date = ? AND market = 'jp'`).all(snapshotDate);
   const out = [];
   for (const r of rows) {
-    const aged181 = sumKnown([r.inv_age_181_270, r.inv_age_271_365, r.inv_age_365_plus]);
+    const aged181 = agedOver180(r);
     const aisEst = sumKnown([r.ais_est_181_210, r.ais_est_211_240, r.ais_est_241_270, r.ais_est_271_300, r.ais_est_301_330, r.ais_est_331_365, r.ais_est_365_plus]);
     const agedValue = aged181 !== null && r.your_price !== null && r.your_price > 0 ? aged181 * r.your_price : null;
     const byQty = aged181 !== null && aged181 >= AGED_MIN_QTY && (agedValue === null || agedValue >= AGED_MIN_VALUE_YEN);
