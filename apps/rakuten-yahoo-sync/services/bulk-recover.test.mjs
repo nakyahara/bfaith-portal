@@ -50,3 +50,13 @@ test('最近まで動いていた batch (デプロイの切り替え中に古い
   assert.equal(recoverStaleBatches(db), 0);
   assert.ok(getRunningBatch(db));
 });
+
+test('中断扱いにした商品は「失敗中を再実行」で拾う (成功済みは拾わない)', async () => {
+  const { listFailedItemCodes } = await import('./bulk-publish.js');
+  const db = freshDb();
+  const old = new Date(Date.now() - STALE_BATCH_MS - 60_000).toISOString();
+  insertRunning(db, old, [['p1', 'pending', null], ['r1', 'running', old], ['s1', 'success', old]]);
+  db.prepare(`INSERT INTO publish_idempotency (idempotency_key, item_code, manage_number, status, created_by) VALUES ('k-s1', 's1', 's1', 'success', 't')`).run();
+  recoverStaleBatches(db);
+  assert.deepEqual(listFailedItemCodes(db).sort(), ['p1', 'r1']);
+});

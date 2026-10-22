@@ -165,6 +165,25 @@ async function testAll() {
     const mod = await import('../services/rys-cron.js');
     expect('full (7): rys-cron module loads with startRysCron export', typeof mod.startRysCron === 'function', typeof mod.startRysCron);
   }
+
+  // (8) 2026-10-22: Yahoo で消えた商品は台帳から外して baseline は確立するが、勝手に移行候補には戻さない
+  //     (Yahoo 側で別コードへ移した商品の二重出品を防ぐ — Codex 指摘)
+  {
+    const db = freshDb();
+    await runRysFullSync({ db, yahooDeps: { callApi: makeYahooMock(5) }, rakutenItems: makeRakuten(['a-5', 'new-1']) });
+    const reducedMock = async ({ query, offset, results }) => {
+      const total = (query === 'a') ? 4 : 5; // a-5 が Yahoo から消えた (件数は一致 = 取りこぼしではない)
+      const items = [];
+      const start = offset + 1;
+      const end = Math.min(offset + results, total);
+      for (let i = start; i <= end; i++) items.push({ ItemCode: `${query}-${i}` });
+      return { ok: true, items, totalResultsAvailable: total, totalResultsReturned: items.length, firstResultPosition: start };
+    };
+    const r = await runRysFullSync({ db, yahooDeps: { callApi: reducedMock }, rakutenItems: makeRakuten(['a-5', 'new-1']) });
+    expect('full (8): baseline は確立して差分まで進む', r.baseline?.establishesBaseline === true && r.baseline?.prunedRows === 1 && !!r.diff, JSON.stringify(r.baseline?.prunedRows));
+    expect('full (8): 消えた a-5 は移行候補にしない', !db.prepare("SELECT 1 FROM migration_candidates WHERE item_code = 'a-5' AND status = 'candidate'").get());
+    expect('full (8): Yahoo に無い new-1 は候補', !!db.prepare("SELECT 1 FROM migration_candidates WHERE item_code = 'new-1' AND status = 'candidate'").get());
+  }
 }
 
 // ──── runner ────

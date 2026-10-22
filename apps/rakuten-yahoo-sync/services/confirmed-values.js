@@ -124,6 +124,15 @@ export function mergeConfirmedValues(confirmed, legacy) {
   };
 }
 
+/**
+ * 確定値の「版」を 1 つの文字列にする (画面で見た値と出品の直前の値が同じかを比べる — D-2 の承認版の固定)。
+ * 確定値の表の行 = `manual:3` / `portal:2`、旧 Notion から継承 = `legacy_notion:0` (以後変わらない)、無し = `none`
+ */
+export function valueTokenOf(merged) {
+  if (!merged) return 'none';
+  return `${merged.value_source || 'unknown'}:${merged.version ?? 0}`;
+}
+
 /** 一覧画面用: 確定値の表を全部 (小文字の管理番号 → 行) */
 export function loadAllConfirmedRows(db) {
   const map = new Map();

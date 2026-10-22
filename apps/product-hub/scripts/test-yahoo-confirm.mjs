@@ -125,5 +125,23 @@ console.log('── 5. 移行アプリで確定済みの商品をハブが引き
   check('移行アプリからは変えられない', err?.code === 'portal_owned');
 }
 
+console.log('── 6. バリエーション: SKU ごとの売価は楽天の出品と同じ決め方 (SKU 別売価 > NE の標準売価 > 代表の売価) ──');
+{
+  const ins = db.prepare(`INSERT OR REPLACE INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 代表商品コード, 標準売価, updated_at)
+    VALUES (?, ?, ?, '1', '取扱中', 'ok', ?, ?, '2026-10-22T00:00:00Z')`);
+  ins.run(99101, 'ycvar-a', 'A', 'ycvar', 1000);
+  ins.run(99102, 'ycvar-b', 'B', 'ycvar', 2000);
+  const d = makeDraft('ycvar', { price: 1000 });
+  const p = await buildYahooConfirmPreview(db, d, { tax: LEGACY });
+  check('NE の標準売価が SKU で違えば止める (SKU 別売価を入れていなくても)', !p.ok && p.reasons.some((r) => /SKU ごとに売価が違います/.test(r)), JSON.stringify(p.reasons));
+  db.prepare('UPDATE mirror_products SET 標準売価 = 1500 WHERE product_id IN (99101, 99102)').run();
+  const p2 = await buildYahooConfirmPreview(db, d, { tax: LEGACY });
+  check('全 SKU が同じ売価ならその売価 (代表の売価ではなく NE の標準売価)', p2.ok && p2.values.yahoo_price === 1500, JSON.stringify(p2));
+  db.prepare('INSERT INTO draft_sku_prices (draft_id, sku_code, price) VALUES (?, ?, ?)').run(d.id, 'ycvar-b', 1800);
+  const p3 = await buildYahooConfirmPreview(db, d, { tax: LEGACY });
+  check('画面の SKU 別売価が NE より優先 (違えば止める)', !p3.ok && p3.reasons.some((r) => /¥1,500 \/ ¥1,800/.test(r)), JSON.stringify(p3.reasons));
+  db.prepare('DELETE FROM mirror_products WHERE product_id IN (99101, 99102)').run();
+}
+
 if (failed) { console.error(`FAILED: ${failed}`); process.exit(1); }
 console.log('ALL CHECKS PASSED');

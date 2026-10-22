@@ -157,9 +157,15 @@ async function detectMigrationCandidates({
     assertYahooBaselineFixed(db);
 
     // 4. Yahoo 側商品 set (yahoo_registered_items から)
+    //   2026-10-22: baseline で「Yahoo から消えた」として台帳から外した商品 (yahoo_removed_items) も含める。
+    //   外す前は台帳に残り続けていたので候補にならなかった — 外したことで勝手に新規候補になると、
+    //   Yahoo 側で別コードへ移した商品が二重出品になる (Codex 指摘)。出し直すかは人が決める
     const yahooCodes = new Set(
       db.prepare('SELECT item_code FROM yahoo_registered_items').all().map((r) => r.item_code)
     );
+    try {
+      for (const r of db.prepare('SELECT DISTINCT item_code FROM yahoo_removed_items').all()) yahooCodes.add(r.item_code);
+    } catch (_) { /* migration 024 未適用 */ }
 
     // 5. overlap 計算
     let overlap = 0;

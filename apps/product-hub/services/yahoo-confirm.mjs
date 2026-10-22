@@ -13,7 +13,8 @@
  *   タイトル = AI 出力の yahoo_title (人が直した値も同じ行)。空なら止める
  *   配送方法 = ヤフーだけ別配送なら draft_yahoo の配送方法、そうでなければ楽天の配送方法グループ → RYS のラベル
  *              (対応を決めていない配送方法は止める — services/delivery-label-map.js)
- *   売価     = ヤフーだけ別配送なら draft_yahoo の Yahoo!売価、そうでなければ基本情報の売価 (= 楽天と同じ)
+ *   売価     = ヤフーだけ別配送なら draft_yahoo の Yahoo!売価、そうでなければ楽天と同じ売価
+ *              (バリエーションは SKU ごとに 画面の SKU 別売価 > NE の標準売価 > 代表の売価 = 楽天の出品と同じ決め方)
  *              SKU ごとに売価が違う商品は Yahoo!へ 1 つの売価でしか出せないので止める
  *   佐川売価 = 佐川売価の対象の配送方法 (定形外（ヤフーのみ…）) のときだけ。空なら「通常売価と同額」を画面で明示的に選ぶ
  *   税率     = 楽天の出品と同じ決め方 (listing-tax.mjs: 切替前は draft_yahoo.tax_rate / 切替後は Company DB)
@@ -24,6 +25,7 @@ import { confirmValues, loadConfirmedRow, validateConfirmInput, normalizeTaxRate
 import { labelFromPortal } from '../../rakuten-yahoo-sync/services/delivery-label-map.js';
 import { resolveListingTax } from './listing-tax.mjs';
 import { existingPageOfDraft } from '../lib/existing-page.js';
+import { resolveVariationGroup } from '../lib/variation.js';
 
 export { ConfirmError };
 
@@ -67,11 +69,35 @@ export async function buildYahooConfirmPreview(db, draft, { sagawaSame = false, 
     if (!price) reasons.push('ヤフーだけ別配送の商品です。Yahoo!売価を入れてください');
   } else {
     price = Number(draft.price) > 0 ? Number(draft.price) : null;
-    if (!price) reasons.push('売価が空です (基本情報の売価)');
-    const skuPrices = db.prepare('SELECT DISTINCT price FROM draft_sku_prices WHERE draft_id = ? AND price IS NOT NULL').all(draft.id)
-      .map((r) => Number(r.price)).filter((n) => n > 0);
-    const distinct = new Set([...(price ? [price] : []), ...skuPrices]);
+    // バリエーションは SKU ごとの売価を楽天の出品と同じ決め方で出して比べる (Codex 指摘):
+    //   画面で入れた SKU 別売価 > NE の標準売価 > ページ代表の売価 (rakuten-listing.js の buildItemPayload と同じ)。
+    //   SKU 別売価を入れていなくても NE の標準売価が SKU で違えば、楽天は SKU ごとの売価で出ている
+    const distinct = new Set(price ? [price] : []);
+    const vari = resolveVariationGroup(db, draft.ne_code, { draftId: draft.id, withMembers: true });
+    if (vari.kind === 'variation' && vari.memberCount > 1) {
+      const priceRows = new Map(db.prepare('SELECT sku_code, price FROM draft_sku_prices WHERE draft_id = ?')
+        .all(draft.id).map((r) => [String(r.sku_code), Number(r.price)]));
+      distinct.clear();
+      for (const m of vari.members) {
+        const key = String(m.商品コード || '').trim().toLowerCase();
+        const manual = Number(priceRows.get(key));
+        const ne = Number(m.標準売価);
+        const p = Number.isFinite(manual) && manual >= 1 ? Math.round(manual)
+          : (Number.isFinite(ne) && ne >= 1 ? Math.round(ne) : price);
+        if (p) distinct.add(p);
+      }
+      if (distinct.size === 1) price = [...distinct][0];
+    } else {
+      // 単品: SKU 別売価が残っていれば (単品なのに) それも見る
+      for (const r of db.prepare('SELECT DISTINCT price FROM draft_sku_prices WHERE draft_id = ? AND price IS NOT NULL').all(draft.id)) {
+        if (Number(r.price) > 0) distinct.add(Number(r.price));
+      }
+    }
+    if (distinct.size === 0 || !price) {
+      if (distinct.size <= 1) reasons.push('売価が空です (基本情報の売価 / NE の標準売価)');
+    }
     if (distinct.size > 1) {
+      price = null;
       reasons.push(`SKU ごとに売価が違います (${[...distinct].sort((a, b) => a - b).map((n) => '¥' + n.toLocaleString()).join(' / ')})。Yahoo!へは 1 つの売価でしか出せないので、移行アプリの商品詳細で決めてください`);
     }
   }

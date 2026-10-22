@@ -28,7 +28,7 @@ import { resolvePrice, pickRakutenMinPrice } from './services/field-mapper.js';
 import { TAX_RATE_MAP } from './services/readiness-check.js';
 import {
   loadAllConfirmedRows, mergeConfirmedValues, loadConfirmedValues, loadConfirmedRow,
-  confirmValues, listConfirmHistory, listDeliveryOptions, ConfirmError, SOURCE_LABELS,
+  confirmValues, listConfirmHistory, listDeliveryOptions, ConfirmError, SOURCE_LABELS, valueTokenOf,
 } from './services/confirmed-values.js';
 import { suggestDeliveryLabelFromRakutenItem } from './services/delivery-label-map.js';
 import {
@@ -358,6 +358,10 @@ function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
       syncedAt:           r.synced_at,
       // 確定値の出所 (manual / portal / legacy_notion / null)。portal はハブの商品詳細へリンクする
       valueSource:        r._merged?.value_source ?? null,
+      // 出品の確認画面と出品の直前で同じ版かを比べる (別の人が確定し直したら止める)
+      valueToken:         valueTokenOf(r._merged),
+      // 実際に送る売価 (佐川売価の対象なら佐川売価)。確認画面に出す
+      resolvedPrice:      r._merged ? resolvePrice({ notionOverride: r._merged, deliveryRow: r.notion_delivery_label ? (deliveryMap.get(String(r.notion_delivery_label).trim()) || null) : null }) : null,
       confirmedAt:        r._merged?.confirmed_at ?? null,
       portalDraftId:      r._merged?.portal_draft_id ?? null,
       exclusionKind:      r.exclusion_kind,
@@ -1039,6 +1043,8 @@ router.post('/api/publish/execute/:itemCode', async (req, res) => {
       db, itemCode, manageNumber,
       createdBy: 'http',
       idempotencyKey: body.idempotencyKey || null,
+      // 確認画面で見た確定値の版 (違えば止める)。送られてこない呼び出し (古い画面・スクリプト) は照合しない
+      expectedValueToken: typeof body.valueToken === 'string' && body.valueToken ? body.valueToken : undefined,
       publishOpts: {
         productCategory: body.productCategory || null,
         pathName: body.pathName || null,
@@ -1407,7 +1413,9 @@ router.post('/api/publish/bulk/start', (req, res) => {
     const body = req.body || {};
     const itemCodes = body.itemCodes;
     const triggeredBy = body.triggeredBy === 'retry_failed' ? 'retry_failed' : 'manual';
-    const result = startBulkPublish({ db, itemCodes, triggeredBy });
+    // 一覧で見た確定値の版 (itemCode → token)。出品の直前に違えば その商品は止める
+    const valueTokens = body.valueTokens && typeof body.valueTokens === 'object' && !Array.isArray(body.valueTokens) ? body.valueTokens : null;
+    const result = startBulkPublish({ db, itemCodes, triggeredBy, valueTokens });
     audit(db, 'bulk_publish_start', { batchId: result.batchId, total: result.total, triggeredBy });
     return res.status(202).json({ status: 'ok', ...result });
   } catch (e) {

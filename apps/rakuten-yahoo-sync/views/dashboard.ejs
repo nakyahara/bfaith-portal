@@ -260,7 +260,7 @@
         </div>
       <% } else { %>
         <% for (const p of products) { %>
-          <div class="product-card js-open-detail" data-item-code="<%= p.itemCode %>" role="button" tabindex="0" aria-label="<%= p.itemCode %> の詳細を見る">
+          <div class="product-card js-open-detail" data-item-code="<%= p.itemCode %>" data-value-token="<%= p.valueToken || '' %>" role="button" tabindex="0" aria-label="<%= p.itemCode %> の詳細を見る">
             <% if (p.status === 'actionable') { %>
               <div class="bulk-checkbox-wrap">
                 <input type="checkbox" class="form-check-input js-bulk-checkbox" data-item-code="<%= p.itemCode %>" aria-label="<%= p.itemCode %> を一括選択">
@@ -356,7 +356,8 @@
                 <button class="btn btn-success btn-sm js-publish-btn"
                         data-item-code="<%= p.itemCode %>"
                         data-yahoo-title="<%= p.yahooTitle || '' %>"
-                        data-yahoo-price="<%= p.yahooPrice || 0 %>"
+                        data-yahoo-price="<%= p.resolvedPrice || p.yahooPrice || 0 %>"
+                        data-value-token="<%= p.valueToken || '' %>"
                         data-delivery="<%= p.delivery || '' %>">
                   <% if (publishEnabled) { %>▶️ Yahoo に出す<% } else { %>🧪 登録テスト<% } %>
                 </button>
@@ -675,8 +676,18 @@ function showPubView(name) {
   document.getElementById('pubModalResultBody').style.display = name === 'result' ? '' : 'none';
 }
 
+// 確認画面に出した確定値の版 (出品の直前に違えば止める — 別の人が確定し直した値で出さない)
+let _pubValueToken = null;
+function valueTokenOfCard(itemCode) {
+  for (const el of document.querySelectorAll('[data-item-code][data-value-token]')) {
+    if (el.dataset.itemCode === itemCode && el.dataset.valueToken) return el.dataset.valueToken;
+  }
+  return null;
+}
+
 function openPublishConfirm(itemCode, title, price, delivery) {
   _pubItemCode = itemCode;
+  _pubValueToken = valueTokenOfCard(itemCode);
   document.getElementById('pubItemCode').textContent = itemCode;
   document.getElementById('pubTitle').textContent = title || '(未入力)';
   document.getElementById('pubPrice').textContent = price ? price.toLocaleString() : '0';
@@ -743,7 +754,7 @@ async function executePublish() {
   let data, error;
   try {
     const res = await fetch('/apps/rakuten-yahoo-sync/api/publish/execute/' + encodeURIComponent(_pubItemCode), {
-      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({}),
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(_pubValueToken ? { valueToken: _pubValueToken } : {}),
     });
     data = await res.json();
   } catch (e) {
@@ -1756,7 +1767,11 @@ async function executeBulkPublish() {
   try {
     const res = await fetch('/apps/rakuten-yahoo-sync/api/publish/bulk/start', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ itemCodes, triggeredBy: 'manual' }),
+      body: JSON.stringify({
+        itemCodes, triggeredBy: 'manual',
+        // 一覧で見た確定値の版 (出品の直前に違えばその商品は止める)
+        valueTokens: Object.fromEntries(itemCodes.map((c) => [c, valueTokenOfCard(c)]).filter(([, t]) => t)),
+      }),
     });
     const data = await res.json();
     if (!res.ok || !data.batchId) {

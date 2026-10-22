@@ -137,7 +137,7 @@ function resolveManageNumber(db, itemCode, codeMappingCache) {
  * 返り値: { status, publishStatus, idempotencyKey?, error? }
  *   - status: 'success' / 'failed' / 'skipped' / 'dedupe' / 'flag_off' / 'readiness_blocked'
  */
-async function publishOneItem({ db, itemCode, batchItemId, codeMappingCache }) {
+async function publishOneItem({ db, itemCode, batchItemId, codeMappingCache, expectedValueToken }) {
   markItemRunning(db, batchItemId);
   try {
     // Codex R1 Critical: manageNumber を resolve してから executePublish へ
@@ -155,6 +155,7 @@ async function publishOneItem({ db, itemCode, batchItemId, codeMappingCache }) {
     const result = await executePublish({
       db, itemCode, manageNumber,
       createdBy: 'bulk',
+      expectedValueToken,
     });
     // Codex R1 Medium-5: not_implemented を success にすると dashboard 集計が done 扱いしない、 'skipped' に正規化。
     let normalized;
@@ -195,7 +196,7 @@ async function publishOneItem({ db, itemCode, batchItemId, codeMappingCache }) {
  *
  * @returns {{ batchId: number, total: number }}
  */
-export function startBulkPublish({ db, itemCodes, triggeredBy = 'manual' }) {
+export function startBulkPublish({ db, itemCodes, triggeredBy = 'manual', valueTokens = null }) {
   if (!Array.isArray(itemCodes) || itemCodes.length === 0) {
     const err = new Error('startBulkPublish: itemCodes must be a non-empty array');
     err.statusCode = 400;
@@ -254,7 +255,8 @@ export function startBulkPublish({ db, itemCodes, triggeredBy = 'manual' }) {
     // 背景で順次実行 (Render は同一プロセス、 fire-and-forget OK、 失敗は batch_items + audit に記録)
     for (let i = 0; i < cleaned.length; i++) {
       try {
-        const result = await publishOneItem({ db, itemCode: cleaned[i], batchItemId: batchItemIds[i], codeMappingCache });
+        const tok = valueTokens && typeof valueTokens[cleaned[i]] === 'string' ? valueTokens[cleaned[i]] : undefined;
+        const result = await publishOneItem({ db, itemCode: cleaned[i], batchItemId: batchItemIds[i], codeMappingCache, expectedValueToken: tok });
         if (result.status === 'success' || result.status === 'dedupe') {
           updateBatchProgress(db, batchId, { success: 1 });
           success++;
@@ -291,7 +293,7 @@ export function startBulkPublish({ db, itemCodes, triggeredBy = 'manual' }) {
  *   除外中・手で Yahoo に出した商品は executePublish 側 (publishTargetGuard) で止まる。
  */
 export function listFailedItemCodes(db, { limit = 100 } = {}) {
-  return db.prepare(`
+  const failed = db.prepare(`
     SELECT p.item_code, p.rowid AS latest_rowid
     FROM publish_idempotency p
     JOIN (SELECT item_code, MAX(rowid) AS max_rowid FROM publish_idempotency GROUP BY item_code) l
@@ -300,6 +302,24 @@ export function listFailedItemCodes(db, { limit = 100 } = {}) {
     ORDER BY p.rowid DESC
     LIMIT ?
   `).all(limit).map((r) => r.item_code);
+  // 一括登録が中断 (recoverStaleBatches) で終わった商品も拾う (Codex 指摘)。
+  //   未着手の商品は publish_idempotency に行が無く、途中だった商品は in_progress のままなので、上の条件では漏れる。
+  //   「その商品のいちばん新しい一括の記録が中断」かつ「成功していない」ものだけ。途中だった商品の出品の行は
+  //   lease (30 分) が切れていれば executePublish が引き継ぐので、二重に出ない (同じ idempotency key)
+  let aborted = [];
+  try {
+    aborted = db.prepare(`
+      SELECT bi.item_code
+      FROM bulk_publish_batch_items bi
+      JOIN (SELECT item_code, MAX(id) AS max_id FROM bulk_publish_batch_items GROUP BY item_code) lb
+        ON lb.item_code = bi.item_code AND lb.max_id = bi.id
+      WHERE bi.publish_status = 'aborted'
+        AND NOT EXISTS (SELECT 1 FROM publish_idempotency p WHERE p.item_code = bi.item_code AND p.status = 'success')
+      ORDER BY bi.id DESC
+      LIMIT ?
+    `).all(limit).map((r) => r.item_code);
+  } catch (_) { /* migration 009 未適用 */ }
+  return [...new Set([...failed, ...aborted])].slice(0, limit);
 }
 
 export function getBatchStatus(db, batchId) {

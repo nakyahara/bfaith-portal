@@ -128,6 +128,10 @@ export function translateReason(rawReason) {
       return { message: 'カテゴリID と店の棚 (path) は両方指定してください (呼び出し側の指定が片方だけでした)', notionField: null, severity: 'check' };
     case 'migration_excluded':
       return { message: 'この商品は移行除外に入っています。出品するなら除外を解除してください', notionField: null, severity: 'must' };
+    case 'removed_from_yahoo':
+      return { message: 'この商品は以前 Yahoo!に出ていて、Yahoo!側で削除されています (別の商品コードへ移した可能性)。出し直すかは管理者が確認してください', notionField: null, severity: 'must' };
+    case 'value_version_changed':
+      return { message: '画面を開いた後に確定値が変わりました (別の人が確定し直した)。画面を読み直して値を確かめてから出品してください', notionField: null, severity: 'must' };
     case 'already_on_yahoo':
       return { message: 'この商品は既に Yahoo!に出ています (移行済み)。出し直すなら「全件再登録」から', notionField: null, severity: 'must' };
     default:
