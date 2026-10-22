@@ -56,6 +56,9 @@ export const PLANNING_HISTORY_COLUMNS = [
   ['inv_age_181_270', 'int', 'inv-age-181-to-270-days'],
   ['inv_age_271_365', 'int', 'inv-age-271-to-365-days'],
   ['inv_age_365_plus', 'int', 'inv-age-365-plus-days'],
+  // 米国のレポートは 365 日超を 366-455 / 456+ に分けて返す (365-plus の列の代わり。Codex R4)。分けたまま残す
+  ['inv_age_366_455', 'int', 'inv-age-366-to-455-days'],
+  ['inv_age_456_plus', 'int', 'inv-age-456-plus-days'],
   ['inv_age_0_30', 'int', 'inv-age-0-to-30-days'],
   ['inv_age_31_60', 'int', 'inv-age-31-to-60-days'],
   ['inv_age_61_90', 'int', 'inv-age-61-to-90-days'],
@@ -99,6 +102,10 @@ export const PLANNING_HISTORY_COLUMNS = [
   ['ais_est_331_365', 'num', 'estimated-ais-331-365-days'],
   ['ais_qty_365_plus', 'int', 'quantity-to-be-charged-ais-365-plus-days'],
   ['ais_est_365_plus', 'num', 'estimated-ais-365-plus-days'],
+  ['ais_qty_366_455', 'int', 'quantity-to-be-charged-ais-366-455-days'],
+  ['ais_est_366_455', 'num', 'estimated-ais-366-455-days'],
+  ['ais_qty_456_plus', 'int', 'quantity-to-be-charged-ais-456-plus-days'],
+  ['ais_est_456_plus', 'num', 'estimated-ais-456-plus-days'],
   // 推奨の処分・値下げ
   ['recommended_action', 'text', 'recommended-action'],
   ['recommended_removal_qty', 'int', 'recommended-removal-quantity'],
@@ -114,8 +121,8 @@ export const PLANNING_HISTORY_COLUMNS = [
 
 /** 「在庫がある」の判定に使う列 (どれかが 1 以上なら残す。どれも 0 なら残さない。どれも分からなければ残す) */
 const STOCK_COLS = ['available', 'reserved_qty', 'unfulfillable_qty', 'pending_removal_qty', 'inbound_qty', 'inbound_working', 'inbound_shipped', 'inbound_received',
-  'inv_age_0_90', 'inv_age_91_180', 'inv_age_181_270', 'inv_age_271_365', 'inv_age_365_plus', 'inv_age_0_30', 'inv_age_31_60', 'inv_age_61_90', 'inv_age_181_330', 'inv_age_331_365',
-  'ais_qty_181_210', 'ais_qty_211_240', 'ais_qty_241_270', 'ais_qty_271_300', 'ais_qty_301_330', 'ais_qty_331_365', 'ais_qty_365_plus'];
+  'inv_age_0_90', 'inv_age_91_180', 'inv_age_181_270', 'inv_age_271_365', 'inv_age_365_plus', 'inv_age_0_30', 'inv_age_31_60', 'inv_age_61_90', 'inv_age_181_330', 'inv_age_331_365', 'inv_age_366_455', 'inv_age_456_plus',
+  'ais_qty_181_210', 'ais_qty_211_240', 'ais_qty_241_270', 'ais_qty_271_300', 'ais_qty_301_330', 'ais_qty_331_365', 'ais_qty_365_plus', 'ais_qty_366_455', 'ais_qty_456_plus'];
 
 const COL_NAMES = PLANNING_HISTORY_COLUMNS.map(([c]) => c);
 for (const c of COL_NAMES) if (!/^[a-z0-9_]+$/.test(c)) throw new Error(`列名が不正: ${c}`);   // SQL に埋めるので固定の英小文字だけ

@@ -15,7 +15,7 @@ import {
 } from '../apps/warehouse/fba-planning-history.js';
 import { runFbaReportSnapshot } from '../apps/warehouse/fba-report-snapshot.js';
 import {
-  runAgedAlert, pickAgedCandidates, agedOver180, buildAgedAlertMessage, weekKeyJst, jstWeekday, ensureAlertLog, ALERT_WEEKDAY_JST, AGED_MIN_QTY, MAX_LIST,
+  runAgedAlert, pickAgedCandidates, agedOver180, over365Of, buildAgedAlertMessage, weekKeyJst, jstWeekday, ensureAlertLog, ALERT_WEEKDAY_JST, AGED_MIN_QTY, MAX_LIST,
 } from '../apps/warehouse/alert-fba-aged-inventory.js';
 
 let ok = 0, ng = 0;
@@ -55,6 +55,17 @@ await t('🚨 列が無い・空・数でない ("--" / "N/A")・整数の列に
   assert.equal(normalizePlanningHistoryRow({ sku: '  ', available: '3' }), null);
   assert.equal(normalizePlanningHistoryRow(null), null);
   assert.equal(normalizePlanningHistoryRow({ 'merchant-sku': 'm1', available: '0' }).amazon_sku, 'm1');
+});
+await t('🚨 米国のレポートの形 (Codex R4): 365 日超の在庫と長期保管料 (AIS) が 366-455 / 456+ に分かれていても捨てずに残す・在庫ありと数える', () => {
+  const us = { sku: 'us-1', available: '0', 'inv-age-366-to-455-days': '4', 'inv-age-456-plus-days': '3', 'quantity-to-be-charged-ais-366-455-days': '4', 'estimated-ais-366-455-days': '12.5',
+    'quantity-to-be-charged-ais-456-plus-days': '3', 'estimated-ais-456-plus-days': '20.25' };
+  const r = normalizePlanningHistoryRow(us);
+  assert.deepEqual([r.inv_age_366_455, r.inv_age_456_plus, r.ais_qty_366_455, r.ais_est_366_455, r.ais_qty_456_plus, r.ais_est_456_plus, r.inv_age_365_plus], [4, 3, 4, 12.5, 3, 20.25, null]);
+  assert.equal(hasStock(r), true);
+  const db = openDb();
+  savePlanningHistory(db, { snapshotDate: '2026-10-22', market: 'us', rawRows: [us], fetchedAt: FETCHED, now: NOW });
+  assert.deepEqual(rowsOf(db, '2026-10-22', 'us').map((x) => [x.inv_age_366_455, x.inv_age_456_plus, x.ais_est_456_plus]), [[4, 3, 20.25]]);
+  assert.ok(!missingPlanningColumns([us]).includes('inv_age_456_plus'));
 });
 await t('この回のレポートに無い列の一覧 (どの行の列名にも無い)', () => {
   const miss = missingPlanningColumns([raw('a'), raw('b')]);
@@ -213,6 +224,10 @@ await t('対象の選び方: 181 日以上が N 個以上かつ金額が大き�
   assert.equal(agedOver180({ inv_age_181_270: 5, inv_age_271_365: null, inv_age_181_330: 9, inv_age_331_365: 9, inv_age_365_plus: 1 }), 6);
   assert.equal(agedOver180({ inv_age_181_270: null, inv_age_271_365: null, inv_age_181_330: 9, inv_age_331_365: 2, inv_age_365_plus: 1 }), 12);
   assert.equal(agedOver180({ inv_age_181_270: null, inv_age_271_365: null, inv_age_181_330: null, inv_age_331_365: null, inv_age_365_plus: null }), null);
+  // 米国の形 (365 日超が 366-455 / 456+ に分かれる。Codex R4): 365-plus が無ければ分けた列を足す・あれば重ねない
+  assert.equal(over365Of({ inv_age_365_plus: null, inv_age_366_455: 4, inv_age_456_plus: 3 }), 7);
+  assert.equal(over365Of({ inv_age_365_plus: 2, inv_age_366_455: 4, inv_age_456_plus: 3 }), 2);
+  assert.equal(agedOver180({ inv_age_181_270: 10, inv_age_271_365: 5, inv_age_365_plus: null, inv_age_366_455: 4, inv_age_456_plus: 3 }), 22);
   assert.deepEqual([c[0].aged181, c[0].over365, c[0].agedValue, c[1].aged181, c[1].agedValue, c[2].aisEst, c[3].aged181, c[3].agedValue], [45, 5, 90000, 20, 40000, 1500, 12, null]);
   assert.ok(AGED_MIN_QTY === 10);
   const msg = buildAgedAlertMessage(c, '2026-10-26');

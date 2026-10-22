@@ -92,7 +92,16 @@ export function agedOver180(r) {
   const alt = [r.inv_age_181_330, r.inv_age_331_365];
   const known = (xs) => xs.some((v) => v !== null && v !== undefined);
   const mid = known(main) ? main : known(alt) ? alt : [];
-  return sumKnown([...mid, r.inv_age_365_plus]);
+  return sumKnown([...mid, over365Of(r)]);
+}
+
+/** 365 日超の個数: 365-plus の列が分かればそれ / 無ければ 366-455 + 456+ (米国の形。重ねて数えない。Codex R4) */
+export function over365Of(r) {
+  return r.inv_age_365_plus !== null && r.inv_age_365_plus !== undefined ? r.inv_age_365_plus : sumKnown([r.inv_age_366_455, r.inv_age_456_plus]);
+}
+/** 365 日超の長期保管料の見込み (同じ決め方) */
+function aisOver365Of(r) {
+  return r.ais_est_365_plus !== null && r.ais_est_365_plus !== undefined ? r.ais_est_365_plus : sumKnown([r.ais_est_366_455, r.ais_est_456_plus]);
 }
 
 /**
@@ -101,19 +110,19 @@ export function agedOver180(r) {
  */
 export function pickAgedCandidates(db, snapshotDate) {
   ensurePlanningHistoryTables(db);
-  const rows = db.prepare(`SELECT amazon_sku, available, your_price, inv_age_181_270, inv_age_271_365, inv_age_365_plus, inv_age_181_330, inv_age_331_365,
-      ais_est_181_210, ais_est_211_240, ais_est_241_270, ais_est_271_300, ais_est_301_330, ais_est_331_365, ais_est_365_plus,
+  const rows = db.prepare(`SELECT amazon_sku, available, your_price, inv_age_181_270, inv_age_271_365, inv_age_365_plus, inv_age_181_330, inv_age_331_365, inv_age_366_455, inv_age_456_plus,
+      ais_est_181_210, ais_est_211_240, ais_est_241_270, ais_est_271_300, ais_est_301_330, ais_est_331_365, ais_est_365_plus, ais_est_366_455, ais_est_456_plus,
       estimated_storage_cost_next_month, units_shipped_t30, recommended_action, recommended_removal_qty
     FROM fba_planning_daily WHERE snapshot_date = ? AND market = 'jp'`).all(snapshotDate);
   const out = [];
   for (const r of rows) {
     const aged181 = agedOver180(r);
-    const aisEst = sumKnown([r.ais_est_181_210, r.ais_est_211_240, r.ais_est_241_270, r.ais_est_271_300, r.ais_est_301_330, r.ais_est_331_365, r.ais_est_365_plus]);
+    const aisEst = sumKnown([r.ais_est_181_210, r.ais_est_211_240, r.ais_est_241_270, r.ais_est_271_300, r.ais_est_301_330, r.ais_est_331_365, aisOver365Of(r)]);
     const agedValue = aged181 !== null && r.your_price !== null && r.your_price > 0 ? aged181 * r.your_price : null;
     const byQty = aged181 !== null && aged181 >= AGED_MIN_QTY && (agedValue === null || agedValue >= AGED_MIN_VALUE_YEN);
     const byAis = aisEst !== null && aisEst >= AIS_MIN_YEN;
     if (!byQty && !byAis) continue;
-    out.push({ sku: r.amazon_sku, available: r.available, aged181, over365: r.inv_age_365_plus, agedValue, aisEst, storageNext: r.estimated_storage_cost_next_month,
+    out.push({ sku: r.amazon_sku, available: r.available, aged181, over365: over365Of(r), agedValue, aisEst, storageNext: r.estimated_storage_cost_next_month,
       units30: r.units_shipped_t30, action: r.recommended_action, removalQty: r.recommended_removal_qty });
   }
   out.sort((a, b) => (b.agedValue ?? -1) - (a.agedValue ?? -1) || (b.aisEst ?? -1) - (a.aisEst ?? -1) || (b.aged181 ?? 0) - (a.aged181 ?? 0) || (a.sku < b.sku ? -1 : 1));
