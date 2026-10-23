@@ -103,8 +103,8 @@ export function pullGuides() {
   inflight = (async () => {
     if (!guideSyncEnabled()) return { ok: false, skipped: 'disabled' };
     const urlProblem = guideUrlProblem();
-    if (urlProblem) { meta.set(META.error, urlProblem); meta.set(META.errorAt, utcNow()); return { ok: false, error: urlProblem }; }
     try {
+      if (urlProblem) throw new Error(urlProblem);
       const rows = rowsOf(await get('/manifest'));
       let fetched = 0;
       for (const g of rows) for (const p of g.photos) if (await ensurePhoto(p)) fetched++;
@@ -122,8 +122,8 @@ export function pullGuides() {
       return { ok: true, count: rows.length, fetched };
     } catch (e) {
       const msg = String(e?.name === 'AbortError' ? '時間切れ' : (e?.message || e)).slice(0, 300);
-      meta.set(META.error, msg);
-      meta.set(META.errorAt, utcNow());
+      // 誤りを残せない (SQLite が満杯・読むだけ) でも投げない = ポーラーから standalone を落とさない (Codex 第 1 段階レビュー 中)
+      try { meta.set(META.error, msg); meta.set(META.errorAt, utcNow()); } catch (e2) { console.error('[packing] 梱包指示の取得の誤りを残せない:', e2.message); }
       return { ok: false, error: msg };
     }
   })().finally(() => { inflight = null; });
@@ -140,12 +140,12 @@ export function guideSyncStatus(now = Date.now()) {
 
 /**
  * 商品コードの一覧 → 梱包指示 (写しにあるものだけ)。Map<sku_norm, { code, name, note, photos: [{ sha256, position, caption, width, height, url }], updated_at, updated_by }>
- * 写しが読めない = 空 (梱包は止めない)
+ * 写しが読めない = 空 (梱包は止めない)。鍵を外した (取りに行かない) = 空 = 古い写しを、古さの知らせなしに出し続けない (Codex 第 1 段階レビュー 中)
  */
 export function guidesFor(codes, { photoBase = '/apps/packing/guide-photos' } = {}) {
   const out = new Map();
   const norms = [...new Set((codes || []).map(normSku).filter(Boolean))];
-  if (!norms.length) return out;
+  if (!norms.length || !guideSyncEnabled()) return out;
   try {
     const db = getDB();
     const stmt = db.prepare('SELECT * FROM pk_pack_guides WHERE sku_norm = ?');
@@ -285,7 +285,8 @@ export function startGuidePoller() {
   if (timer || !guideSyncEnabled()) return false;
   const sec = Math.max(30, Number(process.env.PACKING_GUIDE_POLL_SEC) || 120);
   const tick = () => sendGuideUploads().catch((e) => console.warn(`[packing] 写真の送り待ちを送れない: ${e.message}`))
-    .then(() => pullGuides()).then((r) => { if (!r.ok && !r.skipped) console.warn(`[packing] 梱包指示の取得に失敗 (前の写しで続ける): ${r.error}`); });
+    .then(() => pullGuides()).then((r) => { if (!r.ok && !r.skipped) console.warn(`[packing] 梱包指示の取得に失敗 (前の写しで続ける): ${r.error}`); })
+    .catch((e) => console.error('[packing] 梱包指示のポーラーの誤り (続ける):', e?.message || e));   // 投げたまま = standalone を落とさない
   setTimeout(tick, 5_000).unref?.();
   timer = setInterval(tick, sec * 1000);
   timer.unref?.();

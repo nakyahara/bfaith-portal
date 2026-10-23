@@ -148,6 +148,35 @@ await ta('[G3] 写真の中身が一覧と違う・つながらない・鍵が�
   assert.equal(GS.guideSyncStatus().error, null);
 });
 
+await ta('[G4] 鍵を外した (取りに行かない) = 写しがあっても出さない (古さの知らせなしに古い指示を出し続けない)', async () => {
+  assert.equal(GS.guidesFor(['sku1']).size, 1);
+  delete process.env.PACKING_GUIDE_KEY;
+  try {
+    assert.equal(GS.guidesFor(['sku1']).size, 0);
+    assert.deepEqual(GS.guideSyncStatus(), { enabled: false });
+  } finally { process.env.PACKING_GUIDE_KEY = 'k1'; }
+  assert.equal(GS.guidesFor(['sku1']).size, 1);
+});
+
+await ta('[G5] 誤りを残せない (SQLite に書けない) ときも投げない = ポーラーから standalone を落とさない', async () => {
+  db.exec(`CREATE TRIGGER t_meta_full_i BEFORE INSERT ON pk_pack_meta BEGIN SELECT RAISE(FAIL, 'database or disk is full'); END;
+           CREATE TRIGGER t_meta_full_u BEFORE UPDATE ON pk_pack_meta BEGIN SELECT RAISE(FAIL, 'database or disk is full'); END;`);
+  const url = process.env.PACKING_GUIDE_URL;
+  try {
+    process.env.PACKING_GUIDE_URL = 'http://example.com/api';   // 取れない → 誤りを残そうとして書けない
+    const r = await GS.pullGuides();
+    assert.equal(r.ok, false);
+    assert.match(r.error, /https ではありません/);
+    process.env.PACKING_GUIDE_URL = url;
+    const r2 = await GS.pullGuides();   // 取れても「取れた時刻」を書けない = 誤りとして返す (投げない)
+    assert.equal(r2.ok, false);
+  } finally {
+    process.env.PACKING_GUIDE_URL = url;
+    db.exec('DROP TRIGGER t_meta_full_i; DROP TRIGGER t_meta_full_u;');
+  }
+  assert.equal((await GS.pullGuides()).ok, true);
+});
+
 // ─── 梱包の画面 (本物の router・実ブラウザ) ───
 const app = express();
 app.set('view engine', 'ejs');
@@ -282,6 +311,22 @@ await ta('[U2] つながらない = 送り待ち (pending・間をあけて送�
   assert.equal((await upload({ op_id: 'op-u2-fffffff', sku: 'sku2', worker_name: '三宅晴菜' }, Buffer.from('<svg></svg>'.padEnd(64, ' ')))).status, 400);
   assert.equal((await upload({ op_id: 'op-u2-ggggggg', sku: 'sku2', worker_name: '三宅晴菜', caption: 'あ'.repeat(101) })).status, 400);
   assert.equal(upRow('op-u2-ddddddd'), undefined, '断ったら送り待ちに残さない');
+});
+
+await ta('[V6] 開きっぱなしの画面: 古さは「今」から数え直す (開いたときは新しくても、時間がたてば知らせる)・取り直しで新しい指示が出る', async () => {
+  await GS.pullGuides();
+  await open();
+  await goSlip(1);
+  assert.doesNotMatch(await page.locator('.guide-box').first().innerText(), /分前に取った/);
+  // 開いてから 2 時間たった (端末の時計を進める代わりに、取れた時刻を戻して描き直す)
+  await page.evaluate(() => { STATE.guideSync.okAt = new Date(Date.now() - 120 * 60000).toISOString(); render(); });
+  assert.match(await page.locator('.guide-box').first().innerText(), /120 分前に取ったもの/);
+  // 商品の画面で注意点が変わった → 写しを取り直す → 開いたままの画面も取り直しで出る
+  manifest.guides.find((g) => g.code === 'SKU1').note = '新しい注意点';
+  await GS.pullGuides();
+  await page.evaluate(() => refreshGuides({ force: false }));
+  await page.waitForFunction(() => /新しい注意点/.test(document.querySelector('.guide-box')?.innerText || ''), null, { timeout: 10000 });
+  assert.doesNotMatch(await page.locator('.guide-box').first().innerText(), /分前に取った/, '取り直した = 新しい');
 });
 
 await ta('[V5] 画面で撮って登録: 明細の「📷 梱包写真を登録」→ カメラ → 確かめる (一言) → 登録 → 指示の枠に出る・セットの明細 = 構成品を選ぶ', async () => {

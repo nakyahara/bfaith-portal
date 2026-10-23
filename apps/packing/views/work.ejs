@@ -590,13 +590,22 @@
     //   写真は「入れ方の例」(使う資材は上の資材カードが正)。写しが古いかも = 枠の下に小さく出す
     const GUIDES = STATE.guides || {};
     let guideView = null;   // 大きく見ている写真 { photos, i }
+    // 写しの古さは「今」から数え直す (開いたときの値のままにしない = 開きっぱなしの画面でも古いと分かる・Codex 第 1 段階レビュー 中)
+    const GUIDE_STALE_MIN = 30;
+    /** 最後に取れてから何分 (取りに行かない設定 = undefined・一度も取れていない = null) */
+    function guideAgeMin() {
+      const sync = STATE.guideSync;
+      if (!sync || !sync.enabled) return undefined;
+      const t = Date.parse(sync.okAt || '');
+      return Number.isFinite(t) ? Math.max(0, Math.floor((Date.now() - t) / 60000)) : null;
+    }
     function guideKeysOf(s) { return [...new Set(s.lines.flatMap((l) => l.guideKeys || []))].filter((k) => GUIDES[k]); }
     function guideHtml(s) {
       const keys = guideKeysOf(s);
       if (!keys.length) return '';
-      const sync = STATE.guideSync;
-      const stale = sync && sync.enabled && sync.stale
-        ? `<div class="guide-stale">⚠ 梱包指示の写しは ${sync.ageMin == null ? 'まだ一度も取れていません' : `${sync.ageMin} 分前に取ったものです`} (新しい指示が出ていないかもしれません)</div>` : '';
+      const age = guideAgeMin();
+      const stale = age === undefined || (age !== null && age <= GUIDE_STALE_MIN) ? ''
+        : `<div class="guide-stale">⚠ 梱包指示の写しは ${age == null ? 'まだ一度も取れていません' : `${age} 分前に取ったものです`} (新しい指示が出ていないかもしれません)</div>`;
       return keys.map((k) => {
         const g = GUIDES[k];
         const photos = (g.photos || []).map((p, i) => `
@@ -710,20 +719,26 @@
     });
     $('guideCamCancel').addEventListener('click', closeCam);
     $('guideCamRetake').addEventListener('click', () => { $('guideCamOverlay').style.display = 'none'; startCam(camTarget); });
-    async function refreshGuides() {
+    let guideSig = null;   // 前に出した指示・送り待ち・古さ (変わったときだけ描き直す = 作業中の画面をむやみに作り直さない)
+    async function refreshGuides({ force = true } = {}) {
       try {
         const r = await fetch(`/apps/packing/api/batches/${STATE.batchId}/guides`);
         if (!r.ok) return;
         const j = await r.json();
+        const age = (() => { const sv = STATE.guideSync; STATE.guideSync = j.sync || sv; const a = guideAgeMin(); return a === undefined ? 'off' : a == null ? 'never' : a > GUIDE_STALE_MIN ? 'stale' : 'fresh'; })();
+        const sig = JSON.stringify([j.guides, j.keysBySku, j.uploads, age]);
+        if (!force && sig === guideSig) return;
+        guideSig = sig;
         for (const k of Object.keys(GUIDES)) delete GUIDES[k];
         Object.assign(GUIDES, j.guides || {});
         for (const k of Object.keys(GUIDE_UPLOADS)) delete GUIDE_UPLOADS[k];
         Object.assign(GUIDE_UPLOADS, j.uploads || {});
-        if (j.sync) STATE.guideSync = j.sync;
         for (const s of STATE.slips) for (const l of s.lines) if (j.keysBySku && j.keysBySku[l.sku]) l.guideKeys = j.keysBySku[l.sku];
         render();
-      } catch { /* 取り直せなくても梱包は続ける (次に開いたときに出る) */ }
+      } catch { /* 取り直せなくても梱包は続ける (古さは「今」から数えて出す) */ }
     }
+    // 開きっぱなしの画面も数分ごとに指示を取り直す (商品の画面で直した・ほかの iPad で撮った指示が出る)
+    if (guideOn) setInterval(() => refreshGuides({ force: false }), 3 * 60 * 1000);
     $('guideCamOk').addEventListener('click', async () => {
       if (!camBlob || !camTarget || camBusy) return;
       camBusy = true; $('guideCamOk').disabled = true; $('guideCamOk').textContent = '送っています…';

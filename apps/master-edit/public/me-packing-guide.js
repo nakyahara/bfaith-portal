@@ -89,6 +89,10 @@
       ]));
     });
     var none = $('#pgd-nophoto'); if (none) none.hidden = rows.length > 0;
+    // 送っている間は打てない (返事で「送った時点の値」に戻して、その間の入力を消さない・Codex 第 1 段階レビュー 中)
+    Array.prototype.forEach.call(box.querySelectorAll('#pgd-photos input, #pgd-photos button, #pgd-note'), function (c) {
+      if (busy) { c.dataset.pgdLock = c.disabled ? 'was' : '1'; c.disabled = true; } else if (c.dataset.pgdLock) { if (c.dataset.pgdLock === '1') c.disabled = false; delete c.dataset.pgdLock; }
+    });
     // 足せるか = サーバーの今の写真の数 (外す印は保存するまで枠を空けない)
     var full = P.guide.photos.length >= P.max;
     var add = $('#pgd-add-btn'); if (add) add.classList.toggle('off', full || busy || stale);
@@ -125,7 +129,7 @@
 
   function save() {
     if (busy || stale || !isDirty()) return;
-    busy = true; changed(); msg('保存しています…');
+    busy = true; render(); changed(); msg('保存しています…');
     post('/packing-guide', { request_id: uuid(), seen_event_id: P.guide.event_id, note: noteNow(), photos: keep() })
       .then(function (x) {
         busy = false;
@@ -194,7 +198,30 @@
   if (fileIn) fileIn.addEventListener('change', function () { var f = fileIn.files && fileIn.files[0]; fileIn.value = ''; addPhoto(f); });
   var saveBtn = $('#pgd-save'); if (saveBtn) saveBtn.addEventListener('click', save);
 
+  // 未保存の下書き: 右の「保存する」の後の読み直し (確かめずに読み直す)・うっかりの読み直しで消さない (Codex 第 1 段階レビュー 中)。
+  //   離れるときに sessionStorage に残し、開き直したとき、保存してある指示が離れたときと同じなら戻す (違えば捨てる = 古い下書きで上書きしない)
+  var DRAFT_KEY = 'pgd-draft:' + P.code;
+  function keepDraft() {
+    try {
+      if (isDirty() && !stale) sessionStorage.setItem(DRAFT_KEY, JSON.stringify({ base: base, note: $('#pgd-note') ? $('#pgd-note').value : '', rows: rows.map(function (r) { return { photo_id: r.photo_id, caption: r.caption, removed: r.removed }; }) }));
+      else sessionStorage.removeItem(DRAFT_KEY);
+    } catch (e) { /* 保存できない (private・容量) = 下書きは残らない */ }
+  }
+  window.addEventListener('pagehide', keepDraft);
+  function restoreDraft() {
+    var d = null;
+    try { d = JSON.parse(sessionStorage.getItem(DRAFT_KEY) || 'null'); sessionStorage.removeItem(DRAFT_KEY); } catch (e) { d = null; }
+    if (!d || d.base !== base || !Array.isArray(d.rows)) return false;
+    var byId = {}; rows.forEach(function (r) { byId[r.photo_id] = r; });
+    if (d.rows.length !== rows.length || !d.rows.every(function (x) { return byId[x.photo_id]; })) return false;
+    rows = d.rows.map(function (x) { var r = byId[x.photo_id]; r.caption = String(x.caption || ''); r.removed = !!x.removed; return r; });
+    var t = $('#pgd-note'); if (t) t.value = d.note || '';
+    return true;
+  }
+
   setBase(P.guide);
+  var restored = restoreDraft();
   render();
   changed();
+  if (restored) msg('保存していなかった梱包指示の変更を戻しました。「梱包指示を保存」で保存してください', 'warn');
 })();
