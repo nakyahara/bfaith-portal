@@ -344,7 +344,8 @@ export function normalizeRestockRow(raw) {
     fba_unfulfillable: parseInt(pick('Unfulfillable', '販売不可', 'unfulfillable') || 0),
     // FBA倉庫内の追加3区分 (月末棚卸しツールの fba_warehouse 計算に必須):
     //   fba_warehouse = fba_available + fc_transfer + fc_processing + customer_order
-    fba_fc_transfer: parseInt(pick('FC Transfer', 'FC移管中', 'fc-transfer') || 0),
+    // 🚨 実物の RESTOCK の列名は 'FC transfer' (t が小文字)。'FC Transfer' だけで探していたため移管中が全 SKU で 0 だった (2026-10-22)
+    fba_fc_transfer: parseInt(pick('FC transfer', 'FC Transfer', 'FC移管中', 'fc-transfer') || 0),
     fba_fc_processing: parseInt(pick('FC Processing', '入出荷作業中 - FC処理中', '入出荷作業中-FC処理中', 'fc-processing') || 0),
     fba_customer_order: parseInt(pick('Customer Order', '入出荷作業中 - 出荷待ち', '入出荷作業中-出荷待ち', 'customer-order') || 0),
 
