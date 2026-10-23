@@ -65,6 +65,10 @@ export const SCHEMAS = ['core', 'raw', 'snapshots', 'events', 'ai', 'docs', 'ops
 export const SKIP_RESTORE = ['"ops"."schema_migrations"'];
 const READ_CHUNK = 5000;
 const WRITE_CHUNK = 500;
+/** 🆕 0101: bytea の列のある表 (梱包指示の写真 = 1 行 1.5 MB まで・text にすると倍) は小分けに読む・入れる (5000 行をまとめて持つとメモリを使い切る・Codex の設計レビュー 10/23) */
+const BULKY_CHUNK = 8;
+/** 入れるときの 1 文の行数 (bytea の表は小分け) */
+const writeChunkOf = (m) => (m?.meta?.bulky ? BULKY_CHUNK : WRITE_CHUNK);
 /** 復元で後回しにする行 (指す行がまだ無い自己参照) の上限 / 表。超えたら今までどおり null で入れて最後に埋める (メモリを使い切らない) */
 const MAX_DEFERRED = 200000;
 /** 取得も復元も同じ設定で (設定差で値が変わらないように) */
@@ -147,7 +151,7 @@ export async function listTables(db) {
 /** 表の列 (生成列を除く)・identity 列・自己参照の列 (null 許容のみ) と指す列 (外部キーの中でその列が指す列。外部キーごとに違えば null)・主キー */
 export async function tableMeta(db, table) {
   const cols = (await db.query(`
-    select a.attname as column_name, a.attidentity <> '' as is_identity
+    select a.attname as column_name, a.attidentity <> '' as is_identity, a.atttypid = 'bytea'::regtype as is_bytea
     from pg_attribute a
     where a.attrelid = $1::oid and a.attnum > 0 and not a.attisdropped and a.attgenerated = ''
     order by a.attnum`, [table.oid])).rows;
@@ -167,7 +171,7 @@ export async function tableMeta(db, table) {
     select a.attname as column_name
     from pg_constraint con join pg_attribute a on a.attrelid = con.conrelid and a.attnum = any(con.conkey)
     where con.contype = 'p' and con.conrelid = $1::oid order by array_position(con.conkey, a.attnum)`, [table.oid])).rows.map((r) => r.column_name);
-  return { columns: cols.map((c) => c.column_name), identity: cols.filter((c) => c.is_identity).map((c) => c.column_name), selfRefs: [...new Set(self)], selfRefTo, primaryKey: pk };
+  return { columns: cols.map((c) => c.column_name), identity: cols.filter((c) => c.is_identity).map((c) => c.column_name), selfRefs: [...new Set(self)], selfRefTo, primaryKey: pk, bulky: cols.some((c) => c.is_bytea), byteaColumns: cols.filter((c) => c.is_bytea).map((c) => c.column_name) };
 }
 
 /**
@@ -237,14 +241,15 @@ export async function dumpCompanyDb(db, write, { log = () => {} } = {}) {
       const orderBy = meta.primaryKey.length ? ` order by ${meta.primaryKey.map((c) => `backup_t.${quoteIdent(c)}`).join(', ')}` : '';
       await write(`-- table: ${t.qualified} (${cols.length} cols)`);
       await write(`COPY ${t.qualified} (${cols.map(quoteIdent).join(', ')}) FROM stdin;`);
+      const chunk = meta.bulky ? BULKY_CHUNK : READ_CHUNK;
       let rows = 0;
       // カーソルで 1 回だけ走査する (offset は読み飛ばす行も毎回読むので、大きい表で行数の 2 乗になる)
       await db.exec(`declare backup_dump_cursor no scroll cursor for select ${selectList} from ${t.qualified} as backup_t${orderBy}`);
       for (;;) {
-        const page = (await db.query(`fetch forward ${READ_CHUNK} from backup_dump_cursor`)).rows;
+        const page = (await db.query(`fetch forward ${chunk} from backup_dump_cursor`)).rows;
         for (const r of page) await write(encodeRow(cols.map((c) => r[c])));
         rows += page.length;
-        if (page.length < READ_CHUNK) break;
+        if (page.length < chunk) break;
       }
       await db.exec('close backup_dump_cursor');
       await write('\\.');
@@ -455,6 +460,8 @@ export async function restoreFromLines(db, openLines, { log = () => {}, maxDefer
       metaOf.set(t.table, {
         table, meta, selfRefs, pk,
         selfSet: new Set(meta.selfRefs),
+        // 🆕 0101: bytea の列はダンプの文字 (\x…) を text として渡して DB で bytea に (PGlite は bytea の引数に文字を受けない・本物の PG はどちらでも同じ)
+        byteaSet: new Set(meta.byteaColumns || []),
         idx: Object.fromEntries(t.columns.map((c, i) => [c, i])),
         overriding: meta.identity.some((c) => t.columns.includes(c)) ? ' overriding system value' : '',
         selfRows: Object.fromEntries(selfRefs.map((c) => [c, []])),   // 自己参照を後で埋めるための (主キー, 値)
@@ -496,9 +503,10 @@ export async function restoreFromLines(db, openLines, { log = () => {}, maxDefer
       const t = tables.find((x) => x.table === pendingTable);
       const m = metaOf.get(pendingTable);
       // 待っていた行がまとめて入ることがある = WRITE_CHUNK 行ずつに分ける (1 文の引数の上限)。並びは保つ (指す行が先)
-      for (let i = 0; i < pending.length; i += WRITE_CHUNK) {
+      const chunk = writeChunkOf(m);
+      for (let i = 0; i < pending.length; i += chunk) {
         const params = [];
-        const values = pending.slice(i, i + WRITE_CHUNK).map(({ row, direct }) => `(${t.columns.map((c) => { params.push(m.selfSet.has(c) && !direct.has(c) ? null : row[m.idx[c]]); return `$${params.length}`; }).join(', ')})`).join(', ');
+        const values = pending.slice(i, i + chunk).map(({ row, direct }) => `(${t.columns.map((c) => { params.push(m.selfSet.has(c) && !direct.has(c) ? null : row[m.idx[c]]); return `$${params.length}${m.byteaSet.has(c) ? '::text::bytea' : ''}`; }).join(', ')})`).join(', ');
         await db.query(`insert into ${t.table} (${t.columns.map(quoteIdent).join(', ')})${m.overriding} values ${values}`, params);
       }
       pending = [];
@@ -574,7 +582,7 @@ export async function restoreFromLines(db, openLines, { log = () => {}, maxDefer
       secondHash.update(line + '\n');
       sc.push(line);
       if (pendingTable && sc.cur?.table !== pendingTable) finishTable(pendingTable);   // 表の終わり (次の表の行はまだ読んでいない)
-      if (pending.length >= WRITE_CHUNK || (pending.length && sc.cur?.table !== pendingTable)) await flush();
+      if (pending.length >= writeChunkOf(metaOf.get(pendingTable)) || (pending.length && sc.cur?.table !== pendingTable)) await flush();
     }
     if (pendingTable) finishTable(pendingTable);
     await flush();

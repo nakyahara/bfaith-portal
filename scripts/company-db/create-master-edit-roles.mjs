@@ -277,6 +277,15 @@ export const PACKAGE_SOURCE_SELECT = Object.freeze(['core.product_physicals']);
 export const PACKAGE_EDIT_FUNCTIONS = Object.freeze(['ops.set_product_package(uuid, text, bigint, integer, integer, integer, integer, bigint, text, text)']);
 export const PACKAGE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_package_tables()']);   // core.package_source_rank はビューの中で読む人の権限で呼ばれる = 外さない
 /**
+ * 🆕 0101 (梱包指示 = 入れ方の写真と注意点・中原さん 2026-10-23): master_edit に 3 つの表の select (PACKING_GUIDE_SELECT・写真の中身も = 商品の画面と梱包アプリへの配り)・
+ *   写真を足す / 指示を保存する関数の実行 (PACKING_GUIDE_EDIT_FUNCTIONS)。表・関数が無い DB (0101 の前) では付けない (流し直すと付く = それまで画面は欄を出さない)。
+ *   🚨 渡さない: 表の insert / update / delete (関数だけが書く)・守りの trigger と中の部品 (PACKING_GUIDE_OWNER_ONLY_FUNCTIONS)
+ */
+export const PACKING_GUIDE_SELECT = Object.freeze(['core.sku_packing_guides', 'core.sku_packing_photos', 'ops.sku_packing_guide_events']);
+export const PACKING_GUIDE_EDIT_FUNCTIONS = Object.freeze(['ops.add_sku_packing_photo(uuid, text, text, bigint, bytea, integer, integer, text)',
+  'ops.set_sku_packing_guide(uuid, text, text, bigint, bigint, text, jsonb)']);
+export const PACKING_GUIDE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_packing_guide_tables()', 'ops.packing_guide_state(bigint)', 'ops.packing_guide_check(uuid, text, text, bigint)']);
+/**
  * 🆕 0078 (ロジザードに送るバーコードの決め方・CompanyDB構想 23・中原さんの決定 10/13 夜): master_edit に決め方の表の select (商品の画面) と、
  *   決め方を書く関数の実行 (新商品の登録の取引の中・商品の画面)。表・関数が無い DB (0078 の前) では付けない (流し直すと付く)。
  *   🚨 渡さない: 表の insert / update / delete (関数だけが書く)・守りの trigger
@@ -461,6 +470,10 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   for (const t of PACKAGE_SOURCE_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null and to_regclass('core.v_product_packages') is not null then execute 'grant select on ${t} to master_edit'; end if; end $$`);
   for (const f of [...PACKAGE_EDIT_FUNCTIONS, ...PACKAGE_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of PACKAGE_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
+  // 🆕 0101 (梱包指示): 表・関数がある DB だけ。前に付けた権限を外してから画面のロールに付け直す (表は読むだけ・書くのは関数だけ)
+  for (const t of PACKING_GUIDE_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'revoke all on ${t} from ${all}'; execute 'grant select on ${t} to master_edit'; end if; end $$`);
+  for (const f of [...PACKING_GUIDE_EDIT_FUNCTIONS, ...PACKING_GUIDE_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of PACKING_GUIDE_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
   // 🆕 0078 (ロジザードのバーコードの決め方): 表・関数がある DB だけ。前に付けた権限を外してから画面のロールに付け直す (表は読むだけ・書くのは関数だけ)
   for (const t of LZ_BARCODE_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'revoke all on ${t} from ${all}'; execute 'grant select on ${t} to master_edit'; end if; end $$`);
   for (const f of [...LZ_BARCODE_EDIT_FUNCTIONS, ...LZ_BARCODE_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
