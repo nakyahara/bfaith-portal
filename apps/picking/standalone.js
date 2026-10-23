@@ -52,11 +52,13 @@ import { startDrivePoller } from './drive-sync.js';
 // picking は継続する (梱包の障害でピッキングを巻き添えにしない)
 let packingRouter = null;
 let startPackingPoller = null;
+let startGuidePoller = null;   // 🆕 梱包指示の写し (Render から取る・PACKING_GUIDE_KEY が無い = 何もしない)
 let packingState = 'disabled';   // readyz に載せて機能停止を監視から見えるようにする (Codexレビュー)
 if (process.env.PACKING_ENABLED !== '0') {
   try {
     packingRouter = (await import('../packing/router.js')).default;
     ({ startPackingDrivePoller: startPackingPoller } = await import('../packing/drive-sync.js'));
+    ({ startGuidePoller } = await import('../packing/guide-sync.js'));
     packingState = 'ok';
   } catch (e) {
     packingState = 'failed';
@@ -245,6 +247,7 @@ const server = app.listen(PORT, HOST, () => {
   bootLog(`[picking-notify] 欠品通知の送信先: GChat=${process.env.PICKING_ALERT_WEBHOOK ? 'ON' : 'OFF (PICKING_ALERT_WEBHOOK 未設定)'} / LINE=${shortageLineEnabled() ? 'ON ⚠️従量課金' : 'OFF (既定)'}`);
   startDrivePoller();
   if (startPackingPoller) startPackingPoller();   // 納品書CSVの自動取込 (packing 有効時のみ)
+  if (startGuidePoller) bootLog(`[packing] 梱包指示の写し: ${startGuidePoller() ? 'Render から取る' : 'OFF (PACKING_GUIDE_KEY 未設定)'}`);
 });
 
 // --- graceful shutdown (winsw の stop / 再起動で計測イベントを取りこぼさない) ---

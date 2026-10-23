@@ -17,8 +17,10 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import express from 'express';
 
 const killer = setTimeout(() => { console.error('時間切れ (420 秒)'); process.exit(3); }, 420e3);
 killer.unref();
@@ -29,9 +31,49 @@ process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'pgd-'));
 const { setupVariationDb } = await import('./fixtures/master-variation-db.mjs');
 const PG = await import('../lib/packing-guide.mjs');
 const ROLES = await import('./company-db/create-master-edit-roles.mjs');
-const T = await setupVariationDb();
+const { skuOf } = await import('./fixtures/master-variation-db.mjs');
+// セット (梱包指示を持たない) を 1 つ足しておく
+const T = await setupVariationDb({ extraSkus: [skuOf('pgset1', '試しのセット', { kind: 'set' })] });
 const { pg, db, q, one, asEditor } = T;
 const { default: sharp } = await import('sharp');
+const { initMirrorDB } = await import('../apps/warehouse-mirror/db.js');
+initMirrorDB();
+const { initPurchaseOrders } = await import('../apps/purchase-orders/db.js');
+initPurchaseOrders();
+
+// ─── 本物の router (商品の画面) を HTTP 越しに ───
+process.env.COMPANY_DB_URL = 'postgres://owner@localhost/pgd';
+process.env.COMPANY_DB_MASTER_EDIT_URL = 'postgres://master_edit@localhost/pgd';
+process.env.MASTER_EDITORS = 'naka@test';
+process.env.MASTER_EDIT_OPEN = '1';
+const MR = await import('../apps/master-edit/router.mjs');
+let chain = Promise.resolve();
+MR.__setPgClientFactory(async (url) => {
+  let release; const prev = chain; chain = new Promise((r) => { release = r; }); await prev;
+  await pg.query(`set role ${/master_edit@/.test(url) ? 'master_edit' : 'deploy'}`);
+  return { query: (t, p) => pg.query(t, p), end: async () => { await pg.query('set role deploy'); release(); }, on: () => {} };
+});
+MR.__setShippingRatesProvider(async () => new Map());
+MR.__setPhDraftLookup(async () => null);
+const app = express();
+app.set('view engine', 'ejs');
+const SESS = { editor: { authenticated: true, email: 'naka@test', displayName: '中原', role: 'user', allowedApps: ['master-edit'] },
+  viewer: { authenticated: true, email: 'see@test', displayName: '見る人', role: 'user', allowedApps: ['master-edit'] } };
+app.use((req, res, next) => { req.session = SESS[req.headers['x-test-session'] || 'editor']; next(); });
+app.use('/apps/master-edit', MR.default);
+const server = http.createServer(app);
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const ORIGIN = `http://127.0.0.1:${server.address().port}`;
+async function call(method, url, { body, session = 'editor', origin = true, raw = false } = {}) {
+  const headers = { Accept: 'application/json', 'x-test-session': session };
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  if (origin) headers.Origin = ORIGIN;
+  const r = await fetch(ORIGIN + '/apps/master-edit' + url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(60e3) });
+  if (raw) return { status: r.status, type: r.headers.get('content-type'), cache: r.headers.get('cache-control'), buf: Buffer.from(await r.arrayBuffer()) };
+  const text = await r.text();
+  let j = null; try { j = JSON.parse(text); } catch { /* HTML */ }
+  return { status: r.status, j, text };
+}
 
 const uuid = () => crypto.randomUUID();
 const skuIdOf = async (code) => (await one('select sku_id::text as id from core.skus where code = $1', [code])).id;
@@ -244,6 +286,130 @@ await ta('[B1] バックアップ: 写真の表 (bytea) は小分けに読む・
   assert.equal((await asEditor(() => PG.readPackingGuide(db, sku))).note, g.note);
 });
 
+const pgdData = (html) => JSON.parse((/<script type="application\/json" id="me-pgd">([\s\S]*?)<\/script>/.exec(html) || [])[1] || 'null');
+
+await ta('[S1] 商品の画面: 単品に「梱包指示」の節 (写真・一言・注意点・書ける人だけ動きの JS)・見る人 = 見るだけ・セット = 節を出さない', async () => {
+  const e = await call('GET', '/sku/s001');
+  assert.equal(e.status, 200);
+  assert.match(e.text, /id="p-pgd"/);
+  assert.match(e.text, /me-packing-guide\.js/);
+  const d = pgdData(e.text);
+  assert.equal(d.canWrite, true);
+  assert.equal(d.max, 3);
+  const s1 = await skuIdOf('s001');
+  const g = await asEditor(() => PG.readPackingGuide(db, s1));
+  assert.equal(d.guide.event_id, g.event_id);
+  assert.equal(d.guide.photos.length, g.photos.length);
+  assert.match(d.guide.photos[0].url, /^\/sku\/s001\/packing-photo\/\d+$/);
+  const v = await call('GET', '/sku/s001', { session: 'viewer' });
+  assert.match(v.text, /id="p-pgd"/);
+  assert.doesNotMatch(v.text, /me-packing-guide\.js/);
+  assert.match(v.text, /見るだけです/);
+  assert.doesNotMatch(v.text, /id="pgd-save"/);
+  const s = await call('GET', '/sku/pgset1');
+  assert.equal(s.status, 200);
+  assert.doesNotMatch(s.text, /id="p-pgd"/);
+});
+
+await ta('[S2] 写真を足す (HTTP): 作り直して保存・写真を出す (JPEG・この商品の写真だけ)・見る人 = 403・Origin 無し = 403・形の誤り = 400・セット = 400', async () => {
+  const big = await sharp({ create: { width: 2400, height: 1800, channels: 3, background: { r: 30, g: 120, b: 220 } } }).jpeg({ quality: 95 }).toBuffer();
+  const body = { request_id: uuid(), image: 'data:image/jpeg;base64,' + big.toString('base64'), caption: '箱に立てて入れる' };
+  const r = await call('POST', '/api/sku/s003/packing-guide/photo', { body });
+  assert.equal(r.status, 200, r.text);
+  assert.deepEqual([r.j.ok, r.j.position], [true, 1]);
+  const ph = r.j.guide.photos[0];
+  assert.deepEqual([ph.width, ph.height, ph.caption], [1280, 960, '箱に立てて入れる']);
+  const img = await call('GET', ph.url, { raw: true });
+  assert.equal(img.status, 200);
+  assert.equal(img.type, 'image/jpeg');
+  assert.match(img.cache, /private/);
+  assert.equal(crypto.createHash('sha256').update(img.buf).digest('hex'), ph.sha256);
+  assert.equal((await call('GET', ph.url.replace('/s003/', '/s001/'), { raw: true })).status, 404, 'ほかの商品のコードでは出さない');
+  assert.equal((await call('GET', '/sku/s003/packing-photo/abc', { raw: true })).status, 404);
+  const again = await call('POST', '/api/sku/s003/packing-guide/photo', { body });
+  assert.deepEqual([again.j.replay, again.j.photo_id], [true, r.j.photo_id], '押し直し = 前の答え');
+  assert.equal((await call('POST', '/api/sku/s003/packing-guide/photo', { body: { ...body, request_id: uuid() }, session: 'viewer' })).status, 403);
+  assert.equal((await call('POST', '/api/sku/s003/packing-guide/photo', { body: { ...body, request_id: uuid() }, origin: false })).status, 403);
+  const bad = await call('POST', '/api/sku/s003/packing-guide/photo', { body: { request_id: uuid(), image: Buffer.from('hello').toString('base64') } });
+  assert.deepEqual([bad.status, bad.j.reason], [400, 'bad_image']);
+  const set = await call('POST', '/api/sku/pgset1/packing-guide/photo', { body: { ...body, request_id: uuid() } });
+  assert.deepEqual([set.status, set.j.reason], [400, 'not_single']);
+  assert.equal((await call('POST', '/api/sku/nope-code/packing-guide/photo', { body: { ...body, request_id: uuid() } })).status, 404);
+  const g = await call('GET', '/api/sku/s003/packing-guide');
+  assert.deepEqual([g.status, g.j.guide.photos.length], [200, 1]);
+  // 大きい本文 (17 MB まで) は写真の道だけ = 保存の道は今までどおり 256kb
+  const huge = await call('POST', '/api/sku/s003/packing-guide', { body: { request_id: uuid(), seen_event_id: g.j.guide.event_id, note: 'x'.repeat(300 * 1024), photos: [] } });
+  assert.equal(huge.status, 413);
+});
+
+await ta('[S3] 保存 (HTTP): 注意点・一言・外す・ほかの人が変えた後 = 409・形の誤り = 400・見る人 = 403・記録の人 = セッションのメール', async () => {
+  const g = (await call('GET', '/api/sku/s003/packing-guide')).j.guide;
+  const r = await call('POST', '/api/sku/s003/packing-guide', { body: { request_id: uuid(), seen_event_id: g.event_id, note: 'ワレモノ。立てて入れる', photos: [{ photo_id: g.photos[0].photo_id, caption: '立てる' }] } });
+  assert.equal(r.status, 200, r.text);
+  assert.deepEqual([r.j.changed, r.j.guide.note, r.j.guide.photos[0].caption, r.j.guide.updated_by], [true, 'ワレモノ。立てて入れる', '立てる', 'naka@test']);
+  const old = await call('POST', '/api/sku/s003/packing-guide', { body: { request_id: uuid(), seen_event_id: g.event_id, note: '古い画面から', photos: [] } });
+  assert.deepEqual([old.status, old.j.reason], [409, 'version_conflict']);
+  const bad = await call('POST', '/api/sku/s003/packing-guide', { body: { request_id: 'x', seen_event_id: r.j.event_id, note: '', photos: [] } });
+  assert.equal(bad.status, 400);
+  assert.equal((await call('POST', '/api/sku/s003/packing-guide', { body: { request_id: uuid(), seen_event_id: r.j.event_id, note: '', photos: [] }, session: 'viewer' })).status, 403);
+  const ev = await eventsOf('s003');
+  assert.deepEqual(ev.map((e) => [e.action, e.via, e.actor_id]), [['add_photo', 'sku_page', 'naka@test'], ['set_guide', 'sku_page', 'naka@test']]);
+});
+
+await ta('[R1] ロールの流し直しの前 (master_edit に関数の実行権が無い): 節を出さない・書き込みは 503 db_not_ready・画面は止めない', async () => {
+  for (const f of ROLES.PACKING_GUIDE_EDIT_FUNCTIONS) await pg.query(`revoke execute on function ${f} from master_edit`);
+  try {
+    const e = await call('GET', '/sku/s001');
+    assert.equal(e.status, 200);
+    assert.doesNotMatch(e.text, /id="p-pgd"/);
+    const w = await call('POST', '/api/sku/s001/packing-guide', { body: { request_id: uuid(), seen_event_id: null, note: 'x', photos: [] } });
+    assert.deepEqual([w.status, w.j.reason], [503, 'db_not_ready']);
+  } finally {
+    for (const f of ROLES.PACKING_GUIDE_EDIT_FUNCTIONS) await pg.query(`grant execute on function ${f} to master_edit`);
+  }
+});
+
+await ta('[X2] 配りの口 (Render → miniPC): 鍵が無い設定 = 503・鍵が違う = 401・一覧 (指示のある単品)・写真の中身 (sha256 と同じ)・無い写真 = 404・DB の準備の前 = 503', async () => {
+  const AR = await import('../apps/packing-guide/api-router.mjs');
+  AR.__setPgClientFactory(async () => {
+    let release; const prev = chain; chain = new Promise((r) => { release = r; }); await prev;
+    await pg.query('set role master_edit');
+    return { query: (t, p) => pg.query(t, p), end: async () => { await pg.query('set role deploy'); release(); }, on: () => {} };
+  });
+  const a2 = express();
+  a2.use('/apps/packing-guide-api', AR.default);
+  const s2 = http.createServer(a2);
+  await new Promise((r) => s2.listen(0, '127.0.0.1', r));
+  const B = `http://127.0.0.1:${s2.address().port}/apps/packing-guide-api`;
+  const get = (p, key) => fetch(B + p, { headers: key ? { 'x-packing-guide-key': key } : {} });
+  try {
+    delete process.env.PACKING_GUIDE_KEY;
+    assert.equal((await get('/manifest', 'k')).status, 503);
+    process.env.PACKING_GUIDE_KEY = 'secret-1';
+    assert.equal((await get('/manifest')).status, 401);
+    assert.equal((await get('/manifest', 'secret-2')).status, 401);
+    const m = await get('/manifest', 'secret-1');
+    assert.equal(m.status, 200);
+    assert.equal(m.headers.get('cache-control'), 'no-store');
+    const body = await m.json();
+    assert.equal(body.ok, true);
+    const s3 = body.guides.find((g) => g.code === 's003');
+    assert.equal(s3.note, 'ワレモノ。立てて入れる');
+    assert.equal(s3.photos.length, 1);
+    const ph = await get(`/photos/${s3.photos[0].photo_id}`, 'secret-1');
+    assert.equal(ph.status, 200);
+    assert.equal(ph.headers.get('content-type'), 'image/jpeg');
+    assert.equal(crypto.createHash('sha256').update(Buffer.from(await ph.arrayBuffer())).digest('hex'), s3.photos[0].sha256);
+    assert.equal((await get('/photos/999999999', 'secret-1')).status, 404);
+    assert.equal((await get('/photos/x', 'secret-1')).status, 404);
+    for (const f of ROLES.PACKING_GUIDE_EDIT_FUNCTIONS) await pg.query(`revoke execute on function ${f} from master_edit`);
+    try { assert.equal((await get('/manifest', 'secret-1')).status, 503); } finally {
+      for (const f of ROLES.PACKING_GUIDE_EDIT_FUNCTIONS) await pg.query(`grant execute on function ${f} to master_edit`);
+    }
+  } finally { s2.close(); delete process.env.PACKING_GUIDE_KEY; }
+});
+
+server.close();
 console.log(`${passed} passed`);
 clearTimeout(killer);
 process.exit(process.exitCode || 0);

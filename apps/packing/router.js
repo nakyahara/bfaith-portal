@@ -48,6 +48,9 @@ import { listNouhinCsvFiles, downloadNouhinCsv, driveCall } from './drive.js';
 // 商品画像は picking の楽天白抜きキャッシュ (pk_product_images) を共通部品として流用 (要件§7.1)
 import { getImageMap, queueEnsureImages } from '../picking/images.js';
 import { neNamesFor } from './ne-names.js';
+// 🆕 梱包指示の写し (入れ方の写真と注意点・正 = Render の Company DB の 0101・中原さん 2026-10-23)
+import { guidesFor, guideSyncStatus, guidePhotoFile } from './guide-sync.js';
+import { normSku } from '../../lib/sku-norm.js';
 // 梱包資材の表示・現場登録 (要件 = AI_reference『梱包資材表示_要件定義_20260823.md』v1.7)
 import {
   materialsForState, materialOptions, registerMaterial, undoMaterial,
@@ -416,6 +419,15 @@ async function decorateSlips(state) {
       l.ne_set_unresolved = !!info?.isSet;   // セットだが展開失敗 → CSV名 (セット名の可能性) を出さない
     }
   }
+  // 🆕 梱包指示 (入れ方の写真・注意点)。明細の商品と、セットを展開した構成品の両方で引く (写しが読めない = 出さない・梱包は止めない)
+  const compSkus = state.slips.flatMap((s) => s.lines.flatMap((l) => (l.ne_comps || []).map((c) => c.sku)));
+  const guides = guidesFor([...skus, ...compSkus]);
+  state.guides = Object.fromEntries(guides);
+  for (const s of state.slips) {
+    for (const l of s.lines) {
+      l.guide_keys = [...new Set([l.sku, ...(l.ne_comps || []).map((c) => c.sku)].map(normSku))].filter((k) => guides.has(k));
+    }
+  }
   return state;
 }
 
@@ -462,6 +474,7 @@ router.get('/work/:id(\\d+)', async (req, res, next) => {
       materials,                       // seq → 資材判定 (null = fail-soft)
       materialOpts,                    // { materials: [...], candidateCodes: [...] }
       materialUndoSec: MATERIAL_UNDO_SEC,
+      guideSync: guideSyncStatus(),    // 🆕 梱包指示の写しの取得の様子 (古いかも = 画面に小さく出す)
     });
   } catch (e) { next(e); }
 });
@@ -855,6 +868,16 @@ router.get('/materials/:file([a-z0-9_-]+\\.(?:jpg|jpeg|png|webp))', (req, res) =
   if (!file.startsWith(MATERIALS_DIR) || !fs.existsSync(file)) return res.status(404).send('not found');
   res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
   res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.sendFile(file);
+});
+
+/** 🆕 梱包指示の写真の配信 (端末認証の内側・名前 = 中身の sha256 = immutable)。写しは apps/packing/guide-sync.js */
+router.get('/guide-photos/:sha([0-9a-f]{64})\\.jpg', (req, res) => {
+  const file = guidePhotoFile(req.params.sha);
+  if (!file || !fs.existsSync(file)) return res.status(404).send('not found');
+  res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.type('image/jpeg');
   res.sendFile(file);
 });
 

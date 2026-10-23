@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 21;
+const SCHEMA_VERSION = 22;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -603,6 +603,21 @@ const MIGRATIONS = {
       if (!cols.includes(name)) db.exec(`ALTER TABLE pk_pack_tasks ADD COLUMN ${name} ${type}`);
     }
     db.exec("CREATE INDEX IF NOT EXISTS idx_pk_pack_tasks_returned_notify ON pk_pack_tasks(status, returned_notified_at)");
+  },
+  // v22: 梱包指示の写し (中原さん 2026-10-23・正 = Render の Company DB の 0101。apps/packing/guide-sync.js が Render の配りの口から取る)。
+  //   SKU ごとに 1 行 (写真の並び・一言・大きさ = photos_json・写真の中身は DATA_DIR/packing-guides/<sha256>.jpg)。
+  //   丸ごと入れ替える (写真が全部そろった版だけ)。取れなくても前の写しで出し続ける (取れた時刻を画面に出す)
+  22: () => {
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_guides (
+      sku_norm    TEXT PRIMARY KEY,        -- 商品コードの小文字・前後の空白なし (lib/sku-norm の normSku と同じ)
+      code        TEXT NOT NULL,           -- 商品コード (Company DB の表記)
+      name        TEXT,
+      note        TEXT NOT NULL DEFAULT '',
+      photos_json TEXT NOT NULL DEFAULT '[]',   -- [{ sha256, position, caption, width, height }] (並び順)
+      event_id    TEXT,                    -- Company DB の最後の記録の番号 (版)
+      updated_at  TEXT,
+      updated_by  TEXT
+    )`);
   },
 };
 

@@ -1,0 +1,48 @@
+<%#
+  🆕 0101 梱包指示 (中原さん 2026-10-23「どう袋や箱に入れたかの写真を 3 枚ぐらいと、梱包時の注意点を入れたい」)。
+  商品の画面 (単品) の「梱包指示」。梱包アプリ (miniPC) の伝票の画面に出る。右の「保存する」とは別のボタン。動き = public/me-packing-guide.js
+  - 写真 = 入れ方の例 (使う資材は梱包の資材カードが正)。足すとすぐ保存 (作り直した JPEG・長辺 1280px)。並べ替え・一言・外すは「梱包指示を保存」で
+  - 注意点 = 梱包のときに気をつけること (2000 字まで)
+  渡す値: pg = router の packingGuide ({ guide, canWrite, why, max, noteMax, captionMax })・base・code
+%>
+<%
+  const hq = (x) => String(x ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const G = pg.guide;
+  const pageData = { base, code, canWrite: !!pg.canWrite, max: pg.max, noteMax: pg.noteMax, captionMax: pg.captionMax, guide: G };
+  const viaWords = { sku_page: '商品の画面', packing: '梱包の画面' };
+  const has = G.note.trim() !== '' || G.photos.length > 0;
+%>
+<section class="panel" id="p-pgd" aria-labelledby="h-pgd">
+  <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-box"/></svg></span><h2 id="h-pgd">梱包指示</h2>
+    <span class="sub">入れ方の写真 (<%= pg.max %> 枚まで) と注意点 · 梱包の画面に出ます · 右の「保存する」とは別</span>
+    <span class="right"><span class="b <%= has ? 'info' : 'mute' %>" id="pgd-badge"><%= has ? '指示あり' : 'まだ無し' %></span></span></div>
+  <% if (!pg.canWrite && pg.why) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow">見るだけです: <%= pg.why %></div></div><% } %>
+  <p class="hint">写真は「入れ方の例」です。使う箱・袋 (資材) は梱包の画面の資材カードが正です。写真を足すとすぐ保存されます。並べ替え・一言・外す・注意点は「梱包指示を保存」で保存します。</p>
+
+  <ol class="pgd-photos" id="pgd-photos" aria-label="入れ方の写真 (順番どおり)">
+    <% for (const p of G.photos) { %>
+      <li class="pgd-ph"><a href="<%= base + p.url %>" target="_blank" rel="noopener"><img src="<%= base + p.url %>" alt="入れ方の写真 <%= p.position %>" width="<%= p.width %>" height="<%= p.height %>" loading="lazy"></a>
+        <div class="pgd-cap"><span class="pgd-no"><%= p.position %></span><span><%= p.caption || '' %></span></div></li>
+    <% } %>
+  </ol>
+  <% if (!G.photos.length) { %><p class="hint" id="pgd-nophoto">写真はまだありません。</p><% } %>
+  <% if (pg.canWrite) { %>
+    <div class="pgd-add" id="pgd-add-row">
+      <label class="btn" id="pgd-add-btn"><svg class="ic s" aria-hidden="true"><use href="#i-plus"/></svg>写真を足す<input type="file" id="pgd-file" accept="image/*" hidden></label>
+      <span class="hint" id="pgd-add-hint">iPad・スマホはカメラで撮れます。大きい写真は縮めて送ります</span>
+    </div>
+  <% } %>
+
+  <div class="f wide" data-row="pgd.note"><div class="lab"><label for="pgd-note">注意点</label></div>
+    <div class="ctl col" style="gap:6px">
+      <textarea class="in" id="pgd-note" rows="4" maxlength="<%= pg.noteMax %>" placeholder="例: 割れ物。本体をプチプチで 2 重に巻いてから箱へ。説明書は一番上に"<%= pg.canWrite ? '' : ' disabled' %>><%= G.note %></textarea>
+      <span class="hint"><%= pg.noteMax %> 字まで</span>
+    </div></div>
+
+  <div class="pgd-foot">
+    <% if (pg.canWrite) { %><button type="button" class="btn pri" id="pgd-save" disabled>梱包指示を保存</button><% } %>
+    <span class="msgline" id="pgd-msg" role="status" aria-live="polite"></span>
+    <span class="hint" id="pgd-last"><%= G.updated_at ? '最後に変えた: ' + (G.updated_by || '—') + ' · ' + ui.fmtJst(G.updated_at, { nowMs }) + ' · ' + (viaWords[G.updated_via] || G.updated_via || '') : '' %></span>
+  </div>
+  <script type="application/json" id="me-pgd"><%- JSON.stringify(pageData).replace(/</g, '\\u003c') %></script>
+</section>

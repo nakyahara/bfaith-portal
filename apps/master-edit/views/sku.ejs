@@ -273,6 +273,8 @@
 
         <%# 🆕 0087 梱包した状態の 縦・横・高さ・重さ (単品だけ・人の値は右の「保存する」で一緒に・出どころの値と食い違いも見せる・部品 = _package.ejs・public/me-package.js) %>
         <% if (typeof pkg !== 'undefined' && pkg && c.sku_kind === 'single') { %><%- include('_package', { pkg, editable: !!pkg.ready && editable('pkg_length'), lockWhyHtml: pkg.ready ? lockWhy('pkg_length') : '' }) %><% } %>
+        <%# 🆕 0101 梱包指示 (単品だけ・入れ方の写真 3 枚と注意点・梱包の画面に出る・右の「保存する」とは別のボタン・部品 = _packing-guide.ejs・public/me-packing-guide.js) %>
+        <% if (typeof packingGuide !== 'undefined' && packingGuide && c.sku_kind === 'single') { %><%- include('_packing-guide', { pg: packingGuide, base, code: c.code }) %><% } %>
 
         <section class="panel" aria-labelledby="h-tax">
           <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-percent"/></svg></span><h2 id="h-tax">税・分類</h2></div>
@@ -745,6 +747,8 @@
   <% if (page) { %><script src="<%= base %>/public/me-profit.js?v=<%= assetV %>" defer></script><% } %>
   <%# 🆕 0087: 大きさ・重さの「この値を入れる」(直せるときだけ・欄の数え直しは me-sku.js) %>
   <% if (page && typeof pkg !== 'undefined' && pkg && pkg.ready && c.sku_kind === 'single' && editable('pkg_length')) { %><script src="<%= base %>/public/me-package.js?v=<%= assetV %>" defer></script><% } %>
+  <%# 🆕 0101: 梱包指示 (書ける人だけ・MasterEdit.dirty に未保存を足す = me-sku.js の後) %>
+  <% if (page && typeof packingGuide !== 'undefined' && packingGuide && packingGuide.canWrite) { %><script src="<%= base %>/public/me-packing-guide.js?v=<%= assetV %>" defer></script><% } %>
   <%# 🆕 入出庫の履歴と月別のまとめ (単品だけ・読むだけ) %>
   <% if (page && page.cur.sku_kind === 'single') { %><script src="<%= base %>/public/me-moves.js?v=<%= assetV %>" defer></script><% } %>
   <%# 🆕 販売数のグラフ (読むだけ・単品とセット) %>

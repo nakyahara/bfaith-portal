@@ -99,6 +99,8 @@ import easyShipExtRouter from './apps/easy-ship/ext-router.js';
 import selectSetRouter from './apps/select-set/router.js';
 import selectSetExtRouter from './apps/select-set/ext-router.js';
 import selectSetMasterRouter from './apps/select-set/master-router.js';
+// 🆕 0101 梱包指示の配りの口 (Render → miniPC の梱包アプリ・鍵 PACKING_GUIDE_KEY・セッションの外)
+import packingGuideApiRouter from './apps/packing-guide/api-router.mjs';
 import fbaTrackingExtRouter from './apps/fba-replenishment/tracking-ext-router.js';
 import inquiryHubAiApiRouter from './apps/inquiry-hub/ai-api.js';
 import aiInsightsRouter, { aiInsightsApiRouter } from './apps/ai-insights/router.js';
@@ -406,6 +408,8 @@ app.use((req, res, next) => {
     if (normalizedPath.startsWith('/apps/select-set/ext-api')) return next();
     // /apps/select-set/master-api は miniPC が x-sync-key で取りに来るマスタ配信 (Render側で有効)
     if (normalizedPath.startsWith('/apps/select-set/master-api')) return next();
+    // /apps/packing-guide-api (🆕 0101 梱包指示の配りの口) も router 内で「x-packing-guide-key → 読む」の順 (認証の前に本文を読まない)
+    if (normalizedPath.toLowerCase().startsWith('/apps/packing-guide-api')) return next();
     // /apps/master-decisions (マスタの判断) は mount 側で「requireAppAccess → router の Origin の守り → 512kb parser」の順に処理する (共通の 10MB が先に読むと router の上限が効かない・認証の前に本文を読む。Codex #1481 R1 Medium)
     if (normalizedPath.toLowerCase().startsWith('/apps/master-decisions')) return next();
     // /apps/master-edit (マスタの入力) も同じ: mount 側で「requireAppAccess → router の Origin の守り → 256kb parser」の順 (認証の前に本文を読まない)
@@ -1028,6 +1032,8 @@ app.use('/apps/easy-ship', requireAppAccess('easy-ship'), express.json({ limit: 
 app.use('/apps/select-set/ext-api', selectSetExtRouter);
 // マスタ配信 (Render → miniPC)。x-sync-key 認証なのでセッション認証より先に mount
 app.use('/apps/select-set/master-api', express.json({ limit: '64kb' }), selectSetMasterRouter);
+// 🆕 0101 梱包指示の配りの口 (miniPC の梱包アプリが x-packing-guide-key で取りに来る)。Render だけ (正 = Render の Company DB)
+if (PORTAL_VARIANT === 'render') app.use('/apps/packing-guide-api', packingGuideApiRouter);
 app.use('/apps/select-set', requireAppAccess('select-set'), express.json({ limit: '512kb' }), selectSetRouter);
 app.use('/apps/mgmt-accounting', (req, res, next) => {
   // 管理系API (x-sync-key 直呼び対象) はセッション認証の代わりに parser より前で key 認証。

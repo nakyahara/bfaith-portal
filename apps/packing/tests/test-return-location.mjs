@@ -63,7 +63,8 @@ console.log('── ④ v21: pk_pack_tasks に戻したロケの列 ──');
 t('returned_block / returned_location / returned_at / returned_by / location_source がある', () => {
   const cols = db.prepare('PRAGMA table_info(pk_pack_tasks)').all().map((c) => c.name);
   for (const c of ['returned_block', 'returned_location', 'returned_at', 'returned_by', 'location_source']) assert.ok(cols.includes(c), c);
-  assert.equal(db.prepare("SELECT value FROM pk_pack_meta WHERE key='schema_version'").get()?.value ?? db.prepare('PRAGMA user_version').get()?.user_version, '21');
+  // v21 以降 (v22 = 梱包指示の写し・2026-10-23)
+  assert.ok(Number(db.prepare("SELECT value FROM pk_pack_meta WHERE key='schema_version'").get()?.value ?? db.prepare('PRAGMA user_version').get()?.user_version) >= 21);
 });
 
 console.log('── ① 余りの SKU は検証済みのものだけ・名前を持つ ──');

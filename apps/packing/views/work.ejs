@@ -163,6 +163,27 @@
     .toast.show { opacity: 0.95; }
     .offline-dot { width: 10px; height: 10px; border-radius: 50%; background: #2b8a3e; }
     .offline-dot.ng { background: #e03131; }
+
+    /* ── 🆕 梱包指示 (入れ方の写真・注意点。正 = Company DB・写し = apps/packing/guide-sync.js) ── */
+    .guide-box { border: 3px solid #f08c00; background: #fff9db; border-radius: 12px; padding: 10px 12px; margin-bottom: 10px; }
+    .guide-box + .guide-box { margin-top: -2px; }
+    .guide-h { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; font-size: 18px; font-weight: 800; color: #e8590c; margin-bottom: 6px; }
+    .guide-h small { font-size: 14px; font-weight: 600; color: #495057; }
+    .guide-note { white-space: pre-wrap; font-size: 19px; font-weight: 700; line-height: 1.45; color: #212529; margin: 2px 0 8px; }
+    .guide-photos { display: flex; gap: 10px; overflow-x: auto; }
+    .guide-ph { flex: 0 0 auto; width: 150px; border: 1px solid #ced4da; border-radius: 10px; background: #fff; padding: 4px; cursor: pointer; text-align: left; font: inherit; }
+    .guide-ph img { display: block; width: 100%; height: 120px; object-fit: contain; background: #f1f3f5; border-radius: 6px; }
+    .guide-ph .gcap { display: flex; gap: 6px; align-items: flex-start; font-size: 14px; font-weight: 600; margin-top: 4px; line-height: 1.3; }
+    .guide-no { flex: 0 0 auto; min-width: 22px; height: 22px; border-radius: 11px; background: #e8590c; color: #fff; font-size: 13px; font-weight: 800;
+      display: inline-flex; align-items: center; justify-content: center; }
+    .guide-stale { font-size: 13px; color: #868e96; margin-top: 4px; }
+    .guide-tag { display: inline-block; margin-left: 6px; padding: 1px 8px; border-radius: 10px; background: #fff3bf; border: 1px solid #f08c00; color: #e8590c; font-size: 13px; font-weight: 700; vertical-align: 2px; }
+    #guideOverlay .gbig { background: #fff; border-radius: 14px; padding: 12px; width: min(960px, 96vw); max-height: 94vh; display: flex; flex-direction: column; gap: 8px; }
+    #guideOverlay .gbig img { width: 100%; max-height: 74vh; object-fit: contain; background: #000; border-radius: 8px; }
+    #guideOverlay .gbig-cap { font-size: 20px; font-weight: 700; display: flex; gap: 8px; align-items: center; }
+    #guideOverlay .gbig-nav { display: flex; gap: 10px; justify-content: space-between; }
+    #guideOverlay .gbig-nav button { flex: 1; padding: 14px 8px; font-size: 18px; font-weight: 700; border: 1px solid #ced4da; border-radius: 12px; background: #f8f9fa; cursor: pointer; }
+    #guideOverlay .gbig-nav button:disabled { opacity: 0.35; }
   </style>
 </head>
 <body>
@@ -221,6 +242,19 @@
       <button class="btn-prev" id="prevBtn" type="button">◂ 前へ</button>
     </div>
     <button class="btn-next" id="nextBtn" type="button">次へ ▸</button>
+  </div>
+
+  <%# 🆕 梱包指示の写真を大きく見る (押すと開く・閉じる / 前 / 次) %>
+  <div class="overlay" id="guideOverlay" role="dialog" aria-modal="true" aria-label="梱包指示の写真">
+    <div class="gbig">
+      <div class="gbig-cap"><span class="guide-no" id="guideBigNo">1</span><span id="guideBigCap"></span></div>
+      <img id="guideBigImg" alt="">
+      <div class="gbig-nav">
+        <button type="button" id="guideBigPrev">◀ 前の写真</button>
+        <button type="button" id="guideBigClose">閉じる</button>
+        <button type="button" id="guideBigNext">次の写真 ▶</button>
+      </div>
+    </div>
   </div>
 
   <div class="overlay" id="workerOverlay">
@@ -391,6 +425,9 @@
       materials: typeof materials === 'undefined' ? null : materials,
       materialOpts: typeof materialOpts === 'undefined' ? null : materialOpts,
       materialUndoSec: typeof materialUndoSec === 'undefined' ? 15 : materialUndoSec,
+      // 🆕 梱包指示 (このバッチの商品の分だけ・鍵 = 商品コードの小文字) と、写しの取得の様子
+      guides: state.guides || {},
+      guideSync: typeof guideSync === 'undefined' ? null : guideSync,
       shipChangeReasons: typeof shipChangeReasons === 'undefined' ? [] : shipChangeReasons,
       lastDoneSeq: state.slips.filter((x) => x.status === 'done')
         .sort((a, b) => (a.done_at || '').localeCompare(b.done_at || '') || a.seq - b.seq)
@@ -408,6 +445,7 @@
           // CSV名へ戻さず未解決表示。API不達/未登録はCSVの「商品名」列 (=NE単品名) へ。
           // 印字商品名 (モール名・セットSEO長文) は表示に一切使わない
           sku: l.sku, qty: l.qty, imageUrl: l.imageUrl,
+          guideKeys: l.guide_keys || [],   // 🆕 梱包指示がある商品 (この商品・セットを展開した構成品) の鍵 = GUIDES の鍵
           name: l.ne_name || (l.ne_set_unresolved ? '⚠ 商品名未解決 (セット構成を確認)' : (l.product_name || '(商品名なし)')),
           shortName: l.short_name,   // 送り状備考1 = 読み上げ短縮名の第一候補 (要件§5.3)
         })),
@@ -507,6 +545,57 @@
       showToast._t = setTimeout(() => $('toast').classList.remove('show'), 2500);
     }
 
+    // ── 🆕 梱包指示 (入れ方の写真・注意点) ──
+    //   伝票の商品 (セットは構成品) に指示があれば、宛先の上に橙の枠で出す。写真を押すと大きく見る (前 / 次)
+    //   写真は「入れ方の例」(使う資材は上の資材カードが正)。写しが古いかも = 枠の下に小さく出す
+    const GUIDES = STATE.guides || {};
+    let guideView = null;   // 大きく見ている写真 { photos, i }
+    function guideKeysOf(s) { return [...new Set(s.lines.flatMap((l) => l.guideKeys || []))].filter((k) => GUIDES[k]); }
+    function guideHtml(s) {
+      const keys = guideKeysOf(s);
+      if (!keys.length) return '';
+      const sync = STATE.guideSync;
+      const stale = sync && sync.enabled && sync.stale
+        ? `<div class="guide-stale">⚠ 梱包指示の写しは ${sync.ageMin == null ? 'まだ一度も取れていません' : `${sync.ageMin} 分前に取ったものです`} (新しい指示が出ていないかもしれません)</div>` : '';
+      return keys.map((k) => {
+        const g = GUIDES[k];
+        const photos = (g.photos || []).map((p, i) => `
+          <button type="button" class="guide-ph" data-guide="${esc(k)}" data-i="${i}" aria-label="写真 ${i + 1} を大きく見る">
+            <img src="${esc(p.url)}" alt="入れ方の写真 ${i + 1}" loading="lazy">
+            <div class="gcap"><span class="guide-no">${i + 1}</span><span>${esc(p.caption || '')}</span></div>
+          </button>`).join('');
+        return `<div class="guide-box">
+          <div class="guide-h">📷 梱包指示 <small>${esc(g.name || g.code)} · ${esc(g.code)}</small></div>
+          ${g.note ? `<div class="guide-note">${esc(g.note)}</div>` : ''}
+          ${photos ? `<div class="guide-photos">${photos}</div>` : ''}
+          ${stale}
+        </div>`;
+      }).join('');
+    }
+    function showGuidePhoto() {
+      const { photos, i } = guideView;
+      const p = photos[i];
+      $('guideBigImg').src = p.url;
+      $('guideBigImg').alt = `入れ方の写真 ${i + 1}`;
+      $('guideBigNo').textContent = i + 1;
+      $('guideBigCap').textContent = p.caption || '';
+      $('guideBigPrev').disabled = i === 0;
+      $('guideBigNext').disabled = i === photos.length - 1;
+    }
+    document.addEventListener('click', (e) => {
+      const b = e.target && e.target.closest && e.target.closest('.guide-ph');
+      if (!b) return;
+      const g = GUIDES[b.dataset.guide];
+      if (!g || !g.photos || !g.photos.length) return;
+      guideView = { photos: g.photos, i: Math.min(Number(b.dataset.i) || 0, g.photos.length - 1) };
+      showGuidePhoto();
+      $('guideOverlay').style.display = 'flex';
+    });
+    $('guideBigClose').addEventListener('click', () => { $('guideOverlay').style.display = 'none'; guideView = null; });
+    $('guideOverlay').addEventListener('click', (e) => { if (e.target === $('guideOverlay')) { $('guideOverlay').style.display = 'none'; guideView = null; } });
+    $('guideBigPrev').addEventListener('click', () => { if (guideView && guideView.i > 0) { guideView.i--; showGuidePhoto(); } });
+    $('guideBigNext').addEventListener('click', () => { if (guideView && guideView.i < guideView.photos.length - 1) { guideView.i++; showGuidePhoto(); } });
+
     // ── 描画 ──
     function render() {
       const s = bySeq.get(viewSeq);
@@ -534,7 +623,7 @@
       const lines = s.lines.map((l) => `
         <div class="line">
           <div class="img" data-sku="${esc(l.sku)}" style="${l.imageUrl ? `background-image:url('${esc(l.imageUrl)}')` : ''}">${l.imageUrl ? '' : '📦'}</div>
-          <div class="pname">${esc(l.name)}<div class="pmeta">${esc(l.sku)}</div></div>
+          <div class="pname">${esc(l.name)}<div class="pmeta">${esc(l.sku)}${(l.guideKeys || []).length ? '<span class="guide-tag">📷 梱包指示あり</span>' : ''}</div></div>
           <div class="qty ${l.qty >= 2 ? 'multi' : ''}">${l.qty}<small> 個</small></div>
         </div>`).join('');
 
@@ -560,6 +649,7 @@
         </div>
         ${matCardHtml(s.seq)}
         ${(warns || pshort) ? `<div class="warns">${pshort}${warns}</div>` : ''}
+        ${guideHtml(s)}
         <div class="recipient">
           <div class="name">${esc(s.recipientName || '(送り先なし)')} 様</div>
           <div class="addr">〒${esc(s.recipientZip || '')} ${esc(s.recipientPref || '')}${esc(s.recipientAddr || '')}</div>
