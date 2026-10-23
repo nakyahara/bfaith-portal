@@ -18,7 +18,7 @@ import { imagePreflightStub } from '../lib/yahoo-image.js';
 import { getCustomPatternStrings } from '../lib/image-exclusion-patterns.js';
 import { resolveCategoryAndPath } from './category-resolver.js';
 import { buildYahooEditItemFields, resolvePrice } from './field-mapper.js';
-import { loadConfirmedValues } from './confirmed-values.js';
+import { loadConfirmedValues, valueTokenOf } from './confirmed-values.js';
 
 /**
  * 確定値 (2026-10-22〜: 確定値の表 → 無ければ旧 notion_overrides を「旧運用から継承」)。
@@ -217,6 +217,8 @@ export async function evaluateItemForPublish({
       notion_present: !!notionOverride,
       value_source: notionOverride?.value_source ?? null,   // manual / portal / legacy_notion
       value_version: notionOverride?.version ?? null,
+      // fields を組み立てた確定値の版 (executor が「確認画面で見た版」と照合する — 読んでから組み立てるまでの間に変わっても気づける)
+      value_token: valueTokenOf(notionOverride),
       delivery_resolved: !!deliveryRow,
       variant_count: variationResult.variantCount,
       lead_time_ok: leadTimePreflight?.ok,

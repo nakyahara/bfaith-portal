@@ -47,3 +47,32 @@ test('確認画面で見た確定値の版と違えば出さない (別の人が
     if (prev === undefined) delete process.env.RYS_PUBLISH_ENABLED; else process.env.RYS_PUBLISH_ENABLED = prev;
   }
 });
+
+test('入口の照合のあと、楽天の取得を待つ間に確定し直されても、組み立てた版で照合して止める (Codex R2)', async () => {
+  const db = freshDb();
+  const prev = process.env.RYS_PUBLISH_ENABLED;
+  process.env.RYS_PUBLISH_ENABLED = '1';
+  try {
+    confirmValues(db, { manageNumber: 'v2', input: vals, source: 'manual', actor: 'a' });
+    const r = await executePublish({
+      db, itemCode: 'v2', manageNumber: 'v2', expectedValueToken: 'manual:1',
+      publishOpts: {
+        productCategory: 1, pathName: 'p',
+        deps: {
+          // 楽天を読んでいる間に別の人が 2,000 円で確定し直す
+          fetchItemDetail: async () => {
+            confirmValues(db, { manageNumber: 'v2', input: { ...vals, yahoo_price: 2000 }, source: 'manual', actor: 'b', expectedVersion: 1 });
+            return { item: { itemNumber: 'v2', manageNumber: 'v2', itemName: 'n', variants: { a: { standardPrice: 900 } }, payment: { taxRate: 0.1 } } };
+          },
+          runLeadTimePreflight: async () => ({ ok: true }),
+          imagePreflight: () => ({ ok: true }),
+        },
+      },
+    });
+    assert.equal(r.status, 'readiness_blocked', JSON.stringify(r));
+    assert.match(r.reasons[0], /^value_version_changed:manual:1->manual:2/);
+    assert.equal(db.prepare(`SELECT status FROM publish_idempotency WHERE item_code = 'v2'`).get().status, 'failed');
+  } finally {
+    if (prev === undefined) delete process.env.RYS_PUBLISH_ENABLED; else process.env.RYS_PUBLISH_ENABLED = prev;
+  }
+});

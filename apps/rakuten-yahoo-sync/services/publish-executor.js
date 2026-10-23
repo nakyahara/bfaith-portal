@@ -512,6 +512,22 @@ export async function executePublish({
       };
     }
 
+    // 確定値の版の照合 (2 回目): 入口の照合のあと、楽天の取得を待つ間に確定し直されることがある (Codex R2)。
+    //   実際に fields を組み立てた版 (debug.value_token) で照合し、違えばここで止める (Yahoo には送らない)
+    if (expectedValueToken !== undefined && expectedValueToken !== null
+        && evalResult.debug?.value_token !== expectedValueToken) {
+      const reason = `value_version_changed:${expectedValueToken}->${evalResult.debug?.value_token ?? 'unknown'}`;
+      const finalized = finalize(db, {
+        idempotencyKey, status: 'failed', resultJson: JSON.stringify({ reasons: [reason] }),
+        errorMessage: reason, ownAttempt,
+      });
+      if (!finalized) {
+        return { status: 'lease_lost', idempotencyKey, error: 'finalize CAS failed: another caller has stolen the lease before we could write the result.' };
+      }
+      audit(db, 'publish_execute_blocked_version', { itemCode, expectedValueToken, usedToken: evalResult.debug?.value_token }, { result: 'failed', errorMessage: reason });
+      return { status: 'readiness_blocked', idempotencyKey, reasons: [reason], error: reason };
+    }
+
     // Phase E-5b: 実 publish — 画像 upload → editItem 呼び出し
     let publishResult;
     try {

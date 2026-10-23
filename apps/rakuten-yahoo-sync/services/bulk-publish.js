@@ -314,7 +314,12 @@ export function listFailedItemCodes(db, { limit = 100 } = {}) {
       JOIN (SELECT item_code, MAX(id) AS max_id FROM bulk_publish_batch_items GROUP BY item_code) lb
         ON lb.item_code = bi.item_code AND lb.max_id = bi.id
       WHERE bi.publish_status = 'aborted'
-        AND NOT EXISTS (SELECT 1 FROM publish_idempotency p WHERE p.item_code = bi.item_code AND p.status = 'success')
+        -- 中断の「あと」に成功していないもの (全件再登録の中断なら、過去に成功していても拾う — Codex R2)
+        AND NOT EXISTS (
+          SELECT 1 FROM publish_idempotency p
+           WHERE p.item_code = bi.item_code AND p.status = 'success'
+             AND COALESCE(p.completed_at, p.updated_at, p.created_at) >= bi.finished_at
+        )
       ORDER BY bi.id DESC
       LIMIT ?
     `).all(limit).map((r) => r.item_code);

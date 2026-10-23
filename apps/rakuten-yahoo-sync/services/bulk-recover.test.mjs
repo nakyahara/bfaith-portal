@@ -60,3 +60,18 @@ test('中断扱いにした商品は「失敗中を再実行」で拾う (成功
   recoverStaleBatches(db);
   assert.deepEqual(listFailedItemCodes(db).sort(), ['p1', 'r1']);
 });
+
+test('全件再登録の中断: 過去に成功した商品でも、中断のあとに成功していなければ拾う (Codex R2)', async () => {
+  const { listFailedItemCodes } = await import('./bulk-publish.js');
+  const db = freshDb();
+  db.prepare(`INSERT INTO publish_idempotency (idempotency_key, item_code, manage_number, status, created_by, completed_at, created_at, updated_at)
+              VALUES ('k-old', 'm1', 'm1', 'success', 't', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z')`).run();
+  const old = new Date(Date.now() - STALE_BATCH_MS - 60_000).toISOString();
+  insertRunning(db, old, [['m1', 'pending', null]]);
+  recoverStaleBatches(db);
+  assert.deepEqual(listFailedItemCodes(db), ['m1']);
+  // 中断のあとに成功すれば拾わない
+  db.prepare(`INSERT INTO publish_idempotency (idempotency_key, item_code, manage_number, status, created_by, completed_at)
+              VALUES ('k-new', 'm1', 'm1', 'success', 't', ?)`).run(new Date(Date.now() + 1000).toISOString());
+  assert.deepEqual(listFailedItemCodes(db), []);
+});
