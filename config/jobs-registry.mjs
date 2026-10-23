@@ -1616,6 +1616,27 @@ export const JOBS_REGISTRY = [
       + '済んだら 2 ファイルを消す PR を出し、このエントリも消す',
   },
   {
+    id: 'strip-material-tags',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: '中原さん + Claude',
+    purpose: '一回きり: 商品名の末尾の資材の印 (_梱機プ・_長3封・_K-44 など = lib/master-write.mjs の MATERIAL_TAG_RE) を外すスクリプト '
+      + 'scripts/company-db/strip-material-tags.mjs + 試験 scripts/test-strip-material-tags.mjs (中原さん 10/23 承認・D-47 = 資材は梱包アプリで登録)。'
+      + '外すのは郵便料金 (Render の postage.db の pm_skus) と梱包アプリ (miniPC の picking.db の pk_pack_material_rules) に資材の登録がある単品だけ。'
+      + '保存は商品の画面と同じ saveSku (画面のロール master_edit) = 「NEへ送る」が人の直しとして NE に送る。定期実行はしない',
+    where: 'bfaith-portal リポジトリ (miniPC で手で、dry-run → --apply --expect-hash。途中で止まっても同じハッシュで続きから)',
+    remove_by: '2026-12-31',
+    lifecycle: 'temporary',
+    runbook: 'miniPC の PowerShell (リポジトリ直下・値は一重引用符): 準備 = $env:DOTENV_CONFIG_PATH = \'C:\\Users\\bfaith\\bfaith-portal\\.env\'; $A = \'<人のメール>\';'
+      + ' 郵便料金の DB = その日の Render のバックアップ (rclone で gdrive:bfaith-backup/render/daily/postage-<日付>-*.db.gz を C:\\tmp に取って gunzip) = $P。'
+      + ' (1) dry-run (読むだけ・COMPANY_DB_WATCH_URL): node -r dotenv/config scripts/company-db/strip-material-tags.mjs --actor $A --postage-db $P'
+      + ' --packing-db \'C:\\tools\\bfaith-picking\\data\\picking.db\' --csv \'C:\\tmp\\strip-skipped.csv\' → 数・外さない一覧 (CSV = 先に資材を登録する商品) を中原さんが見る。'
+      + ' (2) 書く: その PowerShell だけで $env:COMPANY_DB_MASTER_EDIT_URL = \'<Render の環境変数の値>\' (.env には書かない) → 同じ引数 + --apply --expect-hash \'<(1) のハッシュ>\' --yes'
+      + ' (はじめは --limit 5 で 1 回・商品の画面で名前と変更の記録を見てから残り)。止まった・つながらない = 同じ引数でもう一度 (済んだものは書かない)。ハッシュが違う = (1) から。'
+      + ' (3) 「NEへ送る」(その日の朝の照合の後なら書いた日のうちに出る): 毎朝の自動は 100 欄を超えると止まる (held) = 画面の「CSV で受け取る」(1 ファイル 1,000 行まで) か「今すぐ送る」→ 次の朝に NE と同じになったか見る。'
+      + '済んだら 2 ファイルを消す PR を出し、このエントリも消す',
+  },
+  {
     id: 'lz-gas-rollback',
     type: 'temporary_asset',
     importance: 'TMP',
