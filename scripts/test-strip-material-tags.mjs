@@ -62,7 +62,8 @@ await ta('[P2] 引数: --actor・資材の DB は要る・apply は --expect-has
   assert.throws(() => T.parseStripArgs(['--actor', 'a@b', '--packing-db', 'k.db']), /--postage-db/);
   assert.throws(() => T.parseStripArgs(['--actor', 'a@b', '--postage-db', 'p.db']), /--packing-db/);
   assert.equal(T.parseStripArgs(['--actor', 'a@b', '--postage-db', 'p.db', '--gate', 'postage']).gate, 'postage');
-  assert.throws(() => T.parseStripArgs([...base, '--gate', 'none']), /--gate/);
+  assert.equal(T.parseStripArgs([...base, '--gate', 'none']).gate, 'none');   // 🆕 10/23 中原さん
+  assert.throws(() => T.parseStripArgs([...base, '--gate', 'all']), /--gate/);
   assert.throws(() => T.parseStripArgs([...base, '--apply', '--yes']), /--expect-hash/);
   assert.throws(() => T.parseStripArgs([...base, '--apply', '--expect-hash', 'a'.repeat(64)]), /--yes/);
   assert.throws(() => T.parseStripArgs([...base, '--limit', '3']), /--limit は --apply/);
@@ -345,6 +346,34 @@ await ta('[N1] 外した名前は「NEへ送る」の send (人の直し)・外�
     assert.equal(x.status, 'send', `${c}: ${JSON.stringify(x)}`);
   }
   for (const c of ['t02', 't03', 't05', 's01']) assert.equal(nameUnit(c), undefined, c);
+});
+
+await ta('[G1] 🆕 --gate none (中原さん 10/23): 資材の DB を見ずに全部外す・印の重なりも全部・同じ名前になっても外す・短い / コードと同じは外さない・済んだ後は何もしない', async () => {
+  assert.equal(T.stripAllTags('アロマ_白プチ_梱機プ').to, 'アロマ');
+  assert.deepEqual(T.stripAllTags('アロマ_白プチ_梱機プ').tags, ['梱機プ', '白プチ']);
+  assert.equal(T.stripAllTags('ふつうの名前'), null);
+  assert.equal(T.parseStripArgs(['--actor', ACTOR, '--gate', 'none']).gate, 'none', '資材の DB の引数は要らない');
+  const NONE = { postage: new Map(), packing: null, meta: { gate: 'none' } };
+  const d = await dry('watcher', { gate: 'none', evidence: NONE });
+  const to = Object.fromEntries(d.plan.pending.map((p) => [p.code, p.to]));
+  assert.equal(to.t02, 'エプロン 110cm', '郵便料金の登録が無くても外す');
+  assert.equal(to.t05, 'ハニー 20ml', '梱包の登録が無くても外す');
+  assert.equal(to.t06, 'アロマ', '印の重なりは全部外す');
+  assert.equal(to.t08, 'オイルB', '同じ名前になっても外す');
+  assert.equal(to.t09, 'オイルB');
+  const skip = Object.fromEntries(d.plan.skipped.map((s) => [s.code, s.why]));
+  assert.equal(skip.t07, 'name_short');
+  assert.equal(skip['ab-1'], 'name_invalid');
+  assert.ok(!('t10' in to) && !('t12' in to), '印の無い商品は計画に入らない');
+  const r = await apply(d.plan.hash, { gate: 'none', evidence: NONE, chunk: 50 });
+  assert.equal(r.exitCode, 0, JSON.stringify(r.result && { stopped: r.result.stopped, failed: r.result.failed, skipped: r.result.skipped, refused: r.result.refused }));
+  for (const [c, n] of Object.entries({ t02: 'エプロン 110cm', t06: 'アロマ', t08: 'オイルB', t09: 'オイルB' })) {
+    const x = await nameOf(c);
+    assert.equal(x.name, n, c);
+    assert.equal(x.pname, n, `${c} の商品の名前もそろう`);
+  }
+  const again = await dry('watcher', { gate: 'none', evidence: NONE });
+  assert.equal(again.plan.pending.length, 0, '全部済んだ後は何も書かない');
 });
 
 fs.rmSync(TMP, { recursive: true, force: true });

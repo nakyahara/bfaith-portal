@@ -55,7 +55,7 @@ export const MAX_ATTEMPTS = 5;
 export const NE_FILE_ROWS = 1000;
 /** 毎朝の自動で送る上限 (0094 の ops.ne_upd_auto_limit。超える朝は held) */
 export const NE_AUTO_LIMIT = 100;
-export const GATES = Object.freeze(['both', 'postage']);
+export const GATES = Object.freeze(['both', 'postage', 'none']);
 const CTRL_RE = new RegExp(`[\\x00-\\x1f\\x7f${String.fromCharCode(0x2028, 0x2029)}]`);
 /** 誤りの文 (接続文字列を出さない) */
 const cleanMsg = (e) => String(e && e.message).replace(/postgres(ql)?:\/\/\S+/gi, '[接続文字列]');
@@ -84,6 +84,17 @@ export function stripTag(name) {
   if (!m) return null;
   return { tag: m[1], to: s.slice(0, m.index).trim() };
 }
+/**
+ * 🆕 --gate none (10/23 中原さん「資材の登録の確かめを外して、印の付いた単品の名前を全部外す」): 末尾の印を重なりも全部外す。
+ *   無い = null。{ tag (いちばん外側の印), tags, to }
+ */
+export function stripAllTags(name) {
+  let s = String(name ?? '');
+  const tags = [];
+  for (let m = MATERIAL_TAG_RE.exec(s); m; m = MATERIAL_TAG_RE.exec(s)) { tags.push(m[1]); s = s.slice(0, m.index).trimEnd(); }
+  if (!tags.length) return null;
+  return { tag: tags[0], tags, to: s.trim() };
+}
 /** 同じ名前かの比べ方 (NFKC・空白を除く) */
 const nameKey = (s) => String(s ?? '').normalize('NFKC').replace(/\s+/g, '');
 /** request_id (uuid の形) = SKU・前の名前・後の名前・やり直しの回から決まる */
@@ -105,7 +116,7 @@ export function parseStripArgs(argv) {
     else if (a === '--expect-hash') { const v = need(i, a); if (!/^[0-9a-f]{64}$/.test(v)) throw fail('--expect-hash は dry-run が出した 64 桁の 16 進'); o.expectHash = v; i++; }
     else if (a === '--actor') { o.actor = need(i, a).trim().toLowerCase(); i++; }
     else if (a === '--reason') { o.reason = need(i, a).trim(); i++; }
-    else if (a === '--gate') { o.gate = need(i, a); if (!GATES.includes(o.gate)) throw fail('--gate は both (郵便料金 + 梱包アプリ・既定) か postage (郵便料金だけ)'); i++; }
+    else if (a === '--gate') { o.gate = need(i, a); if (!GATES.includes(o.gate)) throw fail('--gate は both (郵便料金 + 梱包アプリ・既定) か postage (郵便料金だけ) か none (資材の登録を見ずに全部外す・10/23 中原さん)'); i++; }
     else if (a === '--postage-db') { o.postageDb = need(i, a); i++; }
     else if (a === '--packing-db') { o.packingDb = need(i, a); i++; }
     else if (a === '--limit') { o.limit = posInt(need(i, a), a, 100000); i++; }
@@ -118,7 +129,7 @@ export function parseStripArgs(argv) {
   }
   if (!o.actor || !/^[^\s@]+@[^\s@]+$/.test(o.actor) || o.actor.length > 320) throw fail('--actor <人のメール> が要る (dry-run も apply も同じ人)');
   if (!o.reason || [...o.reason].length > REASON_MAX || CTRL_RE.test(o.reason)) throw fail(`--reason は 1〜${REASON_MAX} 字・制御文字なし (dry-run も apply も同じ理由)`);
-  if (!o.postageDb) throw fail('--postage-db <郵便料金の postage.db (Render のバックアップの写し)> が要る');
+  if (o.gate !== 'none' && !o.postageDb) throw fail('--postage-db <郵便料金の postage.db (Render のバックアップの写し)> が要る');
   if (o.gate === 'both' && !o.packingDb) throw fail('--packing-db <梱包アプリの picking.db (miniPC の C:\\tools\\bfaith-picking\\data\\picking.db)> が要る (--gate both)');
   if (o.apply) {
     if (o.expectHash == null) throw fail('--apply は --expect-hash <dry-run が出した計画のハッシュ> が要る');
@@ -188,11 +199,18 @@ export const packingSkuKey = (v) => String(v ?? '').trim().toLowerCase();
 
 /** 1 つの SKU を見る = { ok: true, tag, to } か { ok: false, why, tag } (印が無い = null) */
 function judge(row, { evidence, gate }) {
-  const t = stripTag(row.name);
+  const t = gate === 'none' ? stripAllTags(row.name) : stripTag(row.name);
   if (!t) return null;
   const base = { tag: t.tag, to: t.to };
   if (row.sku_kind === 'set') return { ...base, ok: false, why: 'kind_set' };
   if (row.sku_kind !== 'single') return { ...base, ok: false, why: 'kind_exception' };
+  // 🆕 --gate none (中原さん 10/23): 資材の登録を見ない・印の重なりも全部外す・登録をやめた商品 (cancelled) のほかは外す (要確認も)
+  if (gate === 'none') {
+    if (row.reg_state === 'cancelled') return { ...base, ok: false, why: 'reg_state' };
+    if ([...t.to].length < 2) return { ...base, ok: false, why: 'name_short' };
+    if (/^empty$/i.test(t.to) || CTRL_RE.test(t.to) || normSku(t.to) === row.code_norm) return { ...base, ok: false, why: 'name_invalid' };
+    return { ...base, ok: true };
+  }
   if (row.reg_state !== 'available') return { ...base, ok: false, why: 'reg_state' };
   if (MATERIAL_TAG_RE.test(t.to)) return { ...base, ok: false, why: 'double_tag' };
   if ([...t.to].length < 2) return { ...base, ok: false, why: 'name_short' };
@@ -233,8 +251,9 @@ export async function buildStripPlan(db, { actor, reason, gate = 'both', evidenc
   const doneIds = new Set();
   const seenSku = new Set();
   for (const d of doneRows) {
-    const t = stripTag(d.from_name);
-    if (!t || t.to !== d.to_name) continue;
+    const t1 = stripTag(d.from_name);
+    const t2 = stripAllTags(d.from_name);
+    if (!((t1 && t1.to === d.to_name) || (t2 && t2.to === d.to_name))) continue;
     let ours = false;
     for (let a = 0; a < MAX_ATTEMPTS && !ours; a++) ours = stripRequestId(d.sku_id, d.from_name, d.to_name, a) === d.request_id;
     if (!ours || seenSku.has(d.sku_id)) continue;
@@ -261,6 +280,7 @@ export async function buildStripPlan(db, { actor, reason, gate = 'both', evidenc
   //   外さないことにした商品は今の名前のまま = 数え直す (増えなくなるまで)
   const dup = new Set();
   for (;;) {
+    if (gate === 'none') break;   // 🆕 --gate none: 同じ名前になっても外す (中原さん 10/23・名前に一意の決まりは無い)
     const keyCount = new Map();
     const bump = (k) => keyCount.set(k, (keyCount.get(k) || 0) + 1);
     const changing = new Set(cands.filter((c) => !dup.has(c.row.sku_id)).map((c) => c.row.sku_id));
@@ -319,7 +339,7 @@ export function planLines(plan, { show = 20, evidence = null, gate = 'both' } = 
     const m = evidence.meta.packing;
     L.push(`梱包アプリ (picking.db): 有効な登録 ${m.active_rules} 件・この商品だけの伝票の登録がある SKU ${m.single_sku} 件・最後の更新 ${m.updated_at ?? '-'}・ファイル ${m.file} (${m.mtime})`);
   }
-  L.push(`条件 (--gate): ${gate === 'both' ? '郵便料金 + 梱包アプリ' : '郵便料金だけ'}`);
+  L.push(`条件 (--gate): ${gate === 'both' ? '郵便料金 + 梱包アプリ' : gate === 'none' ? '資材の登録を見ない (全部外す・印の重なりも・同じ名前になっても)' : '郵便料金だけ'}`);
   L.push(`資材の印がある商品 (登録をやめたものを除く): ${c.tagged_non_cancelled} 件 (登録をやめた商品 ${c.cancelled} 件は数えるだけ)`);
   L.push(`  外す: ${c.strippable} 件${c.done ? ` (この道具で済んだもの ${c.done} 件は別)` : ''}`);
   L.push(`  外さない: ${c.skipped} 件 = 資材の登録が無い ${c.skipped_no_material}・登録と印が違う ${c.skipped_mismatch}・そのほか ${c.skipped_other}`);
@@ -405,7 +425,8 @@ async function writeOne(db, it, opts) {
   try { cur = await readCurrent(db, it.sku_id, opts.today); } catch (e) { return { state: 'stop', reason: 'read_failed', message: cleanMsg(e) }; }
   if (!cur) return { state: 'skipped', why: 'not_found' };
   if (cur.name === it.to) return { state: 'already' };
-  if (cur.name !== it.from || cur.sku_kind !== 'single' || cur.registration?.state !== 'available') return { state: 'skipped', why: 'changed_since_plan', name: cur.name };
+  if (cur.name !== it.from || cur.sku_kind !== 'single'
+      || (opts.gate === 'none' ? cur.registration?.state === 'cancelled' : cur.registration?.state !== 'available')) return { state: 'skipped', why: 'changed_since_plan', name: cur.name };
   // やり直しの回 = 記録の無い最初の回 (前の回の失敗・印を付け直される前に済んだ回の番号は使わない。済んだかは今の名前で見る)
   const ids = Array.from({ length: MAX_ATTEMPTS }, (_, a) => stripRequestId(it.sku_id, it.from, it.to, a));
   const prev = (await db.query('select request_id::text as request_id, status from ops.master_edit_requests where request_id = any($1::uuid[])', [ids])).rows;
@@ -442,7 +463,9 @@ async function writeOne(db, it, opts) {
 
 /** dry-run か apply を流す (main と試験の入口)。戻り値 = { mode, exitCode, plan?, result? } */
 export async function runStrip(db, opts, { log = console.log, now = null, save = null } = {}) {
-  const evidence = opts.evidence || readMaterialEvidence({ postageDb: opts.postageDb, packingDb: opts.gate === 'both' ? opts.packingDb : null });
+  const evidence = opts.evidence || (opts.gate === 'none'
+    ? { postage: new Map(), packing: null, meta: { gate: 'none' } }   // 🆕 --gate none = 資材の DB を読まない
+    : readMaterialEvidence({ postageDb: opts.postageDb, packingDb: opts.gate === 'both' ? opts.packingDb : null }));
   const base = { actor: opts.actor, reason: opts.reason, gate: opts.gate, evidence };
   if (!opts.apply) {
     await db.query('begin read only');
