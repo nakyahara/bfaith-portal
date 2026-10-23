@@ -289,6 +289,16 @@ const STALE_RUNNING_GRACE_MS = 15 * 60 * 1000;
  * Codex R2 Medium-1: STALE_RUNNING_GRACE_MS で grace を適用 (lease 切れた直後の race を緩衝)。
  *   steal 条件は `run_lease_expires_at < now - GRACE`。
  */
+/**
+ * 1 回の baseline で「Yahoo から消えた」として台帳から外してよい件数の上限 (2026-10-22)。
+ * 既定 = max(20, 台帳の 2%)。RYS_BASELINE_PRUNE_MAX で上書き (大量に終売した日など、確認した上で上げる)。
+ */
+function pruneLimitOf(totalRows) {
+  const env = Number.parseInt(process.env.RYS_BASELINE_PRUNE_MAX || '', 10);
+  if (Number.isFinite(env) && env >= 0) return env;
+  return Math.max(20, Math.floor(totalRows * 0.02));
+}
+
 function stealStaleRunningRuns(db, syncName) {
   const now = Date.now();
   const cutoff = new Date(now - STALE_RUNNING_GRACE_MS).toISOString();
@@ -353,14 +363,37 @@ async function syncYahooBaseline({ db, deps = {}, triggeredBy = 'cron', triggerR
 
       const inserted = syncYahooRegisteredItems(db, items, runStartedAt);
 
-      const staleRows = db.prepare(
+      const countStale = () => db.prepare(
         `SELECT COUNT(*) AS c FROM yahoo_registered_items
          WHERE source = 'yahoo_existing' AND last_seen_at < ?`
       ).get(runStartedAt).c;
+      const staleBeforePrune = countStale();
 
       const anyPartial = perQuery.some((q) => q.completeness === 'partial');
       // Codex R2 High-2: 'unknown' も 'complete' とは見なさない、 全 query が 'complete' で確立可。
       const anyIncomplete = perQuery.some((q) => q.completeness !== 'complete');
+
+      // 2026-10-22: Yahoo から消えた商品を台帳から外す (migration 024 の説明を参照)。
+      //   全クエリが件数一致した回 = 取りこぼしではなく本当に見えない、と言えるときだけ。
+      //   多すぎる回 (上限超え) は取得側の異常を疑って外さない → stale_rows が残り baseline は不成立 (従来どおり止まる)
+      let prunedRows = 0;
+      let pruneSkippedReason = null;
+      if (isFullQuerySet && !anyIncomplete && staleBeforePrune > 0) {
+        const limit = pruneLimitOf(items.size + staleBeforePrune);
+        if (staleBeforePrune > limit) {
+          pruneSkippedReason = `Yahoo で見えなくなった商品が ${staleBeforePrune} 件あり、1 回で外せる上限 (${limit} 件) を超えたので外していません (取得の異常の可能性。確認して RYS_BASELINE_PRUNE_MAX で上限を上げる)`;
+        } else {
+          db.prepare(`
+            INSERT INTO yahoo_removed_items (item_code, yahoo_item_code, last_seen_at, sync_run_id)
+            SELECT item_code, yahoo_item_code, last_seen_at, ? FROM yahoo_registered_items
+             WHERE source = 'yahoo_existing' AND last_seen_at < ?
+          `).run(syncRunId, runStartedAt);
+          prunedRows = db.prepare(
+            `DELETE FROM yahoo_registered_items WHERE source = 'yahoo_existing' AND last_seen_at < ?`
+          ).run(runStartedAt).changes;
+        }
+      }
+      const staleRows = countStale();
       const establishesBaseline = isFullQuerySet && staleRows === 0 && !anyIncomplete;
 
       if (establishesBaseline) {
@@ -381,18 +414,21 @@ async function syncYahooBaseline({ db, deps = {}, triggeredBy = 'cron', triggerR
         stale_rows_count: staleRows,
         establishes_baseline: establishesBaseline ? 1 : 0,
         per_query_json: JSON.stringify(perQuery),
+        ...(pruneSkippedReason ? { error_message: pruneSkippedReason } : {}),
       });
 
-      return { inserted, staleRows, anyPartial, anyIncomplete, establishesBaseline };
+      return { inserted, staleRows, anyPartial, anyIncomplete, establishesBaseline, prunedRows, pruneSkippedReason };
     });
 
-    const { inserted, staleRows, anyPartial, anyIncomplete, establishesBaseline } = writeTx();
+    const { inserted, staleRows, anyPartial, anyIncomplete, establishesBaseline, prunedRows, pruneSkippedReason } = writeTx();
 
     return {
       syncRunId,
       itemsObserved: items.size,
       itemsUpserted: inserted,
       staleRows,
+      prunedRows,                 // Yahoo から消えたので台帳から外した件数 (yahoo_removed_items に記録)
+      pruneSkippedReason,         // 多すぎて外さなかったときの理由 (このとき baseline は不成立)
       perQuery,
       isFullQuerySet,
       usingOverride,

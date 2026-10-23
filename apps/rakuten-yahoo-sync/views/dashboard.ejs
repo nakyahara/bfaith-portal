@@ -126,17 +126,20 @@
           🗂 <strong>Notion 連携は <%= (typeof notionRetired !== 'undefined' && notionRetired && notionRetired.at) || '2026-09-14' %> に廃止しました</strong> (旧 Notion 商品マスターは削除済み)。
           全部更新の Notion 系 3 ステップは「スキップ」と記録されます (失敗ではありません)。
           <br>
-          確定値 (Yahoo!タイトル・売価・配送方法・税率) は
+          <% const cf = (typeof notionRetired !== 'undefined' && notionRetired && notionRetired.confirmed) || null; %>
+          <strong>確定値 (Yahoo!に送るタイトル・売価・配送方法・税率)</strong> は、商品カードを押して開く商品詳細の「✅ この値で確定」(既存商品)
+          か、商品登録ハブの商品詳細の「Yahoo!移行に確定」(新商品) で入れます。楽天の値は候補として出るだけで、確定するまで出品には使いません。
+          <br>
+          <% if (cf) { %>このアプリで確定 <strong><%= cf.manual %></strong> / 商品登録ハブで確定 <strong><%= cf.portal %></strong> / <% } %>
           <% if (ov) { %>
-            旧 Notion から引き継いだ <strong><%= ov.total %></strong> 商品分が残っています
-            (4 項目そろい <strong><%= ov.complete %></strong> / タイトル <%= ov.with_title %> / 売価 <%= ov.with_price %> / 配送 <%= ov.with_delivery %> / 税率 <%= ov.with_tax %>)。
+            旧 Notion から継承 <strong><%= ov.total %></strong> 商品
+            (4 項目そろい <strong><%= ov.complete %></strong>。佐川売価の対象で佐川売価が空のものは確定し直しが必要)
           <% } else { %>
-            (件数を取得できませんでした)。
+            (旧 Notion の件数を取得できませんでした)
           <% } %>
           <% if (syncState?.last_successful_sync_at) { %>
-            最終取込: <code><%= syncState.last_successful_sync_at %></code> (以後この値は更新されません)。
+            ・旧 Notion の最終取込: <code><%= syncState.last_successful_sync_at %></code>
           <% } %>
-          新しい入力欄 (この画面の商品詳細) と商品登録ハブからの引き継ぎは順に追加します。
         </div>
       </div>
 
@@ -257,7 +260,7 @@
         </div>
       <% } else { %>
         <% for (const p of products) { %>
-          <div class="product-card js-open-detail" data-item-code="<%= p.itemCode %>" role="button" tabindex="0" aria-label="<%= p.itemCode %> の詳細を見る">
+          <div class="product-card js-open-detail" data-item-code="<%= p.itemCode %>" data-value-token="<%= p.valueToken || '' %>" role="button" tabindex="0" aria-label="<%= p.itemCode %> の詳細を見る">
             <% if (p.status === 'actionable') { %>
               <div class="bulk-checkbox-wrap">
                 <input type="checkbox" class="form-check-input js-bulk-checkbox" data-item-code="<%= p.itemCode %>" aria-label="<%= p.itemCode %> を一括選択">
@@ -297,6 +300,9 @@
                 <code><%= p.itemCode %></code>
                 <% if (p.yahooPrice) { %> ・ ¥<%= p.yahooPrice.toLocaleString() %><% } %>
                 <% if (p.delivery) { %> ・ <%= p.delivery %><% } %>
+                <% if (p.valueSource === 'portal') { %> ・ <span class="badge bg-light text-dark border" title="商品登録ハブで確定した値">ハブで確定</span>
+                <% } else if (p.valueSource === 'manual') { %> ・ <span class="badge bg-light text-dark border" title="この画面の商品詳細で確定した値">確定済み</span>
+                <% } else if (p.valueSource === 'legacy_notion') { %> ・ <span class="badge bg-light text-secondary border" title="旧 Notion から引き継いだ値 (確定日時は記録なし)">旧Notion</span><% } %>
               </div>
 
               <% if (p.status === 'fixable' && p.primaryReason) { %>
@@ -305,6 +311,14 @@
                   <% if (p.reasons.length > 1) { %>
                     <span class="text-muted small">（他 <%= p.reasons.length - 1 %> 件の修正項目）</span>
                   <% } %>
+                </div>
+              <% } %>
+
+              <%# 2026-10-22: 前回 Yahoo で登録に失敗した商品 (Yahoo の拒否・認証切れ等) は理由を出す。
+                  旧実装は一覧に出さず、次の一括登録でも同じ失敗を繰り返していた %>
+              <% if ((p.status === 'actionable' || p.status === 'fixable') && p.publishStatus === 'failed') { %>
+                <div class="product-reason text-danger" title="<%= p.publishError || '' %>">
+                  ❌ 前回の登録に失敗: <%= String(p.publishError || '理由不明').slice(0, 120) %>
                 </div>
               <% } %>
 
@@ -342,13 +356,14 @@
                 <button class="btn btn-success btn-sm js-publish-btn"
                         data-item-code="<%= p.itemCode %>"
                         data-yahoo-title="<%= p.yahooTitle || '' %>"
-                        data-yahoo-price="<%= p.yahooPrice || 0 %>"
+                        data-yahoo-price="<%= p.resolvedPrice || p.yahooPrice || 0 %>"
+                        data-value-token="<%= p.valueToken || '' %>"
                         data-delivery="<%= p.delivery || '' %>">
                   <% if (publishEnabled) { %>▶️ Yahoo に出す<% } else { %>🧪 登録テスト<% } %>
                 </button>
               <% } else if (p.status === 'fixable') { %>
-                <%# 2026-09-14 Notion 廃止: 「Notion で修正」の行き先が無い。入力欄は PR 2 で追加 — それまで嘘の導線を出さない %>
-                <span class="small text-muted text-center">確定値 (タイトル・売価・配送・税率) の入力欄は準備中です</span>
+                <%# 2026-10-22: 確定値はカードを押して開く商品詳細で入れる (カテゴリだけ足りない商品は紐付け画面) %>
+                <span class="small text-muted text-center">カードを押して商品詳細で直す<br><a href="/apps/rakuten-yahoo-sync/category-binding" onclick="event.stopPropagation()">カテゴリは紐付け画面へ</a></span>
               <% } %>
             </div>
           </div>
@@ -661,8 +676,18 @@ function showPubView(name) {
   document.getElementById('pubModalResultBody').style.display = name === 'result' ? '' : 'none';
 }
 
+// 確認画面に出した確定値の版 (出品の直前に違えば止める — 別の人が確定し直した値で出さない)
+let _pubValueToken = null;
+function valueTokenOfCard(itemCode) {
+  for (const el of document.querySelectorAll('[data-item-code][data-value-token]')) {
+    if (el.dataset.itemCode === itemCode && el.dataset.valueToken) return el.dataset.valueToken;
+  }
+  return null;
+}
+
 function openPublishConfirm(itemCode, title, price, delivery) {
   _pubItemCode = itemCode;
+  _pubValueToken = valueTokenOfCard(itemCode);
   document.getElementById('pubItemCode').textContent = itemCode;
   document.getElementById('pubTitle').textContent = title || '(未入力)';
   document.getElementById('pubPrice').textContent = price ? price.toLocaleString() : '0';
@@ -729,7 +754,7 @@ async function executePublish() {
   let data, error;
   try {
     const res = await fetch('/apps/rakuten-yahoo-sync/api/publish/execute/' + encodeURIComponent(_pubItemCode), {
-      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({}),
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(_pubValueToken ? { valueToken: _pubValueToken } : {}),
     });
     data = await res.json();
   } catch (e) {
@@ -777,14 +802,22 @@ async function executePublish() {
         '<span class="small text-muted">※ Yahoo!ショッピング側で実際に商品ページが表示されるまで 数分かかる場合があります</span>';
       wrap.appendChild(note);
     } else if (data.status === 'readiness_blocked' && data.reasons?.length) {
+      // 2026-10-22: 日本語にした理由 (reasonsTranslated) を出す。旧実装は内部コード (notion_title_missing 等) のままだった
       const ul = document.createElement('ul');
       ul.className = 'mb-0 mt-2 small';
-      for (const r of data.reasons.slice(0, 5)) {
+      const list = Array.isArray(data.reasonsTranslated) && data.reasonsTranslated.length ? data.reasonsTranslated : data.reasons;
+      for (const r of list.slice(0, 8)) {
         const li = document.createElement('li');
         li.textContent = typeof r === 'string' ? r : (r.message || JSON.stringify(r));
         ul.appendChild(li);
       }
       wrap.appendChild(ul);
+    } else if (data.error) {
+      // 失敗の理由 (Yahoo の応答 it-xxxxx など) を本文に出す (旧実装は畳まれた「詳細」の JSON の中だけだった)
+      const note = document.createElement('div');
+      note.className = 'small mt-2';
+      note.textContent = String(data.error);
+      wrap.appendChild(note);
     }
     main.replaceChildren(wrap);
     rawPre.textContent = JSON.stringify(data, null, 2);
@@ -1242,6 +1275,221 @@ function dlSection(title, items) {
   return sec;
 }
 
+// ───── 確定値の表示と入力 (2026-10-22、方針案 20260914 D-2〜D-5) ─────
+//   楽天の値は「候補を読み込む」で欄に入れるだけ。出品に使うのは「この値で確定」を押した値だけ。
+//   商品登録ハブで確定した商品は読み取り専用 (値はハブで直す)。
+function yen(v) { return v !== null && v !== undefined && v !== '' ? '¥' + Number(v).toLocaleString() : null; }
+
+function buildConfirmSection(data) {
+  const sec = el('div', { className: 'drawer-section' });
+  const n = data.notion;
+  const conf = data.confirmed || {};
+  const labels = conf.sourceLabels || {};
+  sec.appendChild(el('h6', { text: '📝 確定値 (Yahoo!に送る値)' }));
+
+  if (n) {
+    const srcLine = el('div', { className: 'small mb-2' });
+    srcLine.appendChild(el('span', {
+      className: 'badge ' + (n.value_source === 'legacy_notion' ? 'bg-secondary' : 'bg-success'),
+      text: labels[n.value_source] || n.value_source || '?',
+    }));
+    const when = n.value_source === 'legacy_notion'
+      ? ' 最終同期 ' + (n.synced_at || '?') + ' (確定日時は記録なし)'
+      : ' ' + (n.confirmed_at || '') + ' / ' + (n.confirmed_by || '') + ' / 版 ' + (n.version || '?');
+    srcLine.appendChild(document.createTextNode(when));
+    sec.appendChild(srcLine);
+    const dl = el('dl');
+    const rows = [
+      ['Yahoo!タイトル', n.yahoo_title],
+      ['売価', yen(n.yahoo_price)],
+      ['佐川売価', n.sagawa_mode === 'same' ? '通常売価と同額' : yen(n.yahoo_price_sagawa)],
+      ['配送方法', n.notion_delivery_label],
+      ['税率', n.notion_tax_rate ? String(n.notion_tax_rate).replace(/%$/, '') + '%' : null],
+      ['Yahoo!カテゴリ / 店の棚', n.notion_product_category ? (n.notion_product_category + ' / ' + (n.notion_path || '')) : '(紐付け画面の辞書で解決)'],
+    ];
+    for (const [k, v] of rows) {
+      dl.appendChild(el('dt', { text: k }));
+      dl.appendChild(el('dd', { text: v === null || v === undefined || v === '' ? '(未確定)' : String(v) }));
+    }
+    sec.appendChild(dl);
+  } else {
+    sec.appendChild(el('div', { className: 'text-muted small mb-2', text: 'まだ確定値がありません。下の欄で確定すると出品できるようになります。' }));
+  }
+
+  if (conf.readOnly) {
+    const box = el('div', { className: 'alert alert-info small py-2 mb-0' });
+    box.appendChild(document.createTextNode('この商品は商品登録ハブで確定しています。値を変えるときはハブの商品詳細で直して「Yahoo!移行に確定」を押してください。 '));
+    if (conf.portalUrl) {
+      const a = el('a', { text: '商品登録ハブで開く ↗' });
+      a.href = conf.portalUrl; a.target = '_blank'; a.rel = 'noopener';
+      box.appendChild(a);
+    }
+    sec.appendChild(box);
+    return sec;
+  }
+
+  const details = el('details');
+  details.open = !n;
+  details.appendChild(el('summary', { className: 'small fw-semibold', text: n ? '✏️ 値を確定し直す' : '✏️ 値を入れて確定する' }));
+  const form = el('div', { className: 'mt-2' });
+  form.appendChild(buildConfirmForm(data));
+  details.appendChild(form);
+  sec.appendChild(details);
+  return sec;
+}
+
+function buildConfirmForm(data) {
+  const n = data.notion || {};
+  const conf = data.confirmed || {};
+  const wrap = el('div', { className: 'small' });
+  const field = (label, input, hint) => {
+    const d = el('div', { className: 'mb-2' });
+    d.appendChild(el('label', { className: 'form-label mb-0', text: label }));
+    d.appendChild(input);
+    if (hint) d.appendChild(hint);
+    return d;
+  };
+  const inp = (type, value) => {
+    const i = el('input', { className: 'form-control form-control-sm' });
+    i.type = type;
+    if (value !== null && value !== undefined) i.value = String(value);
+    return i;
+  };
+  const hintEl = () => el('div', { className: 'text-muted', text: '' });
+
+  const title = inp('text', n.yahoo_title);
+  const titleHint = hintEl();
+  const updTitleHint = () => { titleHint.textContent = title.value.length + ' 字 (送るときは 65 字に切り詰めます)'; };
+  title.addEventListener('input', updTitleHint); updTitleHint();
+  wrap.appendChild(field('Yahoo!タイトル', title, titleHint));
+
+  const price = inp('number', n.yahoo_price); price.min = '1'; price.step = '1';
+  const priceHint = hintEl();
+  wrap.appendChild(field('Yahoo!売価 (税込・円)', price, priceHint));
+
+  const delivery = el('select', { className: 'form-select form-select-sm' });
+  delivery.appendChild(new Option('(選んでください)', ''));
+  const opts = conf.deliveryOptions || [];
+  for (const o of opts) delivery.appendChild(new Option(o.label + (o.applies_sagawa_price ? ' (佐川売価の対象)' : ''), o.label));
+  delivery.value = n.notion_delivery_label && opts.some((o) => o.label === n.notion_delivery_label) ? n.notion_delivery_label : '';
+  const deliveryHint = hintEl();
+  wrap.appendChild(field('配送方法', delivery, deliveryHint));
+
+  // 佐川売価 (対象の配送方法のときだけ出す): 「佐川売価を入れる」か「通常売価と同額」を明示的に選ぶ (D-2)
+  const sagawaBox = el('div', { className: 'mb-2 ps-2 border-start' });
+  const radioName = 'sagawa-mode-' + Math.random().toString(36).slice(2);
+  const mkRadio = (value, text) => {
+    const l = el('label', { className: 'form-check-label me-3' });
+    const r = el('input', { className: 'form-check-input me-1' });
+    r.type = 'radio'; r.name = radioName; r.value = value;
+    l.appendChild(r); l.appendChild(document.createTextNode(text));
+    return { l, r };
+  };
+  const rPrice = mkRadio('price', '佐川売価を入れる');
+  const rSame = mkRadio('same', '通常売価と同額');
+  const sagawaPrice = inp('number', n.yahoo_price_sagawa); sagawaPrice.min = '1'; sagawaPrice.step = '1';
+  sagawaBox.appendChild(el('div', { className: 'form-label mb-0', text: '佐川売価' }));
+  sagawaBox.appendChild(rPrice.l); sagawaBox.appendChild(rSame.l);
+  sagawaBox.appendChild(sagawaPrice);
+  if (n.sagawa_mode === 'same') rSame.r.checked = true;
+  else if (n.yahoo_price_sagawa) rPrice.r.checked = true;
+  wrap.appendChild(sagawaBox);
+  const updSagawa = () => {
+    const o = opts.find((x) => x.label === delivery.value);
+    sagawaBox.style.display = o && o.applies_sagawa_price ? '' : 'none';
+    sagawaPrice.disabled = !rPrice.r.checked;
+  };
+  delivery.addEventListener('change', updSagawa);
+  rPrice.r.addEventListener('change', updSagawa); rSame.r.addEventListener('change', updSagawa);
+  updSagawa();
+
+  const tax = el('select', { className: 'form-select form-select-sm' });
+  tax.appendChild(new Option('(選んでください)', ''));
+  tax.appendChild(new Option('10%', '10'));
+  tax.appendChild(new Option('8% (軽減税率)', '8'));
+  const curTax = String(n.notion_tax_rate || '').replace(/%$/, '');
+  tax.value = curTax === '10' || curTax === '8' ? curTax : '';
+  const taxHint = hintEl();
+  wrap.appendChild(field('税率', tax, taxHint));
+
+  const cat = inp('text', n.notion_product_category); cat.inputMode = 'numeric';
+  const path = inp('text', n.notion_path);
+  wrap.appendChild(field('Yahoo!カテゴリID (任意)', cat));
+  wrap.appendChild(field('店の棚 path (任意・カテゴリIDと両方入れる)', path,
+    el('div', { className: 'text-muted', text: '両方空なら「カテゴリを紐付ける」画面の辞書で決まります' })));
+
+  const msg = el('div', { className: 'mt-2' });
+  const btnRow = el('div', { className: 'd-flex gap-2 flex-wrap' });
+  const btnCand = el('button', { className: 'btn btn-outline-secondary btn-sm', text: '🛒 楽天の値を候補として読み込む' });
+  btnCand.type = 'button';
+  const btnSave = el('button', { className: 'btn btn-primary btn-sm', text: '✅ この値で確定' });
+  btnSave.type = 'button';
+  btnRow.appendChild(btnCand); btnRow.appendChild(btnSave);
+  wrap.appendChild(btnRow);
+  wrap.appendChild(msg);
+  const showMsg = (cls, text) => { msg.className = 'mt-2 small ' + cls; msg.textContent = text; };
+
+  // 空の欄だけ埋める (人が入れた値を候補で上書きしない)。候補の値は欄の下に必ず出す
+  btnCand.addEventListener('click', async () => {
+    btnCand.disabled = true;
+    showMsg('text-muted', '楽天 RMS から読んでいます...');
+    try {
+      const res = await fetch('/apps/rakuten-yahoo-sync/api/products/' + encodeURIComponent(data.itemCode) + '/confirm-candidates');
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || !j.ok) { showMsg('text-danger', '読めませんでした: ' + (j.error || ('HTTP ' + res.status))); return; }
+      if (!j.candidates) { showMsg('text-danger', '楽天の値を読めませんでした: ' + (j.rakutenError || '不明')); return; }
+      const c = j.candidates;
+      if (!title.value && c.yahoo_title) { title.value = c.yahoo_title; updTitleHint(); }
+      if (!price.value && c.yahoo_price) price.value = String(c.yahoo_price);
+      if (!delivery.value && c.delivery_label) { delivery.value = c.delivery_label; updSagawa(); }
+      if (!tax.value && c.tax_rate) tax.value = c.tax_rate;
+      priceHint.textContent = c.yahoo_price ? '楽天の候補: ¥' + Number(c.yahoo_price).toLocaleString() + ' (表示中の SKU の最安値)' : '楽天の候補: なし';
+      deliveryHint.textContent = c.rakutenShippingMixed ? '楽天の候補: SKU ごとに配送方法が違うので候補なし'
+        : (c.rakutenShippingGroupName ? '楽天の配送方法: ' + c.rakutenShippingGroupName + (c.delivery_label ? ' → ' + c.delivery_label : ' (対応する Yahoo!の配送方法が決まっていません。選んでください)') : '楽天の候補: なし');
+      taxHint.textContent = c.tax_rate ? '楽天の税率: ' + c.tax_rate + '%' : '';
+      showMsg('text-success', '空の欄に楽天の値を入れました。中身を確かめてから「この値で確定」を押してください (押すまでは出品に使いません)');
+    } catch (e) {
+      showMsg('text-danger', '通信エラー: ' + e.message);
+    } finally {
+      btnCand.disabled = false;
+    }
+  });
+
+  btnSave.addEventListener('click', async () => {
+    const sagawaMode = sagawaBox.style.display === 'none' ? null : (rSame.r.checked ? 'same' : (rPrice.r.checked ? 'price' : ''));
+    const values = {
+      yahoo_title: title.value, yahoo_price: price.value, delivery_label: delivery.value,
+      sagawa_mode: sagawaMode, yahoo_price_sagawa: sagawaMode === 'price' ? sagawaPrice.value : null,
+      tax_rate: tax.value, product_category: cat.value, path: path.value,
+    };
+    const summary = [
+      'この値で確定します (出品に使うのはこの値です):',
+      '・タイトル: ' + values.yahoo_title,
+      '・売価: ¥' + values.yahoo_price,
+      '・配送方法: ' + values.delivery_label + (sagawaMode === 'same' ? ' (佐川売価 = 通常売価と同額)' : (sagawaMode === 'price' ? ' (佐川売価 ¥' + values.yahoo_price_sagawa + ')' : '')),
+      '・税率: ' + values.tax_rate + '%',
+    ].join('\n');
+    if (!confirm(summary)) return;
+    btnSave.disabled = true;
+    showMsg('text-muted', '保存しています...');
+    try {
+      const res = await fetch('/apps/rakuten-yahoo-sync/api/products/' + encodeURIComponent(data.itemCode) + '/confirm', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ values, expectedVersion: conf.row ? conf.row.version : null }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || !j.ok) { showMsg('text-danger', '確定できませんでした: ' + (j.error || ('HTTP ' + res.status))); return; }
+      showMsg('text-success', j.changed ? '確定しました。出品前チェックを取り直しています (数十秒で一覧に反映)' : '同じ値で確定済みです (変更なし)');
+      setTimeout(() => fetchDetailAndRender(data.itemCode), 800);
+    } catch (e) {
+      showMsg('text-danger', '通信エラー: ' + e.message);
+    } finally {
+      btnSave.disabled = false;
+    }
+  });
+  return wrap;
+}
+
 function buildDetailContent(data) {
   const frag = fragment();
 
@@ -1251,8 +1499,11 @@ function buildDetailContent(data) {
     const ycr = data.yahooCategoryResolved || {};
     const ycrLabel = (() => {
       if (!ycr.category) return '(未解決)';
-      const src = ycr.source === 'notion' ? '✓ 確定値 (旧 Notion から引き継ぎ)' :
+      const src = ycr.source === 'notion' ? '✓ 確定値' :
+                  ycr.source === 'manual' ? '✓ 紐付け画面で保存' :
+                  ycr.source === 'decisions' ? '📊 出品実績から' :
                   ycr.source === 'learned' ? '🤖 自動推定 (sample=' + (ycr.sampleCount || '?') + ')' :
+                  ycr.source === 'ai' ? '🤖 AI の初期紐付け' :
                   ycr.source;
       return ycr.category + ' / ' + (ycr.path || '(path 無し)') + ' [' + src + ']';
     })();
@@ -1277,22 +1528,8 @@ function buildDetailContent(data) {
     frag.appendChild(el('div', { className: 'drawer-section text-muted small', text: '⚠ migration_candidates に登録なし (orphan 扱い)' }));
   }
 
-  // 確定値 = 旧 Notion から引き継いだ notion_overrides (2026-09-14 の Notion 廃止後は増えない。入力欄は PR 2)
-  if (data.notion) {
-    frag.appendChild(dlSection('📝 確定値 (旧 Notion から引き継ぎ)', [
-      ['Yahoo!タイトル', data.notion.yahoo_title],
-      ['売価', data.notion.yahoo_price !== null && data.notion.yahoo_price !== undefined ? '¥' + Number(data.notion.yahoo_price).toLocaleString() : null],
-      ['佐川価格', data.notion.yahoo_price_sagawa !== null && data.notion.yahoo_price_sagawa !== undefined ? '¥' + Number(data.notion.yahoo_price_sagawa).toLocaleString() : null],
-      ['配送方法', data.notion.notion_delivery_label],
-      ['税率', data.notion.notion_tax_rate],
-      ['Yahoo!カテゴリ (確定値)', data.notion.notion_product_category || '(未入力)'],
-      ['Yahoo!path (確定値)', data.notion.notion_path || '(未入力)'],
-      ['旧 Notion ステータス', data.notion.notion_status],
-      ['最終取込日時 (旧 Notion・以後更新なし)', data.notion.synced_at],
-    ]));
-  } else {
-    frag.appendChild(el('div', { className: 'drawer-section', html: '<h6>📝 確定値</h6><div class="text-muted small">(確定値なし — 旧 Notion に該当行が無かった商品。入力欄は準備中)</div>' }));
-  }
+  // 確定値 (2026-10-22〜: このアプリで確定 / 商品登録ハブで確定 / 旧 Notion から継承) + 入力フォーム
+  frag.appendChild(buildConfirmSection(data));
 
   // Yahoo 観測
   if (data.yahoo) {
@@ -1493,8 +1730,15 @@ async function pollBulkBatch(batchId) {
   while (true) {
     try {
       const res = await fetch('/apps/rakuten-yahoo-sync/api/publish/bulk/' + batchId + '?withItems=1');
-      const data = await res.json();
-      if (!data.batch) break;
+      const data = await res.json().catch(() => ({}));
+      // 2026-10-22: セッション切れ (401) や 500 で batch が返らないとき、閉じるボタンが無効のまま
+      //   全画面のモーダルから抜けられなかった → 理由を出して閉じられるようにする
+      if (!res.ok || !data.batch) {
+        document.getElementById('bulkPublishProgressText').textContent = '進捗を読めませんでした: '
+          + (data.error || ('HTTP ' + res.status)) + ' (登録は裏で続いている可能性があります。画面を読み直して確かめてください)';
+        document.querySelector('.js-close-bulk-publish-modal').disabled = false;
+        break;
+      }
       setBulkProgress(data.batch);
       // Phase E-9: poll 毎に items を更新 (running も含む)
       for (const it of (data.items || [])) updateBulkResultRow(it);
@@ -1523,7 +1767,11 @@ async function executeBulkPublish() {
   try {
     const res = await fetch('/apps/rakuten-yahoo-sync/api/publish/bulk/start', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ itemCodes, triggeredBy: 'manual' }),
+      body: JSON.stringify({
+        itemCodes, triggeredBy: 'manual',
+        // 一覧で見た確定値の版 (出品の直前に違えばその商品は止める)
+        valueTokens: Object.fromEntries(itemCodes.map((c) => [c, valueTokenOfCard(c)]).filter(([, t]) => t)),
+      }),
     });
     const data = await res.json();
     if (!res.ok || !data.batchId) {
@@ -1916,7 +2164,7 @@ async function refreshAll(evt) {
         alert('全部更新が完了しました。\n'
           + '・新しい移行候補: ' + (s.full_sync?.candidatesNew ?? '?') + ' 件\n'
           + '・ジャンル取得: ' + (s.genre_backfill?.updated ?? '?') + ' 件\n'
-          + '・Notion 連携: 廃止のためスキップ (確定値は更新されません)\n'
+          + '・Notion 連携: 廃止のためスキップ (確定値は商品詳細 / 商品登録ハブで入れます)\n'
           + '・出品前チェック: 出せる ' + (s.readiness_check?.okCount ?? '?') + ' 件 / 要修正 ' + (s.readiness_check?.blockedCount ?? '?') + ' 件\n\n'
           + 'ページを再読み込みします。');
         location.reload();

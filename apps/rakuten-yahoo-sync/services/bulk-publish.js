@@ -20,6 +20,52 @@ import { summarizeReasons } from '../lib/reason-translator.js';
 
 function isoNow() { return new Date().toISOString(); }
 
+/**
+ * 2026-10-22: 途中で止まった batch の片付け。
+ *   旧実装は batch を裏で回すだけで、途中で Render が再起動 (master への push の自動デプロイ等) すると
+ *   status='running' のまま残り、部分 UNIQUE INDEX (running は 1 件) のせいで以後の一括登録・失敗の再実行・
+ *   全件再登録が全部 409 になって、DB を手で直すまで止まっていた。
+ *   このプロセスが回している batch は ACTIVE_BATCHES に持つ。それ以外の running で、最後の動き (batch の開始・
+ *   item の開始/終了) から STALE_BATCH_MS 経った batch は止まったものとみなして aborted にする。
+ *   STALE_BATCH_MS は出品 1 件のロック (publish-executor の LEASE_TTL_MS = 30 分) + 余裕 — デプロイの切り替え中に
+ *   古いプロセスがまだ回している batch を、新しいプロセスが早まって閉じないように。
+ */
+const ACTIVE_BATCHES = new Set();
+export const STALE_BATCH_MS = 35 * 60 * 1000;
+
+export function recoverStaleBatches(db, { now = Date.now() } = {}) {
+  const rows = db.prepare(`
+    SELECT b.batch_id,
+           MAX(b.started_at, COALESCE(MAX(i.started_at), ''), COALESCE(MAX(i.finished_at), '')) AS last_activity
+      FROM bulk_publish_batches b
+      LEFT JOIN bulk_publish_batch_items i ON i.batch_id = b.batch_id
+     WHERE b.status = 'running'
+     GROUP BY b.batch_id
+  `).all();
+  let recovered = 0;
+  for (const r of rows) {
+    if (ACTIVE_BATCHES.has(Number(r.batch_id))) continue;
+    const last = Date.parse(r.last_activity || '');
+    if (Number.isFinite(last) && now - last < STALE_BATCH_MS) continue;
+    db.transaction(() => {
+      const msg = '中断 (アプリの再起動などで一括登録が途中で止まりました。この商品は登録されていない可能性があります — 「失敗中を再実行」で出し直せます)';
+      const left = db.prepare(`
+        UPDATE bulk_publish_batch_items SET status = 'failed', publish_status = COALESCE(publish_status, 'aborted'),
+               error_message = COALESCE(error_message, ?), finished_at = ?
+         WHERE batch_id = ? AND status IN ('pending', 'running')
+      `).run(msg, new Date(now).toISOString(), r.batch_id).changes;
+      db.prepare(`
+        UPDATE bulk_publish_batches SET status = 'aborted', finished_at = ?,
+               failed = failed + ?, in_progress = 0
+         WHERE batch_id = ? AND status = 'running'
+      `).run(new Date(now).toISOString(), left, r.batch_id);
+    })();
+    console.warn(`[bulk-publish] 止まっていた batch ${r.batch_id} を aborted にしました (最後の動き ${r.last_activity})`);
+    recovered++;
+  }
+  return recovered;
+}
+
 function insertBatch(db, { total, triggeredBy }) {
   const r = db.prepare(`
     INSERT INTO bulk_publish_batches (total, in_progress, status, triggered_by, started_at)
@@ -91,7 +137,7 @@ function resolveManageNumber(db, itemCode, codeMappingCache) {
  * 返り値: { status, publishStatus, idempotencyKey?, error? }
  *   - status: 'success' / 'failed' / 'skipped' / 'dedupe' / 'flag_off' / 'readiness_blocked'
  */
-async function publishOneItem({ db, itemCode, batchItemId, codeMappingCache }) {
+async function publishOneItem({ db, itemCode, batchItemId, codeMappingCache, expectedValueToken }) {
   markItemRunning(db, batchItemId);
   try {
     // Codex R1 Critical: manageNumber を resolve してから executePublish へ
@@ -109,6 +155,7 @@ async function publishOneItem({ db, itemCode, batchItemId, codeMappingCache }) {
     const result = await executePublish({
       db, itemCode, manageNumber,
       createdBy: 'bulk',
+      expectedValueToken,
     });
     // Codex R1 Medium-5: not_implemented を success にすると dashboard 集計が done 扱いしない、 'skipped' に正規化。
     let normalized;
@@ -149,7 +196,7 @@ async function publishOneItem({ db, itemCode, batchItemId, codeMappingCache }) {
  *
  * @returns {{ batchId: number, total: number }}
  */
-export function startBulkPublish({ db, itemCodes, triggeredBy = 'manual' }) {
+export function startBulkPublish({ db, itemCodes, triggeredBy = 'manual', valueTokens = null }) {
   if (!Array.isArray(itemCodes) || itemCodes.length === 0) {
     const err = new Error('startBulkPublish: itemCodes must be a non-empty array');
     err.statusCode = 400;
@@ -174,10 +221,13 @@ export function startBulkPublish({ db, itemCodes, triggeredBy = 'manual' }) {
   // kill-switch dual check: bulk endpoint も RYS_PUBLISH_ENABLED=0 で fail-fast
   // (executor 側でも check するが、 早期に 403 を返すのが UX 上良い)
   if (!isPublishEnabled()) {
-    const err = new Error('RYS_PUBLISH_ENABLED=0: real publish is disabled (kill-switch)');
+    const err = new Error('本番スイッチが OFF (RYS_PUBLISH_ENABLED=0) なので一括登録はできません。1 商品ずつの「🧪 登録テスト」で出品前チェックだけ試せます');
     err.statusCode = 403;
     throw err;
   }
+
+  // 途中で止まった batch が running のまま残っていたら先に片付ける (残っていると UNIQUE INDEX で永久に 409)
+  recoverStaleBatches(db);
 
   // batch + items を 1 transaction で作る (race 対策、 UNIQUE INDEX は別 batch を防ぐ)
   const setupTx = db.transaction(() => {
@@ -187,6 +237,7 @@ export function startBulkPublish({ db, itemCodes, triggeredBy = 'manual' }) {
     return { batchId, batchItemIds };
   });
   const { batchId, batchItemIds } = setupTx();
+  ACTIVE_BATCHES.add(Number(batchId));
 
   // Codex R1 Critical: 背景実行の冒頭で 楽天 itemNumber→manageNumber マップを 1 回だけ取得 (cache)。
   // 各 item の publishOneItem 内で cache + jobs.payload_json fallback で resolve。
@@ -204,7 +255,8 @@ export function startBulkPublish({ db, itemCodes, triggeredBy = 'manual' }) {
     // 背景で順次実行 (Render は同一プロセス、 fire-and-forget OK、 失敗は batch_items + audit に記録)
     for (let i = 0; i < cleaned.length; i++) {
       try {
-        const result = await publishOneItem({ db, itemCode: cleaned[i], batchItemId: batchItemIds[i], codeMappingCache });
+        const tok = valueTokens && typeof valueTokens[cleaned[i]] === 'string' ? valueTokens[cleaned[i]] : undefined;
+        const result = await publishOneItem({ db, itemCode: cleaned[i], batchItemId: batchItemIds[i], codeMappingCache, expectedValueToken: tok });
         if (result.status === 'success' || result.status === 'dedupe') {
           updateBatchProgress(db, batchId, { success: 1 });
           success++;
@@ -226,31 +278,58 @@ export function startBulkPublish({ db, itemCodes, triggeredBy = 'manual' }) {
     // 想定外: batch を aborted で閉じる
     try { finishBatch(db, batchId, 'aborted'); } catch (_) {}
     console.error('[bulk-publish] unexpected error:', e);
+  }).finally(() => {
+    ACTIVE_BATCHES.delete(Number(batchId));
   });
 
   return { batchId, total: cleaned.length };
 }
 
 /**
- * publish_idempotency.status='failed' な item を最新順に N 件返す。
- *   一度 success がある item は除く (再実行不要)。
- *   Codex R1 Medium-3: GROUP BY item_code + MAX(rowid) で 「item 毎の最新 failed」 を正しく取る。
+ * **いちばん新しい試行が failed** の item を新しい順に N 件返す。
+ *   2026-10-22: 旧実装は「一度でも success があれば除く」だったので、全件再登録 (楽天リンク除去の反映) で
+ *   失敗した商品 (過去に一度は成功している) が再実行の対象から漏れ、楽天リンクが Yahoo に残ったままになった。
+ *   最新の試行で判定すれば、成功のあとに失敗した商品も拾え、失敗のあとに成功した商品は拾わない。
+ *   除外中・手で Yahoo に出した商品は executePublish 側 (publishTargetGuard) で止まる。
  */
 export function listFailedItemCodes(db, { limit = 100 } = {}) {
-  return db.prepare(`
-    SELECT item_code, MAX(rowid) AS latest_rowid
-    FROM publish_idempotency
-    WHERE status='failed'
-      AND item_code NOT IN (
-        SELECT item_code FROM publish_idempotency WHERE status='success'
-      )
-    GROUP BY item_code
-    ORDER BY latest_rowid DESC
+  const failed = db.prepare(`
+    SELECT p.item_code, p.rowid AS latest_rowid
+    FROM publish_idempotency p
+    JOIN (SELECT item_code, MAX(rowid) AS max_rowid FROM publish_idempotency GROUP BY item_code) l
+      ON l.item_code = p.item_code AND l.max_rowid = p.rowid
+    WHERE p.status = 'failed'
+    ORDER BY p.rowid DESC
     LIMIT ?
   `).all(limit).map((r) => r.item_code);
+  // 一括登録が中断 (recoverStaleBatches) で終わった商品も拾う (Codex 指摘)。
+  //   未着手の商品は publish_idempotency に行が無く、途中だった商品は in_progress のままなので、上の条件では漏れる。
+  //   「その商品のいちばん新しい一括の記録が中断」かつ「成功していない」ものだけ。途中だった商品の出品の行は
+  //   lease (30 分) が切れていれば executePublish が引き継ぐので、二重に出ない (同じ idempotency key)
+  let aborted = [];
+  try {
+    aborted = db.prepare(`
+      SELECT bi.item_code
+      FROM bulk_publish_batch_items bi
+      JOIN (SELECT item_code, MAX(id) AS max_id FROM bulk_publish_batch_items GROUP BY item_code) lb
+        ON lb.item_code = bi.item_code AND lb.max_id = bi.id
+      WHERE bi.publish_status = 'aborted'
+        -- 中断の「あと」に成功していないもの (全件再登録の中断なら、過去に成功していても拾う — Codex R2)
+        AND NOT EXISTS (
+          SELECT 1 FROM publish_idempotency p
+           WHERE p.item_code = bi.item_code AND p.status = 'success'
+             AND COALESCE(p.completed_at, p.updated_at, p.created_at) >= bi.finished_at
+        )
+      ORDER BY bi.id DESC
+      LIMIT ?
+    `).all(limit).map((r) => r.item_code);
+  } catch (_) { /* migration 009 未適用 */ }
+  return [...new Set([...failed, ...aborted])].slice(0, limit);
 }
 
 export function getBatchStatus(db, batchId) {
+  // 進捗を見ている画面が、止まった batch を running のまま待ち続けないように
+  try { recoverStaleBatches(db); } catch (e) { console.warn('[bulk-publish] recoverStaleBatches failed:', e.message); }
   return db.prepare(`
     SELECT batch_id, total, succeeded, failed, in_progress, status, triggered_by, started_at, finished_at
     FROM bulk_publish_batches WHERE batch_id = ?
@@ -267,6 +346,7 @@ export function getBatchItems(db, batchId) {
 }
 
 export function getRunningBatch(db) {
+  try { recoverStaleBatches(db); } catch (e) { console.warn('[bulk-publish] recoverStaleBatches failed:', e.message); }
   return db.prepare(`
     SELECT batch_id, total, succeeded, failed, in_progress, started_at
     FROM bulk_publish_batches WHERE status='running'

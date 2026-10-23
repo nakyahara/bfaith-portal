@@ -68,10 +68,11 @@ export function extractRakutenGenre(item) {
  *   rakuten_manage_number があるものだけ (楽天 RMS で再取得可能なもの)。
  */
 export function countMissingRakutenGenre(db) {
+  // stale (楽天で見えなくなった候補) は数えない — 楽天から読めないので埋まらない (2026-10-22)
   return db.prepare(`
     SELECT COUNT(*) AS n
     FROM migration_candidates
-    WHERE status IN ('candidate', 'stale')
+    WHERE status = 'candidate'
       AND (rakuten_genre_id IS NULL OR rakuten_genre_id = '')
       AND rakuten_manage_number IS NOT NULL
       AND rakuten_manage_number <> ''
@@ -109,14 +110,19 @@ export async function backfillRakutenGenre({ db, limit = DEFAULT_BATCH_LIMIT, dr
     return { picked: 0, updated: 0, stillNull: 0, failed: 0, errors: ['genre_columns_missing'] };
   }
 
+  // 2026-10-22: 「まだ試していない → 試したのが古い」順 (migration 025)。stale は対象外 (楽天から読めない)
+  const hasAttemptCol = (() => {
+    try { db.prepare('SELECT genre_backfill_attempted_at FROM migration_candidates LIMIT 0').get(); return true; }
+    catch (_) { return false; }
+  })();
   const targets = db.prepare(`
     SELECT item_code, rakuten_manage_number
     FROM migration_candidates
-    WHERE status IN ('candidate', 'stale')
+    WHERE status = 'candidate'
       AND (rakuten_genre_id IS NULL OR rakuten_genre_id = '')
       AND rakuten_manage_number IS NOT NULL
       AND rakuten_manage_number <> ''
-    ORDER BY first_detected_at ASC
+    ORDER BY ${hasAttemptCol ? '(genre_backfill_attempted_at IS NOT NULL), genre_backfill_attempted_at,' : ''} first_detected_at ASC
     LIMIT ?
   `).all(limit);
 
@@ -133,6 +139,13 @@ export async function backfillRakutenGenre({ db, limit = DEFAULT_BATCH_LIMIT, dr
   const manageNumbers = Array.from(itemCodesByMn.keys());
 
   const { items, failed } = await _bulk(manageNumbers);
+
+  // 試した印 (埋まらなかった行が次回も先頭に来ないように)
+  if (!dryRun && hasAttemptCol) {
+    const ids = targets.map((t) => t.item_code);
+    db.prepare(`UPDATE migration_candidates SET genre_backfill_attempted_at = ? WHERE item_code IN (${ids.map(() => '?').join(',')})`)
+      .run(isoNow(), ...ids);
+  }
 
   let updated = 0;
   let stillNull = 0;

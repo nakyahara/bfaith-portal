@@ -1375,6 +1375,17 @@ th.attr-unknown { color: #dc2626; }
     </div>
     </div>
     <button class="btn btn-primary" id="save-yahoo-btn">Yahoo!項目を保存</button>
+    <%# 2026-10-22: Notion 廃止後の Yahoo!移行への引き継ぎ (RYS 方針案 20260914 D-5)。
+        押したときだけ移行アプリの確定値になる (保存しただけでは引き継がない)。出品は移行アプリの画面で行う %>
+    <div id="rys-confirm-box" style="margin-top:14px; padding:10px 12px; border:1px dashed #94a3b8; border-radius:8px; background:#f8fafc;">
+      <div style="font-weight:600; font-size:13px;">🔁 楽天→Yahoo!移行への引き継ぎ</div>
+      <div class="muted" style="font-size:12px; margin:4px 0 8px;">
+        Yahoo!タイトル・売価・配送方法・税率を移行アプリへ渡します。押すまでは渡りません。確定した後にこの画面の値を変えたら、もう一度確定してください
+        (移行アプリは確定した値で出品します)。出品は <a href="/apps/rakuten-yahoo-sync" target="_blank" rel="noopener">楽天→Yahoo!移行</a> の画面で行います。
+      </div>
+      <button class="btn btn-sm" id="rys-preview-btn" type="button">送る内容を確認</button>
+      <div id="rys-preview" style="font-size:12px; margin-top:8px;"></div>
+    </div>
   </div>
   </div><!-- /tab-basic -->
 
@@ -6357,6 +6368,77 @@ th.attr-unknown { color: #dc2626; }
     if (json.ok && phKeep) phKeep.saved(snap);
     showAndReload(json, 'Yahoo!項目を保存しました');
   }));
+
+  // ─── 楽天→Yahoo!移行への引き継ぎ (2026-10-22) ───
+  //   「送る内容を確認」で組み立てた値を見せ、「この内容で確定」はその値をそのまま送り返す
+  //   (サーバーは組み立て直して一致しなければ 409 = 確認した内容と違う値を確定しない)
+  (function () {
+    const btn = document.getElementById('rys-preview-btn');
+    const box = document.getElementById('rys-preview');
+    if (!btn || !box) return;
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const yen = (v) => (v == null || v === '' ? '—' : '¥' + Number(v).toLocaleString());
+    const KEYS = ['yahoo_title', 'yahoo_price', 'delivery_label', 'sagawa_mode', 'yahoo_price_sagawa', 'tax_rate', 'product_category', 'path'];
+    const same = (a, b) => !!a && !!b && KEYS.every((k) => (a[k] ?? null) === (b[k] ?? null));
+    const rowsHtml = (v) => [
+      ['Yahoo!タイトル', esc(v.yahoo_title) || '—'],
+      ['売価', yen(v.yahoo_price)],
+      ['配送方法', esc(v.delivery_label) || '—'],
+      ['佐川売価', v.sagawa_mode === 'same' ? '通常売価と同額' : (v.sagawa_mode === 'price' ? yen(v.yahoo_price_sagawa) : '対象外')],
+      ['税率', v.tax_rate ? esc(v.tax_rate) + '%' : '—'],
+      ['カテゴリ / path', v.product_category ? esc(v.product_category) + ' / ' + esc(v.path) : '(移行アプリの紐付け辞書で決める)'],
+    ].map(([k, x]) => '<tr><th style="text-align:left; padding:2px 8px 2px 0; font-weight:500; white-space:nowrap;">' + k + '</th><td>' + x + '</td></tr>').join('');
+    async function load(sagawaSame) {
+      btn.disabled = true;
+      box.textContent = '確認しています...';
+      try {
+        const res = await fetch(BASE + '/yahoo-confirm' + (sagawaSame ? '?sagawa_same=1' : ''));
+        const j = await res.json().catch(() => ({}));
+        if (!res.ok || !j.ok) { box.textContent = '確認できませんでした: ' + (j.error || ('HTTP ' + res.status)); return; }
+        render(j.preview, sagawaSame);
+      } catch (e) {
+        box.textContent = '通信エラー: ' + e.message;
+      } finally { btn.disabled = false; }
+    }
+    function render(p, sagawaSame) {
+      let html = '';
+      if (p.rys) {
+        const srcLabel = p.rys.source === 'portal' ? 'この画面 (商品登録ハブ) で確定済み' : '移行アプリで確定済み (ここで確定すると、以後はこの画面の値が正になります)';
+        html += '<div style="margin-bottom:6px;">いまの移行アプリの値: <b>' + esc(srcLabel) + '</b> 版 ' + esc(p.rys.version) + ' / ' + esc(p.rys.confirmedAt) + ' / ' + esc(p.rys.confirmedBy)
+          + (same(p.values, p.rys.values) ? ' — <span style="color:#15803d;">この画面の値と同じです</span>' : ' — <span style="color:#b45309;">この画面の値と違います (確定すると下の値に置き換わります)</span>') + '</div>';
+      } else {
+        html += '<div style="margin-bottom:6px;">移行アプリにはまだ確定値がありません。</div>';
+      }
+      html += '<table style="font-size:12px; margin-bottom:6px;">' + rowsHtml(p.values) + '</table>';
+      if (p.reasons && p.reasons.length) {
+        html += '<div style="color:#b91c1c;">このままでは確定できません:<ul style="margin:2px 0 0 18px;">' + p.reasons.map((r) => '<li>' + esc(r) + '</li>').join('') + '</ul></div>';
+      }
+      if (p.needsSagawaChoice) {
+        html += '<div style="color:#b45309; margin:4px 0;">この配送方法は佐川売価の対象ですが、Yahoo!売価 (佐川の場合) が空です。入れるか、通常売価と同額で出すかを選んでください。'
+          + ' <button class="btn btn-sm" type="button" id="rys-sagawa-same">通常売価と同額で出す</button></div>';
+      }
+      if (p.ok) html += '<button class="btn btn-sm btn-primary" type="button" id="rys-confirm-btn">この内容で Yahoo!移行に確定</button>';
+      box.innerHTML = html;
+      const sameBtn = document.getElementById('rys-sagawa-same');
+      if (sameBtn) sameBtn.addEventListener('click', () => load(true));
+      const cBtn = document.getElementById('rys-confirm-btn');
+      if (cBtn) cBtn.addEventListener('click', async () => {
+        cBtn.disabled = true;
+        try {
+          const j = await post(BASE + '/yahoo-confirm', {
+            expectedValues: p.values, expectedVersion: p.rys ? p.rys.version : null, sagawa_same: !!sagawaSame,
+          });
+          if (!j.ok) { alert('確定できませんでした: ' + (j.error || '')); cBtn.disabled = false; return; }
+          box.insertAdjacentHTML('afterbegin', '<div style="color:#15803d; font-weight:600; margin-bottom:6px;">' + (j.changed ? '確定しました (版 ' + esc(j.version) + ')。移行アプリの出品前チェックを取り直しています' : '同じ内容で確定済みです (変更なし)') + '</div>');
+          cBtn.remove();
+        } catch (e) {
+          alert('通信エラー: ' + e.message);
+          cBtn.disabled = false;
+        }
+      });
+    }
+    btn.addEventListener('click', () => load(false));
+  })();
 
   // ─── Yahoo!売価・配送方法のゲート (2026-08-06 中原さん指示) ───
   // 通常は楽天と同じ配送・売価で出すため入力不可。基本情報の配送方法で

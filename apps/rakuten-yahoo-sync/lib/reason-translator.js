@@ -7,8 +7,9 @@
  * 設計原則 (Codex E-6 UX 議論 確定):
  *   - 「何が悪い」 より 「どこを直す」 を先に
  *   - 確定値のどの項目を直すかを明示 (notionField = 項目名。2026-09-14 の Notion 廃止後も
- *     キー名は互換のため据え置き。「確定値」= 旧 Notion から引き継いだ notion_overrides の値。
- *     入力欄は PR 2 (ドロワー手入力) / PR 3 (商品登録ハブ) で用意する)
+ *     キー名・reason コード (notion_*) は互換のため据え置き — jobs に保存済みの理由も読めるように)。
+ *     「確定値」= 商品詳細の「この値で確定」/ 商品登録ハブの「Yahoo!移行に確定」で入れた値
+ *     (無ければ旧 Notion から継承した値)。直す場所 = 商品カードを押して開く商品詳細
  *   - 厳しい色 (赤) より「直してね」 トーン
  */
 
@@ -24,7 +25,7 @@ export function translateReason(rawReason) {
   const head = rawReason.split(':')[0];
   switch (head) {
     case 'notion_title_missing':
-      return { message: 'Yahoo!タイトルが未入力です (確定値なし)', notionField: 'Yahoo!タイトル', severity: 'must' };
+      return { message: 'Yahoo!タイトルが確定していません。商品詳細の「この値で確定」で入れてください', notionField: 'Yahoo!タイトル', severity: 'must' };
     case 'notion_title_too_long':
       return { message: 'Yahoo!タイトルが 65 字を超えています', notionField: 'Yahoo!タイトル', severity: 'must' };
     case 'product_category_unresolved':
@@ -32,21 +33,23 @@ export function translateReason(rawReason) {
     case 'path_unresolved':
       return { message: '店の棚 (path) が未設定です。「🏷️ カテゴリ紐付け画面」で棚を選んでください (実績のある棚 or 楽天カテゴリに合わせる)', notionField: 'Yahoo!path', severity: 'must' };
     case 'notion_category_partial':
-      return { message: '確定値の Yahoo!カテゴリID と Yahoo!path のどちらか片方しか入っていません。 両方そろえてください (片方だけだと自動推定との混在を避けるため publish が止まります)', notionField: 'Yahoo!カテゴリID', severity: 'must' };
+      return { message: '確定値の Yahoo!カテゴリID と店の棚 (path) のどちらか片方しか入っていません。商品詳細で両方入れるか両方空にして確定し直してください', notionField: 'Yahoo!カテゴリID', severity: 'must' };
     case 'price_invalid_or_zero':
-      return { message: '売価が未入力、 または 0 円です', notionField: '売価', severity: 'must' };
+      return { message: 'Yahoo!売価が確定していません (楽天の値は自動では使いません)。商品詳細で「楽天の値を候補として読み込む」→「この値で確定」', notionField: '売価', severity: 'must' };
+    case 'sagawa_price_unconfirmed':
+      return { message: '佐川売価の対象の配送方法です。商品詳細で「佐川売価を入れる」か「通常売価と同額」を選んで確定してください', notionField: '売価', severity: 'must' };
     case 'delivery_mapping_unresolved':
-      return { message: '配送方法が Yahoo 用に変換できません (確定値の配送方法が未入力か、対応表に無い値です)', notionField: '配送方法', severity: 'must' };
+      return { message: '配送方法が確定していません (または対応表に無い値です)。商品詳細で選んで確定してください', notionField: '配送方法', severity: 'must' };
     case 'delivery_value_invalid':
       return { message: '配送方法の値が想定外です', notionField: '配送方法', severity: 'must' };
     case 'postage_set_out_of_range':
       return { message: '配送方法の設定が Yahoo の範囲外です', notionField: '配送方法', severity: 'must' };
     case 'notion_tax_rate_missing':
-      return { message: '税率が未入力です (確定値なし)', notionField: '税率', severity: 'must' };
+      return { message: '税率が確定していません。商品詳細で 10% / 8% を選んで確定してください', notionField: '税率', severity: 'must' };
     case 'notion_tax_rate_ref_error':
       return { message: '税率の値が壊れています (#REF!)', notionField: '税率', severity: 'must' };
     case 'notion_tax_rate_unknown_value':
-      return { message: '税率の値が想定外です', notionField: '税率', severity: 'must' };
+      return { message: '税率の値が想定外です。商品詳細で 10% / 8% を選んで確定し直してください', notionField: '税率', severity: 'must' };
     case 'rakuten_tax_rate_missing':
       return { message: '楽天側の税率が取得できません', notionField: null, severity: 'check' };
     case 'rakuten_tax_rate_invalid':
@@ -70,7 +73,11 @@ export function translateReason(rawReason) {
     case 'variation_result_missing':
       return { message: 'バリエーション情報の解析に失敗しました', notionField: null, severity: 'must' };
     case 'variation_conflict':
-      return { message: 'バリエーション情報に矛盾があります (確定値の「バリエーション有無」と楽天が食い違っています)', notionField: 'バリエーション有無', severity: 'must' };
+      return { message: 'バリエーション情報に矛盾があります (旧 Notion の「バリエーション有無」と今の楽天が食い違っています)。楽天が正しければ、商品詳細で確定し直すと解消します', notionField: 'バリエーション有無', severity: 'must' };
+    case 'variant_sku_id_empty':
+      return { message: 'バリエーションの SKU に楽天の「システム連携用SKU番号」が入っていません。楽天RMSで入れてください (Yahoo のバリエーションコードに使います)', notionField: 'バリエーション', severity: 'must' };
+    case 'variant_sku_id_invalid_format':
+      return { message: 'バリエーションの「システム連携用SKU番号」に Yahoo で使えない文字があります。楽天RMSで半角英数字と - (ハイフン) だけにしてください', notionField: 'バリエーション', severity: 'must' };
     case 'variation_subcode_errors':
       return { message: 'バリエーションの商品コード形式に問題があります', notionField: 'バリエーション', severity: 'must' };
     case 'lead_time_preflight_not_run':
@@ -99,7 +106,7 @@ export function translateReason(rawReason) {
     }
     case 'variation_option_invalid_char': {
       const detail = rawReason.slice(head.length + 1);
-      return { message: `バリエーションの項目名/選択肢に Yahoo で使えない記号が含まれています (${detail})。 楽天側の表記から | ; : & = # 引用符 を外してください`, notionField: null, severity: 'must' };
+      return { message: `バリエーションの項目名/選択肢に Yahoo で使えない記号が含まれています (${detail})。 楽天側の表記から | ; : & = # , (半角カンマ) 引用符 を外してください (全角なら使えます)`, notionField: null, severity: 'must' };
     }
     case 'variation_combo_duplicate': {
       const detail = rawReason.slice(head.length + 1);
@@ -115,6 +122,18 @@ export function translateReason(rawReason) {
       return { message: '楽天に この商品コードが存在しません', notionField: null, severity: 'must' };
     case 'persist_failed':
       return { message: '内部状態の保存に失敗しました', notionField: null, severity: 'must' };
+    case 'image_patterns_load_failed':
+      return { message: '画像の除外パターンを読み込めませんでした (一時的な障害の可能性。少し待ってもう一度)', notionField: null, severity: 'check' };
+    case 'caller_category_partial':
+      return { message: 'カテゴリID と店の棚 (path) は両方指定してください (呼び出し側の指定が片方だけでした)', notionField: null, severity: 'check' };
+    case 'migration_excluded':
+      return { message: 'この商品は移行除外に入っています。出品するなら除外を解除してください', notionField: null, severity: 'must' };
+    case 'removed_from_yahoo':
+      return { message: 'この商品は以前 Yahoo!に出ていて、Yahoo!側で削除されています (別の商品コードへ移した可能性)。出し直すかは管理者が確認してください', notionField: null, severity: 'must' };
+    case 'value_version_changed':
+      return { message: '画面を開いた後に確定値が変わりました (別の人が確定し直した)。画面を読み直して値を確かめてから出品してください', notionField: null, severity: 'must' };
+    case 'already_on_yahoo':
+      return { message: 'この商品は既に Yahoo!に出ています (移行済み)。出し直すなら「全件再登録」から', notionField: null, severity: 'must' };
     default:
       // Codex E-6 R1 Medium-2: 未知 reason は内部用語をそのまま出さない
       //   業務担当者に文脈不明な英語 reason を見せない、 管理者向け詳細は別途 (details モーダル) で出す。

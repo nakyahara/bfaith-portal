@@ -42,9 +42,10 @@ export function rewriteAndSanitizeYahooHtml(rakutenHtml, urlMap, { allowedYahooH
   if (!hasImg) {
     return sanitizeProductHtml(s); // img 無し → 通常 sanitize (img 削除モード) で問題なし
   }
-  if (!allowedYahooHosts || !Array.isArray(allowedYahooHosts) || allowedYahooHosts.length === 0) {
-    throw new YahooHtmlRewriteError('allowedYahooHosts is required (non-empty array) when HTML contains <img>');
-  }
+  // 2026-10-22: 許可 host が空でも、<img> が全部「意図的な除外」(クーポン・レビュー等) なら消すだけで通す。
+  //   旧実装はここで先に throw しており、説明文の画像が除外対象だけの商品は毎回出品に失敗していた。
+  //   Yahoo の URL に置き換える必要がある <img> が出てきた時点で、許可 host が無ければ止める (下の loop)
+  const hosts = Array.isArray(allowedYahooHosts) ? allowedYahooHosts : [];
 
   const map = urlMap instanceof Map ? urlMap : new Map(Object.entries(urlMap || {}));
   const excludedSet = new Set(excludedRakutenUrls);
@@ -68,9 +69,12 @@ export function rewriteAndSanitizeYahooHtml(rakutenHtml, urlMap, { allowedYahooH
       return;
     }
     // Yahoo URL を既に入れてある場合 (再 publish 等) も pass through
-    if (allowedYahooHosts.some((h) => normalized.includes(`://${h.toLowerCase()}`))) {
+    if (hosts.some((h) => normalized.includes(`://${h.toLowerCase()}`))) {
       $el.attr('src', normalized);
       return;
+    }
+    if (hosts.length === 0) {
+      throw new YahooHtmlRewriteError('allowedYahooHosts is required (non-empty array) when HTML contains <img> to rewrite', { rakutenUrl: normalized });
     }
     const yahooUrl = map.get(normalized);
     if (!yahooUrl) {
@@ -85,5 +89,7 @@ export function rewriteAndSanitizeYahooHtml(rakutenHtml, urlMap, { allowedYahooH
   const rewritten = $('root').html() || '';
 
   // 2. sanitize (img を許可、 Yahoo host のみ)
-  return sanitizeProductHtml(rewritten, { allowImgFromHosts: allowedYahooHosts });
+  // 置き換えた <img> が無ければ (全部除外で消えた) 通常の sanitize (img 削除モード)
+  if (hosts.length === 0) return sanitizeProductHtml(rewritten);
+  return sanitizeProductHtml(rewritten, { allowImgFromHosts: hosts });
 }

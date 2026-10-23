@@ -20,6 +20,9 @@ import { shouldUseSagawaPrice } from './delivery-resolver.js';
 
 export const YAHOO_TITLE_MAX_LEN = 65;
 
+/** 確定値の税率 → Yahoo editItem の taxrate_type (readiness-check の TAX_RATE_MAP と同じ書式を受ける) */
+export const YAHOO_TAXRATE_TYPE = Object.freeze({ '10': 0.1, '10%': 0.1, '8': 0.08, '8%': 0.08 });
+
 export const FIXED_FIELDS = Object.freeze({
   cross_border_agency_flag: 1,
   template: 'IT03',
@@ -83,12 +86,33 @@ export function pickRakutenMinPrice(rakutenItem) {
   return Math.min(...prices);
 }
 
-export function resolvePrice({ notionOverride, deliveryRow, rakutenItem }) {
-  if (notionOverride && shouldUseSagawaPrice(deliveryRow, notionOverride.yahoo_price_sagawa)) {
-    return notionOverride.yahoo_price_sagawa;
+/**
+ * 出品する売価 = **人が確定した金額だけ** (2026-10-22、方針案 20260914 D-2)。
+ *
+ * 旧実装は Yahoo 売価が空だと楽天の最安値へ黙って fallback し、佐川売価が空でも通常売価へ黙って
+ * 進んでいた (7/2 の「楽天値の無断自動採用はしない」がコードに入っていなかった)。今は:
+ *   - 売価が無い → null (出品前チェックが price_invalid_or_zero で止める)。楽天の値は画面の「候補」に出すだけ
+ *   - 佐川売価の対象の配送方法 (applies_sagawa_price=1):
+ *       佐川売価がある → それ / sagawa_mode='same' (通常売価と同額を明示) → 通常売価 / どちらでもない → null
+ *       (旧 Notion から継承した値で佐川売価が空のものは、ここで止まる = ドロワーで確定し直す)
+ * rakutenItem は呼び出し互換のため受け取るが使わない。
+ */
+export function resolvePrice({ notionOverride, deliveryRow } = {}) {
+  if (!notionOverride) return null;
+  const normal = notionOverride.yahoo_price > 0 ? notionOverride.yahoo_price : null;
+  if (deliveryRow && deliveryRow.applies_sagawa_price === 1) {
+    if (shouldUseSagawaPrice(deliveryRow, notionOverride.yahoo_price_sagawa)) return notionOverride.yahoo_price_sagawa;
+    if (notionOverride.sagawa_mode === 'same') return normal;
+    return null;
   }
-  if (notionOverride?.yahoo_price > 0) return notionOverride.yahoo_price;
-  return pickRakutenMinPrice(rakutenItem);
+  return normal;
+}
+
+/** 佐川売価の対象の配送方法なのに、佐川売価も「同額」の選択も無い (= 確定できていない) */
+export function isSagawaPriceUnconfirmed({ notionOverride, deliveryRow } = {}) {
+  if (!notionOverride || !deliveryRow || deliveryRow.applies_sagawa_price !== 1) return false;
+  if (shouldUseSagawaPrice(deliveryRow, notionOverride.yahoo_price_sagawa)) return false;
+  return notionOverride.sagawa_mode !== 'same';
 }
 
 export function mapKeepStock(rakutenItem) {
@@ -129,8 +153,8 @@ export function buildYahooEditItemFields({
   const ytRaw = notionOverride?.yahoo_title || '';
   fields.name = ytRaw ? truncateYahooTitle(ytRaw, { maxLen: YAHOO_TITLE_MAX_LEN }) : '';
 
-  // price
-  const price = resolvePrice({ notionOverride, deliveryRow, rakutenItem });
+  // price (確定した金額だけ。楽天の値へは fallback しない — D-2)
+  const price = resolvePrice({ notionOverride, deliveryRow });
   if (price !== null && price > 0) fields.price = price;
 
   // delivery / postage_set
@@ -195,6 +219,12 @@ export function buildYahooEditItemFields({
   //   plain 化 + truncate 済みの resolvedHeadline を代入。
   if (resolvedHeadline) fields.headline = resolvedHeadline;
   if (notionOverride?.yahoo_jan) fields.jan = String(notionOverride.yahoo_jan);
+
+  // 税率 (2026-10-22): Yahoo editItem の taxrate_type (0.1 = 10% / 0.08 = 軽減 8%)。省略すると 0.1 扱い。
+  //   旧実装は出品前チェックで確定値と楽天の税率の一致まで確かめていたのに、この欄を送っておらず、
+  //   軽減税率 8% の商品が Yahoo では 10% で登録されていた (公式仕様: developer.yahoo.co.jp editItem)。
+  const taxRate = YAHOO_TAXRATE_TYPE[String(notionOverride?.notion_tax_rate ?? '').trim()];
+  if (taxRate !== undefined) fields.taxrate_type = taxRate;
 
   // 楽天 features 由来 flags
   const features = rakutenItem.features || {};

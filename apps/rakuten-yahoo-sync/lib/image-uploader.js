@@ -44,6 +44,16 @@ export function normalizeRakutenImageUrl(loc, { shopSlug = null } = {}) {
   if (typeof loc !== 'string') return null;
   const s = loc.trim();
   if (!s) return null;
+  // 2026-10-22: 古い説明文によくある http:// の楽天画像は https に直す。旧実装はそのまま通し、
+  //   ダウンロードの安全確認 (https の楽天 host だけ) で「楽天 host ではありません」になって毎回出品が失敗していた。
+  //   楽天以外の http は直さない (安全確認でそのまま弾く)
+  if (/^http:\/\//i.test(s)) {
+    try {
+      const u = new URL(s);
+      if (isRakutenImageHost(u.hostname)) { u.protocol = 'https:'; return u.toString(); }
+    } catch (_) { /* 下でそのまま返す */ }
+    return s;
+  }
   if (/^https?:\/\//i.test(s)) return s;
   if (/^\/\//.test(s)) return 'https:' + s;
   if (s.startsWith('/')) {
@@ -133,36 +143,38 @@ async function downloadImage(initialUrl, timeoutMs = DEFAULT_DOWNLOAD_TIMEOUT_MS
   return Buffer.concat(chunks.map((c) => Buffer.from(c)));
 }
 
+/**
+ * JPEG にする。透過のある PNG / GIF は白い背景に重ねてから (2026-10-22)。
+ * 旧実装は flatten していなかったので、透過部分が黒くなっていた (sharp の既定)。
+ */
+function toJpeg(rawBuffer, quality, { resize = false } = {}) {
+  let p = sharp(rawBuffer).rotate();
+  if (resize) p = p.resize({ width: 2000, height: 2000, fit: 'inside', withoutEnlargement: true });
+  return p.flatten({ background: '#ffffff' }).jpeg({ quality }).toBuffer();
+}
+
 async function toJpegUnderLimit(rawBuffer, { maxBytes = MAX_BYTES } = {}) {
   // 1st pass: 元解像度 + quality 85 → 50 で 5 step 圧縮
   let quality = 85;
   let out;
   try {
-    out = await sharp(rawBuffer).rotate().jpeg({ quality }).toBuffer();
+    out = await toJpeg(rawBuffer, quality);
   } catch (e) {
     throw new ImageUploadError(`jpeg convert failed: ${e.message}`, { cause: e });
   }
   while (out.length > maxBytes && quality > 50) {
     quality = Math.max(50, quality - 10);
-    out = await sharp(rawBuffer).rotate().jpeg({ quality }).toBuffer();
+    out = await toJpeg(rawBuffer, quality);
     if (quality === 50) break;
   }
   if (out.length <= maxBytes) return { buffer: out, quality };
 
   // 2nd pass: 長辺 2000px に resize + quality 80 → 50 で再試行 (Codex E-5b R1 M-2: floor 50 厳守 + resize 後も段階圧縮)
   let q2 = 80;
-  out = await sharp(rawBuffer)
-    .rotate()
-    .resize({ width: 2000, height: 2000, fit: 'inside', withoutEnlargement: true })
-    .jpeg({ quality: q2 })
-    .toBuffer();
+  out = await toJpeg(rawBuffer, q2, { resize: true });
   while (out.length > maxBytes && q2 > 50) {
     q2 = Math.max(50, q2 - 10);
-    out = await sharp(rawBuffer)
-      .rotate()
-      .resize({ width: 2000, height: 2000, fit: 'inside', withoutEnlargement: true })
-      .jpeg({ quality: q2 })
-      .toBuffer();
+    out = await toJpeg(rawBuffer, q2, { resize: true });
     if (q2 === 50) break;
   }
   if (out.length > maxBytes) {
@@ -199,18 +211,39 @@ const DESC_MAX = 20;
 // Codex Phase E image-html R5 H-1: SSRF 防御. download 対象は **https: + 楽天 host のみ**。
 //   楽天 cabinet 画像は `image.rakuten.co.jp` か `*.r10s.jp` ドメイン。
 //   外部 URL や内部向け (localhost / 169.254.169.254 等) は弾く。
-const ALLOWED_DOWNLOAD_HOSTS_SUFFIX = ['.rakuten.co.jp', '.r10s.jp'];
+// 2026-10-22: www.rakuten.ne.jp/gold/ (楽天 GOLD = 店舗の独自 HTML 置き場) も楽天の画像。旧実装は弾いて出品が失敗していた
+const ALLOWED_DOWNLOAD_HOSTS_SUFFIX = ['.rakuten.co.jp', '.r10s.jp', '.rakuten.ne.jp'];
+
+function isRakutenImageHost(hostname) {
+  const host = String(hostname || '').toLowerCase();
+  // hostname が rakuten.co.jp / r10s.jp / rakuten.ne.jp の subdomain か exact match
+  return ALLOWED_DOWNLOAD_HOSTS_SUFFIX.some((suffix) => {
+    const s = suffix.startsWith('.') ? suffix.slice(1) : suffix;
+    return host === s || host.endsWith(suffix);
+  });
+}
 
 function isAllowedDownloadUrl(url) {
   if (typeof url !== 'string') return false;
   let u;
   try { u = new URL(url); } catch (_) { return false; }
   if (u.protocol !== 'https:') return false;
-  const host = u.hostname.toLowerCase();
-  // hostname が rakuten.co.jp / r10s.jp の subdomain か exact match
-  return ALLOWED_DOWNLOAD_HOSTS_SUFFIX.some((suffix) => {
-    const s = suffix.startsWith('.') ? suffix.slice(1) : suffix;
-    return host === s || host.endsWith(suffix);
+  return isRakutenImageHost(u.hostname);
+}
+
+/**
+ * 楽天 images[] の GOLD 画像 (type='GOLD') は location が GOLD のフォルダからの相対パス。
+ * normalizeRakutenImageUrl は相対パスを cabinet の URL にするので、GOLD は先に完全 URL にしておく
+ * (旧実装は GOLD でも cabinet の URL を組み立てて 404 になっていた。mercari-sync/mapper.js と同じ組み立て)
+ */
+function resolveGoldImages(rakutenImages, { shopSlug = null } = {}) {
+  if (!Array.isArray(rakutenImages)) return rakutenImages;
+  const slug = (shopSlug || process.env.RAKUTEN_SHOP_SLUG || 'b-faith').trim();
+  return rakutenImages.map((img) => {
+    if (!img || typeof img !== 'object') return img;
+    const loc = typeof img.location === 'string' ? img.location.trim() : '';
+    if (String(img.type || '').toUpperCase() !== 'GOLD' || !loc || /^(https?:)?\/\//i.test(loc)) return img;
+    return { ...img, location: `https://image.rakuten.co.jp/${slug}/gold${loc.startsWith('/') ? '' : '/'}${loc}` };
   });
 }
 
@@ -243,7 +276,7 @@ export async function uploadRakutenImagesToYahoo({
 
   // 1. main 画像: filter + normalize + dedupe + host check (順序保持)
   //    R5 H-1: 楽天 host 以外の URL は弾く (SSRF 防御)
-  const filtered = filterUploadableImageUrls(rakutenImages, { customPatterns });
+  const filtered = filterUploadableImageUrls(resolveGoldImages(rakutenImages), { customPatterns });
   const mainUrls = [];
   const seen = new Set();
   for (const raw of filtered) {
@@ -371,3 +404,6 @@ async function uploadLibOne(rakutenUrl, fileName, itemCode, libUrlMap, allowedYa
   } catch (_) { /* malformed URL, skip host allowlist */ }
   console.log(`[rys-upload lib] item=${itemCode} file=${fileName} OK → ${result.yahooUrl}`);
 }
+
+// テスト用 (透過の白背景化の確認)
+export { toJpeg as _toJpegForTest, isAllowedDownloadUrl as _isAllowedDownloadUrlForTest, resolveGoldImages as _resolveGoldImagesForTest };

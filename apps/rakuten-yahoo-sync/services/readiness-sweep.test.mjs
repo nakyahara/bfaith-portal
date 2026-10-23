@@ -28,6 +28,10 @@ function setupDb() {
       item_code TEXT NOT NULL,
       status TEXT NOT NULL
     );
+    CREATE TABLE jobs (
+      item_code TEXT PRIMARY KEY,
+      last_readiness_at TEXT
+    );
   `);
   return db;
 }
@@ -45,6 +49,29 @@ test('対象抽出: candidate のみ (excluded / 登録済 / publish成功 は�
   db.prepare("INSERT INTO publish_idempotency (item_code, status) VALUES ('d', 'success')").run();
   const targets = pickSweepTargets(db);
   assert.deepEqual(targets.map((t) => t.item_code), ['a']);
+});
+
+test('2026-10-22: 未検査 → 検査が古い順に拾う (先頭 N 件だけを毎回見続けない)', () => {
+  const db = setupDb();
+  seed(db, [['a', 'a'], ['b', 'b'], ['c', 'c'], ['d', 'd']]);
+  db.prepare("INSERT INTO jobs (item_code, last_readiness_at) VALUES ('a', '2026-10-21T00:00:00Z'), ('b', '2026-10-01T00:00:00Z'), ('c', NULL)").run();
+  assert.deepEqual(pickSweepTargets(db, { limit: 3 }).map((t) => t.item_code), ['c', 'd', 'b']);
+});
+
+test('2026-10-22: 楽天から読めなかった (基盤の障害) が過半数なら成功扱いにしない', async () => {
+  const db = setupDb();
+  seed(db, [['a', 'a'], ['b', 'b'], ['c', 'c']]);
+  await assert.rejects(sweepReadiness({
+    db, deps: { sleepMs: 0, evaluateItemForPublish: async ({ itemCode }) => (itemCode === 'a'
+      ? { status: 'ok', reasons: [] }
+      : { status: 'blocked', reasons: ['rakuten_fetch_failed:proxy 502'] }) },
+  }), /過半数/);
+  // 商品の状態で止まったもの (タイトル未確定など) は障害に数えない
+  const r = await sweepReadiness({
+    db, deps: { sleepMs: 0, evaluateItemForPublish: async () => ({ status: 'blocked', reasons: ['notion_title_missing', 'rakuten_fetch_failed:x'] }) },
+  });
+  assert.equal(r.infraBlocked, 0);
+  assert.equal(r.blockedCount, 3);
 });
 
 test('除外の復元済 (restored_at あり) は対象に戻る', () => {

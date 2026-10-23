@@ -181,6 +181,9 @@ import {
 import { masterLegacyGate, legacyBannerHtml, legacyNewKindNoticeHtml, refuseLegacyNewKind, checkLegacyGate, legacyHandler, legacyWriteFence, respondIfLegacyAborted } from '../../lib/master-legacy-gate.mjs';
 import { resolveCdbDraftTax } from './services/cdb-tax-rate.mjs';
 import { resolveListingTax } from './services/listing-tax.mjs';
+import { buildYahooConfirmPreview, confirmYahooFromPortal, ConfirmError as YahooConfirmError } from './services/yahoo-confirm.mjs';
+import { reevaluateAfterConfirm } from '../rakuten-yahoo-sync/services/confirm-followup.js';
+import { getDB as getRysDB } from '../rakuten-yahoo-sync/db.js';
 import { compareJanUnits, janUnitsForDraftId, boardJanMarks, parseBoardDraftIds, janWarningsOf, readCdbJans, JAN_READ_DEADLINE_MS } from './services/cdb-jan-compare.mjs';
 // 🆕 0090 表示の項目を商品マスタと比べる (Company DB構想 27 ④-2・読むだけ)
 import { compareDraftLabels } from './services/cdb-label-compare.mjs';
@@ -1483,6 +1486,52 @@ router.post('/api/drafts/:id/yahoo', (req, res) => {
   });
   logEvent(db, draft.id, 'yahoo_updated', null, actorOf(req));
   res.json({ ok: true });
+});
+
+// ─── API: 楽天→Yahoo!移行 (RYS) への確定 (2026-10-22、RYS 方針案 20260914 D-5) ─────────────
+//   Notion 廃止後の新商品の入口。GET = 送る内容の確認 (書かない) / POST = 確認した内容で確定。
+//   確定した値は RYS の確定値の表へ入り、以後 RYS では読み取り専用。出品そのものは RYS の画面で行う
+//   (入力と出品の権限を分ける — ここで出品はしない)
+
+router.get('/api/drafts/:id/yahoo-confirm', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  try {
+    const p = await buildYahooConfirmPreview(getDB(), draft, { sagawaSame: req.query.sagawa_same === '1' });
+    res.json({ ok: true, preview: p });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String((e && e.message) || e) });
+  }
+});
+
+router.post('/api/drafts/:id/yahoo-confirm', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const b = req.body || {};
+  const ev = b.expectedVersion;
+  const expectedVersion = ev === null || ev === undefined || ev === '' ? null : Number(ev);
+  if (expectedVersion !== null && !Number.isInteger(expectedVersion)) {
+    return res.status(400).json({ ok: false, error: 'expectedVersion が不正です (画面を読み直してください)' });
+  }
+  const actor = actorOf(req);
+  if (!actor) return res.status(401).json({ ok: false, error: 'ログインし直してください' });
+  try {
+    const db = getDB();
+    const r = await confirmYahooFromPortal(db, draft, {
+      actor, expectedValues: b.expectedValues || null, expectedVersion, sagawaSame: b.sagawa_same === true,
+    });
+    if (r.changed) {
+      logEvent(db, draft.id, 'yahoo_confirmed_to_rys', `版 ${r.row?.version} / ${r.values.yahoo_title} / ¥${r.values.yahoo_price} / ${r.values.delivery_label} / 税${r.values.tax_rate}%`, actor);
+      // 移行アプリの出品前チェックを取り直す (候補に居れば。待たない)
+      reevaluateAfterConfirm(getRysDB(), r.manageNumber).catch(() => {});
+    }
+    res.json({ ok: true, changed: r.changed, version: r.row?.version ?? null, manageNumber: r.manageNumber });
+  } catch (e) {
+    if (e instanceof YahooConfirmError) {
+      return res.status(e.statusCode).json({ ok: false, code: e.code, error: e.message, errors: e.errors });
+    }
+    res.status(500).json({ ok: false, error: String((e && e.message) || e) });
+  }
 });
 
 /**

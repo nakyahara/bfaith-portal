@@ -18,6 +18,7 @@
 import crypto from 'crypto';
 import { evaluateItemForPublish } from './publish-pipeline.js';
 import { applyAucFreespaceFallback } from './field-mapper.js';
+import { loadConfirmedValues, valueTokenOf } from './confirmed-values.js';
 import { stripEcmpanBlocks } from '../lib/rakuten-link-sanitizer.js';
 import { callEditItem, YahooProxyError } from '../lib/yahoo-publish-proxy.js';
 import { uploadRakutenImagesToYahoo } from '../lib/image-uploader.js';
@@ -282,10 +283,38 @@ function audit(db, action, detail, { actor = 'http', result = 'success', errorMe
  * @param {object} [opts.publishOpts]      evaluateItemForPublish に渡す extras
  * @returns {Promise<{status, idempotencyKey, dedupe?, fields?, reasons?, executorResult?, error?}>}
  */
+/**
+ * 出品してはいけない商品なら理由コードを返す (出してよければ null)。
+ *   - migration_excluded: 移行除外が有効 (restored_at IS NULL)
+ *   - removed_from_yahoo: Yahoo で見えていた商品が消えた (yahoo_removed_items)。別コードへ移した可能性があるので出さない
+ *   - already_on_yahoo:   Yahoo で見えている商品で、このアプリで出品に成功したことが無い
+ *                         (= 手で出した / 元からある商品。上書きしない)。このアプリで出した商品の出し直し
+ *                         (全件再登録 = 楽天リンク除去の反映) は通す
+ */
+export function publishTargetGuard(db, itemCode) {
+  const has = (name) => !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?`).get(name);
+  if (has('migration_excluded')
+    && db.prepare('SELECT 1 FROM migration_excluded WHERE item_code = ? AND restored_at IS NULL').get(itemCode)) {
+    return 'migration_excluded';
+  }
+  // Yahoo 側で消えた商品 (baseline が台帳から外した) は勝手に出し直さない (別コードへ移した商品の二重出品を防ぐ)
+  if (has('yahoo_removed_items')
+    && db.prepare('SELECT 1 FROM yahoo_removed_items WHERE item_code = ?').get(itemCode)) {
+    return 'removed_from_yahoo';
+  }
+  if (has('yahoo_registered_items')
+    && db.prepare('SELECT 1 FROM yahoo_registered_items WHERE item_code = ?').get(itemCode)
+    && !db.prepare(`SELECT 1 FROM publish_idempotency WHERE item_code = ? AND status = 'success'`).get(itemCode)) {
+    return 'already_on_yahoo';
+  }
+  return null;
+}
+
 export async function executePublish({
   db, itemCode, manageNumber, createdBy = 'http',
   idempotencyKey: providedKey = null,
   publishOpts = {},
+  expectedValueToken = undefined,
 }) {
   if (!db) throw new Error('executePublish: db required');
   if (!itemCode) throw new Error('executePublish: itemCode required');
@@ -299,6 +328,27 @@ export async function executePublish({
       idempotencyKey: providedKey,
       error: 'RYS_PUBLISH_ENABLED is 0 (kill-switch). Real publish is disabled.',
     };
+  }
+
+  // 2026-10-22: 出してはいけない商品をここで止める (単品・一括・失敗の再実行・全件再登録の全部がここを通る)。
+  //   旧実装は出品の経路がどこも移行除外と Yahoo の実在を見ておらず、一度失敗した後に永続除外にした商品や
+  //   手で Yahoo に出した商品が「失敗中を再実行」で出品されていた。
+  const guardReason = publishTargetGuard(db, itemCode);
+  if (guardReason) {
+    audit(db, 'publish_execute_blocked_target', { itemCode, reason: guardReason }, { result: 'failed', errorMessage: guardReason });
+    return { status: 'readiness_blocked', idempotencyKey: providedKey, reasons: [guardReason], error: guardReason };
+  }
+
+  // 確認画面で見た確定値の版と今の版を比べる (2026-10-22、D-2 の承認版の固定)。
+  //   見た後に別の人が売価などを確定し直していたら、見ていない値で出さない。
+  //   失敗中の再実行・全件再登録は画面で値を見ていないので照合しない (= いまの確定値で出す)
+  if (expectedValueToken !== undefined && expectedValueToken !== null) {
+    const nowToken = valueTokenOf(loadConfirmedValues(db, manageNumber));
+    if (nowToken !== expectedValueToken) {
+      const reason = `value_version_changed:${expectedValueToken}->${nowToken}`;
+      audit(db, 'publish_execute_blocked_version', { itemCode, expectedValueToken, nowToken }, { result: 'failed', errorMessage: reason });
+      return { status: 'readiness_blocked', idempotencyKey: providedKey, reasons: [reason], error: reason };
+    }
   }
 
   const idempotencyKey = providedKey || buildIdempotencyKey({ itemCode, manageNumber });
@@ -460,6 +510,22 @@ export async function executePublish({
         reasons: evalResult.reasons,
         executorResult: evalResult,
       };
+    }
+
+    // 確定値の版の照合 (2 回目): 入口の照合のあと、楽天の取得を待つ間に確定し直されることがある (Codex R2)。
+    //   実際に fields を組み立てた版 (debug.value_token) で照合し、違えばここで止める (Yahoo には送らない)
+    if (expectedValueToken !== undefined && expectedValueToken !== null
+        && evalResult.debug?.value_token !== expectedValueToken) {
+      const reason = `value_version_changed:${expectedValueToken}->${evalResult.debug?.value_token ?? 'unknown'}`;
+      const finalized = finalize(db, {
+        idempotencyKey, status: 'failed', resultJson: JSON.stringify({ reasons: [reason] }),
+        errorMessage: reason, ownAttempt,
+      });
+      if (!finalized) {
+        return { status: 'lease_lost', idempotencyKey, error: 'finalize CAS failed: another caller has stolen the lease before we could write the result.' };
+      }
+      audit(db, 'publish_execute_blocked_version', { itemCode, expectedValueToken, usedToken: evalResult.debug?.value_token }, { result: 'failed', errorMessage: reason });
+      return { status: 'readiness_blocked', idempotencyKey, reasons: [reason], error: reason };
     }
 
     // Phase E-5b: 実 publish — 画像 upload → editItem 呼び出し

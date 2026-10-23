@@ -12,7 +12,9 @@
  *   - iterateMyItemList: paging + 0/1/N 件 + 暴走防止
  *   - syncYahooBaseline:
  *       (1) 初回 success → baseline 確立
- *       (2) 取りこぼし (stale_rows>0) → baseline 再確立せず、 既存 state 保持
+ *       (2) 全クエリ件数一致で 1 件見えない = Yahoo から消えた → 台帳から外して (yahoo_removed_items) baseline 確立 (2026-10-22)
+ *       (2b) 件数不一致のクエリがある回の見えない行 = 取りこぼし → 外さず baseline 再確立せず、 既存 state 保持
+ *       (2c) 見えない行が上限超え → 外さず baseline 不成立 (理由を記録)
  *       (3) env override 下では確立しない
  *       (4) failed 経路で sync_run.status='failed' + error_message 記録
  *   - assertYahooBaselineComplete:
@@ -226,10 +228,56 @@ async function testSyncYahooBaseline() {
       return { ok: true, items, totalResultsAvailable: total, totalResultsReturned: items.length, firstResultPosition: start };
     };
     const r2 = await syncYahooBaseline({ db, deps: { callApi: customMock }, triggeredBy: 'cron' });
-    expect('sync (2): stale rows detected', r2.staleRows === 1, `stale=${r2.staleRows}`);
-    expect('sync (2): does NOT re-establish baseline on stale>0', r2.establishesBaseline === false, `establishes=${r2.establishesBaseline}`);
+    // 旧実装はここで stale=1 のまま baseline 不成立 → 以後ずっと差分取得が止まっていた (2026-10-22 修正)
+    expect('sync (2): 消えた 1 件を台帳から外す', r2.prunedRows === 1 && r2.staleRows === 0, JSON.stringify({ pruned: r2.prunedRows, stale: r2.staleRows }));
+    expect('sync (2): baseline を確立し直す', r2.establishesBaseline === true, `establishes=${r2.establishesBaseline}`);
+    expect('sync (2): 外した行は yahoo_removed_items に残る', db.prepare("SELECT COUNT(*) c FROM yahoo_removed_items WHERE item_code = 'a-5'").get().c === 1);
+    expect('sync (2): 台帳から消えている', !db.prepare("SELECT 1 FROM yahoo_registered_items WHERE item_code = 'a-5'").get());
     const stateAfter = db.prepare('SELECT * FROM yahoo_baseline_state').get();
-    expect('sync (2): state preserved from prior good run', stateAfter && stateAfter.baseline_run_id === stateBefore.baseline_run_id, JSON.stringify({ before: stateBefore.baseline_run_id, after: stateAfter?.baseline_run_id }));
+    expect('sync (2): state は新しい run', stateAfter && stateAfter.baseline_run_id !== stateBefore.baseline_run_id);
+    // 次の回も止まらない
+    const r3 = await syncYahooBaseline({ db, deps: { callApi: customMock }, triggeredBy: 'cron' });
+    expect('sync (2): 次の回も確立', r3.establishesBaseline === true && r3.staleRows === 0 && r3.prunedRows === 0);
+  }
+
+  // (2b) 件数不一致のクエリがある回は取りこぼしかもしれないので外さない
+  {
+    const db = freshDb();
+    await syncYahooBaseline({ db, deps: { callApi: makeUniformMock(5) }, triggeredBy: 'cron' });
+    const stateBefore = db.prepare('SELECT * FROM yahoo_baseline_state').get();
+    const partialMock = async ({ query, offset, results }) => {
+      const total = 5;
+      const returnUpTo = query === 'a' ? 4 : 5; // 'a' は total=5 と言いながら 4 件しか返さない
+      const items = [];
+      const start = offset + 1;
+      const end = Math.min(offset + results, returnUpTo);
+      for (let i = start; i <= end; i++) items.push({ ItemCode: `${query}-${i}` });
+      return { ok: true, items, totalResultsAvailable: total, totalResultsReturned: items.length, firstResultPosition: start };
+    };
+    const r2 = await syncYahooBaseline({ db, deps: { callApi: partialMock }, triggeredBy: 'cron' });
+    expect('sync (2b): 外さない', r2.prunedRows === 0 && r2.staleRows === 1, JSON.stringify({ pruned: r2.prunedRows, stale: r2.staleRows }));
+    expect('sync (2b): baseline 再確立しない', r2.establishesBaseline === false);
+    const stateAfter = db.prepare('SELECT * FROM yahoo_baseline_state').get();
+    expect('sync (2b): state preserved from prior good run', stateAfter && stateAfter.baseline_run_id === stateBefore.baseline_run_id);
+  }
+
+  // (2c) 見えない行が上限を超えたら外さない (取得側の異常を疑う)
+  {
+    const db = freshDb();
+    await syncYahooBaseline({ db, deps: { callApi: makeUniformMock(5) }, triggeredBy: 'cron' });
+    process.env.RYS_BASELINE_PRUNE_MAX = '1';
+    const fewerMock = async ({ query, offset, results }) => {
+      const total = (query === 'a' || query === 'b') ? 4 : 5; // 2 件消える
+      const items = [];
+      const start = offset + 1;
+      const end = Math.min(offset + results, total);
+      for (let i = start; i <= end; i++) items.push({ ItemCode: `${query}-${i}` });
+      return { ok: true, items, totalResultsAvailable: total, totalResultsReturned: items.length, firstResultPosition: start };
+    };
+    const r2 = await syncYahooBaseline({ db, deps: { callApi: fewerMock }, triggeredBy: 'cron' });
+    delete process.env.RYS_BASELINE_PRUNE_MAX;
+    expect('sync (2c): 上限超えは外さない', r2.prunedRows === 0 && r2.staleRows === 2 && r2.establishesBaseline === false, JSON.stringify({ pruned: r2.prunedRows, stale: r2.staleRows }));
+    expect('sync (2c): 理由が残る', /上限/.test(r2.pruneSkippedReason || '') && /上限/.test(db.prepare('SELECT error_message FROM sync_runs WHERE id = ?').get(r2.syncRunId).error_message || ''));
   }
 
   // (3) env override → throw 412、 DB write 一切なし (Codex E-7-a R1 Critical-1)

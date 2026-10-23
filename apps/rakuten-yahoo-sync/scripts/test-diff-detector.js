@@ -305,7 +305,7 @@ async function testDetector() {
       const start = offset + 1;
       const end = Math.min(offset + results, total);
       for (let i = start; i <= end; i++) items.push({ ItemCode: `${query}-${i}` });
-      return { ok: true, items, totalResultsAvailable: total, totalResultsReturned: items.length, firstResultPosition: start };
+      return { ok: true, items, totalResultsAvailable: 5, /* 取りこぼし (件数不一致) */ totalResultsReturned: items.length, firstResultPosition: start };
     };
     await syncYahooBaseline({ db, deps: { callApi: incompleteMock }, triggeredBy: 'cron' });
     // baseline_state は前回のまま (incomplete だから establish しない)、
@@ -390,7 +390,7 @@ async function testDetector() {
       const start = offset + 1;
       const end = Math.min(offset + results, total);
       for (let i = start; i <= end; i++) items.push({ ItemCode: `${query}-${i}` });
-      return { ok: true, items, totalResultsAvailable: total, totalResultsReturned: items.length, firstResultPosition: start };
+      return { ok: true, items, totalResultsAvailable: 5, /* 取りこぼし (件数不一致) */ totalResultsReturned: items.length, firstResultPosition: start };
     };
     await syncYahooBaseline({ db, deps: { callApi: incompleteMock }, triggeredBy: 'cron' });
     // 楽天 fetch を解放
