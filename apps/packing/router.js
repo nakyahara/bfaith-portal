@@ -1056,7 +1056,12 @@ router.post('/api/guide-photos', checkOrigin, (req, res, next) => {
   if (caption.length > 100) throw new PackError(400, 'bad_caption', '一言は 100 字までにしてください');
   const batchId = /^\d{1,12}$/.test(String(req.body.batch_id || '')) ? Number(req.body.batch_id) : null;
   if (sniffImage(req.file?.buffer) !== 'jpg') throw new PackError(400, 'bad_image', '写真 (JPEG) を受け取れませんでした。撮り直してください');
-  enqueueGuidePhoto({ opId, sku, caption, worker: name, batchId, jpeg: req.file.buffer });
+  try {
+    enqueueGuidePhoto({ opId, sku, caption, worker: name, batchId, jpeg: req.file.buffer });
+  } catch (e) {
+    if (e?.code === 'request_reused') throw new PackError(409, 'request_reused', e.message);
+    throw e;
+  }
   // その場で 1 回送る (遅い = 送り待ちのまま返す。送り待ちは数分ごとに送る)
   let timer;
   const v = await Promise.race([
@@ -1064,7 +1069,7 @@ router.post('/api/guide-photos', checkOrigin, (req, res, next) => {
     new Promise((ok) => { timer = setTimeout(() => ok(null), 20_000); }),
   ]).finally(() => clearTimeout(timer));
   const st = v || { status: 'pending' };
-  res.json({ ok: st.status !== 'failed', status: st.status, position: st.position ?? null, error: st.error || null });
+  res.json({ ok: st.status !== 'failed', status: st.status, sku: st.sku ?? sku, position: st.position ?? null, error: st.error || null });
 }));
 
 // ─── 日次サマリ (管理者) ───

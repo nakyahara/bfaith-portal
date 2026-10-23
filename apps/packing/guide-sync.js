@@ -180,16 +180,23 @@ const uploadView = (r) => (r ? { op_id: r.op_id, sku: r.sku, status: r.status, p
  * jpeg = 画面が縮めた JPEG (このサーバーは作り直さない = Render が作り直す)
  */
 export function enqueueGuidePhoto({ opId, sku, caption = '', worker, batchId = null, jpeg }) {
+  const jpegSha = crypto.createHash('sha256').update(jpeg).digest('hex');
   const prev = uploadRow(opId);
-  if (prev) return uploadView(prev);
+  if (prev) {
+    // 押し直し = 同じ中身のときだけ前の行 (違う商品・写真・一言・人を「前の成功」として返さない・Codex 第 2 段階レビュー 中)
+    if (prev.sku !== sku || prev.caption !== caption || prev.worker !== worker || prev.jpeg_sha256 !== jpegSha) {
+      throw Object.assign(new Error('同じ操作の番号で、違う写真・商品・一言が来ました。撮り直してください'), { code: 'request_reused' });
+    }
+    return uploadView(prev);
+  }
   const requestId = crypto.randomUUID();
   fs.mkdirSync(GUIDE_UPLOAD_DIR, { recursive: true });
   const file = path.join(GUIDE_UPLOAD_DIR, `${requestId}.jpg`);
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, jpeg);
   fs.renameSync(tmp, file);
-  getDB().prepare(`INSERT INTO pk_pack_guide_uploads (op_id, request_id, sku, caption, worker, batch_id, file, status, created_at, next_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`).run(opId, requestId, sku, caption, worker, batchId, path.basename(file), utcNow(), utcNow());
+  getDB().prepare(`INSERT INTO pk_pack_guide_uploads (op_id, request_id, sku, caption, worker, batch_id, jpeg_sha256, file, status, created_at, next_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`).run(opId, requestId, sku, caption, worker, batchId, jpegSha, path.basename(file), utcNow(), utcNow());
   return uploadView(uploadRow(opId));
 }
 
@@ -215,8 +222,13 @@ async function sendOne(row) {
       .run(String(msg).slice(0, 300), new Date(Date.now() + wait * 60000).toISOString().slice(0, 19) + 'Z', row.op_id);
   };
   let jpeg;
-  try { jpeg = fs.readFileSync(path.join(GUIDE_UPLOAD_DIR, path.basename(row.file))); } catch {
-    db.prepare(`UPDATE pk_pack_guide_uploads SET status = 'failed', last_error = ? WHERE op_id = ?`).run('写真のファイルがありません (撮り直してください)', row.op_id);
+  try { jpeg = fs.readFileSync(path.join(GUIDE_UPLOAD_DIR, path.basename(row.file))); } catch (e) {
+    // 無い = 送れない (failed)・そのほか (EIO・アクセス拒否…) = 一時的かもしれない = 間をあけて送り直す (Codex 第 2 段階レビュー 中)
+    if (e?.code === 'ENOENT') {
+      db.prepare(`UPDATE pk_pack_guide_uploads SET status = 'failed', last_error = ? WHERE op_id = ?`).run('写真のファイルがありません (撮り直してください)', row.op_id);
+    } else {
+      later(`写真のファイルを読めない (${e?.code || e?.message || e})`);
+    }
     return uploadView(uploadRow(row.op_id));
   }
   try {

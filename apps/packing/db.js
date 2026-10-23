@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 22;
+const SCHEMA_VERSION = 23;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -604,7 +604,7 @@ const MIGRATIONS = {
     }
     db.exec("CREATE INDEX IF NOT EXISTS idx_pk_pack_tasks_returned_notify ON pk_pack_tasks(status, returned_notified_at)");
   },
-  // v22: 梱包指示の写しと、梱包の画面で撮った写真の送り待ち (中原さん 2026-10-23・正 = Render の Company DB の 0101。apps/packing/guide-sync.js)。
+  // v22: 梱包指示の写し (中原さん 2026-10-23・正 = Render の Company DB の 0101。apps/packing/guide-sync.js)。
   //   SKU ごとに 1 行 (写真の並び・一言・大きさ = photos_json・写真の中身は DATA_DIR/packing-guides/<sha256>.jpg)。
   //   丸ごと入れ替える (写真が全部そろった版だけ)。取れなくても前の写しで出し続ける (取れた時刻を画面に出す)
   22: () => {
@@ -618,9 +618,12 @@ const MIGRATIONS = {
       updated_at  TEXT,
       updated_by  TEXT
     )`);
-    // 梱包の画面のカメラで撮った写真の送り待ち (iPad → このサーバー → Render)。撮ったらすぐここに残す = 通信が切れても消えない。
-    //   request_id = Render に送る 1 枚の番号 (送り直しても 2 枚にならない)・op_id = iPad の押した 1 回 (押し直しは同じ行)
-    //   status: pending (送る) / sent (Render の Company DB に入った) / failed (断られた = 送り直さない・理由を画面に)
+  },
+  // v23: 梱包の画面のカメラで撮った写真の送り待ち (梱包指示の 2 段目・2026-10-23)。v22 とは別の版 = v22 を当てた DB にも作る (Codex 第 2 段階レビュー 高)。
+  //   iPad → このサーバー → Render。撮ったらすぐここに残す = 通信が切れても消えない。
+  //   request_id = Render に送る 1 枚の番号 (送り直しても 2 枚にならない)・op_id = iPad の押した 1 回 (押し直しは同じ行・中身が違えば断る)
+  //   status: pending (送る) / sent (Render の Company DB に入った) / failed (断られた = 送り直さない・理由を画面に)
+  23: () => {
     db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_guide_uploads (
       op_id       TEXT PRIMARY KEY,
       request_id  TEXT NOT NULL UNIQUE,
@@ -628,6 +631,7 @@ const MIGRATIONS = {
       caption     TEXT NOT NULL DEFAULT '',
       worker      TEXT NOT NULL,
       batch_id    INTEGER,
+      jpeg_sha256 TEXT NOT NULL,           -- 撮った写真の中身 (同じ op_id の押し直しが同じ写真か確かめる)
       file        TEXT NOT NULL,           -- DATA_DIR/packing-guide-uploads/<request_id>.jpg
       status      TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'sent', 'failed')),
       attempts    INTEGER NOT NULL DEFAULT 0,

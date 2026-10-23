@@ -69,6 +69,7 @@ fake.post('/api/photos', express.json({ limit: '20mb' }), (req, res) => {
   PHOTOS.set(id, buf);
   let g = manifest.guides.find((x) => x.code.toLowerCase() === String(b.code).toLowerCase());
   if (!g) { g = { code: b.code, sku_id: id, name: `撮った商品 ${b.code}`, note: '', event_id: id, photos: [] }; manifest.guides.push(g); }
+  if (g.photos.length >= 3) { PHOTOS.delete(id); return res.status(409).json({ ok: false, reason: 'photos_full', error: '写真はもう 3 枚あります。どれかを外してから足してください' }); }
   g.photos.push({ photo_id: id, sha256: sha(buf), position: g.photos.length + 1, caption: b.caption || '', width: 10, height: 10 });
   const ans = { ok: true, code: b.code, photo_id: id, position: g.photos.length, replay: false };
   seenReq.set(b.request_id, ans);
@@ -83,6 +84,16 @@ process.env.WAREHOUSE_SERVICE_TOKEN = 't';
 
 // ─── 梱包のバッチ (伝票 1 = 指示のある商品・伝票 2 = 無い商品・伝票 3 = セット (構成品 B に指示)) ───
 initPackingDB();
+// 第 1 段階 (v22) を当てた DB を更新しても送り待ちの表ができる (Codex 第 2 段階レビュー 高): v22 に戻して開き直す
+{
+  const d0 = getDB();
+  d0.exec("DROP TABLE IF EXISTS pk_pack_guide_uploads");
+  d0.prepare("UPDATE pk_pack_meta SET value = '22' WHERE key = 'schema_version'").run();
+  initPackingDB();
+  assert.ok(getDB().prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pk_pack_guide_uploads'").get(), "v22 → v23 で送り待ちの表ができる");
+  assert.equal(getDB().prepare("SELECT value FROM pk_pack_meta WHERE key = 'schema_version'").get().value, "23");
+  console.log("  ok  [M1] v22 を当てた DB → v23 で送り待ちの表ができる");
+}
 const db = getDB();
 const now = utcNow();
 db.prepare(`INSERT INTO pk_pack_batches (id, tb_key, folder_name, work_date, slip_count, line_count,
@@ -329,7 +340,77 @@ await ta('[V6] 開きっぱなしの画面: 古さは「今」から数え直す
   assert.doesNotMatch(await page.locator('.guide-box').first().innerText(), /分前に取った/, '取り直した = 新しい');
 });
 
+await ta('[U3] 同じ op_id で違う中身 = 409 (前の成功を返さない)・同じ中身 = 前の答え・ファイルが無い = failed・読めない (一時的) = 送り直す', async () => {
+  const op = 'op-u3-hhhhhhh';
+  const a = await upload({ op_id: op, sku: 'comp-a', caption: 'A', worker_name: '三宅晴菜', batch_id: '1' });
+  assert.deepEqual([a.status, a.j.status, a.j.sku], [200, 'sent', 'comp-a']);
+  const same = await upload({ op_id: op, sku: 'comp-a', caption: 'A', worker_name: '三宅晴菜', batch_id: '1' });
+  assert.deepEqual([same.status, same.j.status], [200, 'sent'], '同じ中身の押し直し = 前の答え');
+  for (const diff of [{ sku: 'sku2', caption: 'A' }, { sku: 'comp-a', caption: 'B' }]) {
+    const r = await upload({ op_id: op, ...diff, worker_name: '三宅晴菜', batch_id: '1' });
+    assert.deepEqual([r.status, r.j.code], [409, 'request_reused'], JSON.stringify(diff));
+  }
+  const other = await sharp({ create: { width: 30, height: 30, channels: 3, background: { r: 1, g: 2, b: 3 } } }).jpeg().toBuffer();
+  assert.equal((await upload({ op_id: op, sku: 'comp-a', caption: 'A', worker_name: '三宅晴菜', batch_id: '1' }, other)).status, 409, '違う写真');
+  // 送り待ちのファイル: 読めない (ディレクトリ = EISDIR・一時的と同じ扱い) = pending のまま / 無い = failed
+  postMode = 'down';
+  const t = await upload({ op_id: 'op-u3-iiiiiii', sku: 'comp-a', caption: '', worker_name: '三宅晴菜', batch_id: '1' });
+  assert.equal(t.j.status, 'pending');
+  postMode = 'ok';
+  const row = upRow('op-u3-iiiiiii');
+  const file = path.join(GS.GUIDE_UPLOAD_DIR, row.file);
+  const keep = fs.readFileSync(file);
+  fs.rmSync(file); fs.mkdirSync(file);
+  db.prepare(`UPDATE pk_pack_guide_uploads SET next_at = '2000-01-01T00:00:00Z' WHERE op_id = ?`).run(row.op_id);
+  await GS.sendGuideUploads();
+  assert.equal(upRow(row.op_id).status, 'pending', '読めない = 送り直す (止めない)');
+  assert.match(upRow(row.op_id).last_error, /読めない/);
+  fs.rmSync(file, { recursive: true }); fs.writeFileSync(file, keep);
+  db.prepare(`UPDATE pk_pack_guide_uploads SET next_at = '2000-01-01T00:00:00Z' WHERE op_id = ?`).run(row.op_id);
+  await GS.sendGuideUploads();
+  assert.equal(upRow(row.op_id).status, 'sent', '読めるようになったら送れる');
+  // 無い = failed
+  postMode = 'down';
+  await upload({ op_id: 'op-u3-jjjjjjj', sku: 'comp-a', caption: '', worker_name: '三宅晴菜', batch_id: '1' });
+  postMode = 'ok';
+  const r2 = upRow('op-u3-jjjjjjj');
+  fs.rmSync(path.join(GS.GUIDE_UPLOAD_DIR, r2.file));
+  db.prepare(`UPDATE pk_pack_guide_uploads SET next_at = '2000-01-01T00:00:00Z' WHERE op_id = ?`).run(r2.op_id);
+  await GS.sendGuideUploads();
+  assert.equal(upRow(r2.op_id).status, 'failed');
+});
+
+await ta('[V7] 古さの一言は描き直さずに今の時刻で書き直す (通信できなくても・分も進む)・送っている間は 撮り直す / やめる / 一言 を押せない', async () => {
+  await GS.pullGuides();
+  await open();
+  await goSlip(1);
+  await page.evaluate(() => { document.getElementById('paper').dataset.mark = 'keep'; });
+  await page.evaluate(() => { STATE.guideSync.okAt = new Date(Date.now() - 61 * 60000).toISOString(); updateGuideStale(); });
+  assert.match(await page.locator('[data-guide-stale]').first().innerText(), /61 分前/);
+  await page.evaluate(() => { STATE.guideSync.okAt = new Date(Date.now() - 75 * 60000).toISOString(); updateGuideStale(); });
+  assert.match(await page.locator('[data-guide-stale]').first().innerText(), /75 分前/, '分も進む');
+  assert.equal(await page.evaluate(() => document.getElementById('paper').dataset.mark), 'keep', '画面全体は描き直さない');
+  // 送っている間
+  let release;
+  const held = new Promise((r) => { release = r; });
+  await page.route('**/apps/packing/api/guide-photos', async (route) => { await held; await route.continue(); });
+  const shotFile = path.join(tmp, 'shot-v7.jpg');
+  fs.writeFileSync(shotFile, await sharp({ create: { width: 800, height: 600, channels: 3, background: { r: 90, g: 90, b: 10 } } }).jpeg().toBuffer());
+  await goSlip(2);
+  await page.locator('.guide-cam').click();
+  await page.setInputFiles('#guideCamInput', shotFile);
+  await page.waitForSelector('#guideCamOverlay', { state: 'visible' });
+  await page.locator('#guideCamOk').click();
+  for (const id of ['#guideCamOk', '#guideCamRetake', '#guideCamCancel', '#guideCamCaption']) assert.equal(await page.isDisabled(id), true, id);
+  release();
+  await page.waitForFunction(() => document.getElementById('guideCamOverlay').style.display === 'none', null, { timeout: 15000 });
+  await page.unroute('**/apps/packing/api/guide-photos');
+});
+
 await ta('[V5] 画面で撮って登録: 明細の「📷 梱包写真を登録」→ カメラ → 確かめる (一言) → 登録 → 指示の枠に出る・セットの明細 = 構成品を選ぶ', async () => {
+  // sku2 の写真を空に戻す (前の試験で足した分・Company DB と同じく 3 枚まで)
+  manifest.guides.find((g) => g.code.toLowerCase() === 'sku2').photos = [];
+  await GS.pullGuides();
   await open();
   await goSlip(2);
   assert.equal(await page.locator('.guide-cam').count(), 1);

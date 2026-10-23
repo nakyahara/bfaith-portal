@@ -599,13 +599,23 @@
       const t = Date.parse(sync.okAt || '');
       return Number.isFinite(t) ? Math.max(0, Math.floor((Date.now() - t) / 60000)) : null;
     }
+    /** 古さの一言 (古くない・取りに行かない = 空) */
+    function guideStaleText() {
+      const age = guideAgeMin();
+      if (age === undefined || (age !== null && age <= GUIDE_STALE_MIN)) return '';
+      return `⚠ 梱包指示の写しは ${age == null ? 'まだ一度も取れていません' : `${age} 分前に取ったものです`} (新しい指示が出ていないかもしれません)`;
+    }
+    /** 古さの一言だけを今の時刻で書き直す (通信できなくても・画面全体は描き直さない = スクロールも保つ・Codex 第 2 段階レビュー 中) */
+    function updateGuideStale() {
+      const t = guideStaleText();
+      for (const el of document.querySelectorAll('[data-guide-stale]')) { el.textContent = t; el.hidden = !t; }
+    }
     function guideKeysOf(s) { return [...new Set(s.lines.flatMap((l) => l.guideKeys || []))].filter((k) => GUIDES[k]); }
     function guideHtml(s) {
       const keys = guideKeysOf(s);
       if (!keys.length) return '';
-      const age = guideAgeMin();
-      const stale = age === undefined || (age !== null && age <= GUIDE_STALE_MIN) ? ''
-        : `<div class="guide-stale">⚠ 梱包指示の写しは ${age == null ? 'まだ一度も取れていません' : `${age} 分前に取ったものです`} (新しい指示が出ていないかもしれません)</div>`;
+      const t = guideStaleText();
+      const stale = `<div class="guide-stale" data-guide-stale${t ? '' : ' hidden'}>${esc(t)}</div>`;
       return keys.map((k) => {
         const g = GUIDES[k];
         const photos = (g.photos || []).map((p, i) => `
@@ -717,16 +727,23 @@
       $('guideCamOk').disabled = false;
       $('guideCamOverlay').style.display = 'flex';
     });
-    $('guideCamCancel').addEventListener('click', closeCam);
-    $('guideCamRetake').addEventListener('click', () => { $('guideCamOverlay').style.display = 'none'; startCam(camTarget); });
-    let guideSig = null;   // 前に出した指示・送り待ち・古さ (変わったときだけ描き直す = 作業中の画面をむやみに作り直さない)
+    // 送っている間は やめる・撮り直す・一言 を止める (返事が前の写真の画面を閉じて、撮り直した写真を消さない・Codex 第 2 段階レビュー 中)
+    $('guideCamCancel').addEventListener('click', () => { if (!camBusy) closeCam(); });
+    $('guideCamRetake').addEventListener('click', () => { if (camBusy) return; $('guideCamOverlay').style.display = 'none'; startCam(camTarget); });
+    function setCamBusy(b) {
+      camBusy = b;
+      for (const id of ['guideCamOk', 'guideCamCancel', 'guideCamRetake', 'guideCamCaption']) $(id).disabled = b;
+      $('guideCamOk').textContent = b ? '送っています…' : '登録する';
+    }
+    let guideSig = null;   // 前に出した指示・送り待ち (変わったときだけ描き直す = 作業中の画面をむやみに作り直さない。古さの一言は updateGuideStale)
     async function refreshGuides({ force = true } = {}) {
       try {
         const r = await fetch(`/apps/packing/api/batches/${STATE.batchId}/guides`);
         if (!r.ok) return;
         const j = await r.json();
-        const age = (() => { const sv = STATE.guideSync; STATE.guideSync = j.sync || sv; const a = guideAgeMin(); return a === undefined ? 'off' : a == null ? 'never' : a > GUIDE_STALE_MIN ? 'stale' : 'fresh'; })();
-        const sig = JSON.stringify([j.guides, j.keysBySku, j.uploads, age]);
+        if (j.sync) STATE.guideSync = j.sync;
+        updateGuideStale();
+        const sig = JSON.stringify([j.guides, j.keysBySku, j.uploads]);
         if (!force && sig === guideSig) return;
         guideSig = sig;
         for (const k of Object.keys(GUIDES)) delete GUIDES[k];
@@ -739,9 +756,12 @@
     }
     // 開きっぱなしの画面も数分ごとに指示を取り直す (商品の画面で直した・ほかの iPad で撮った指示が出る)
     if (guideOn) setInterval(() => refreshGuides({ force: false }), 3 * 60 * 1000);
+    // 古さの一言は通信と関係なく 1 分ごとに今の時刻で書き直す
+    if (guideOn) setInterval(updateGuideStale, 60 * 1000);
     $('guideCamOk').addEventListener('click', async () => {
       if (!camBlob || !camTarget || camBusy) return;
-      camBusy = true; $('guideCamOk').disabled = true; $('guideCamOk').textContent = '送っています…';
+      setCamBusy(true);
+      const sentOp = camOpId;   // 返事は、送った写真の画面のときだけ閉じる
       const fd = new FormData();
       fd.append('op_id', camOpId);
       fd.append('sku', camTarget.sku);
@@ -755,13 +775,14 @@
         if (r.ok && j.status === 'sent') showToast(`梱包写真を登録しました${j.position ? ` (${j.position} 枚目)` : ''}`);
         else if (r.ok && j.status === 'pending') showToast('いまは送れないので、あとで自動で送ります');
         else showToast(`登録できませんでした: ${j.error || `HTTP ${r.status}`}`);
-        closeCam();
+        setCamBusy(false);
+        if (camOpId === sentOp) closeCam();
         refreshGuides();
       } catch {
         // 届いたか分からない = 写真は手元に残したまま、もう一度押せるようにする (同じ op_id = 届いていても 2 枚にならない)
         showToast('通信できませんでした。電波を確かめて、もう一度「登録する」を押してください');
-        $('guideCamOk').disabled = false;
-      } finally { camBusy = false; $('guideCamOk').textContent = '登録する'; }
+        setCamBusy(false);
+      }
     });
 
     // ── 描画 ──
