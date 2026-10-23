@@ -2515,7 +2515,8 @@ router.post('/api/bulk/inspect', (req, res) => {
   return withPgApi(res, async (db) => {
     const editable = await bulkEditable(db);
     res.set('Cache-Control', 'no-store');
-    res.json(await bulkInspect(db, req.body || {}, { now: new Date(clock()), editable, suppliers: await selectableSuppliers(db) }));
+    // 送料の表 = 配送方法の選べる値 (1 件の画面と同じ)。読めない = null (配送方法の板は「保存できない」)
+    res.json(await bulkInspect(db, req.body || {}, { now: new Date(clock()), editable, suppliers: await selectableSuppliers(db), shippingRates: await shippingRatesProvider() }));
   });
 });
 router.post('/api/bulk/preview', (req, res) => {
@@ -2525,7 +2526,7 @@ router.post('/api/bulk/preview', (req, res) => {
     const editable = await bulkEditable(db);
     res.set('Cache-Control', 'no-store');
     // 確かめの切符 (保存はこの切符の中身だけ) = 確かめた人のメールを入れる
-    res.json(await bulkPreview(db, req.body || {}, { now: new Date(clock()), editable, suppliers: await selectableSuppliers(db), actor: String(req.session.email).trim().toLowerCase() }));
+    res.json(await bulkPreview(db, req.body || {}, { now: new Date(clock()), editable, suppliers: await selectableSuppliers(db), shippingRates: await shippingRatesProvider(), actor: String(req.session.email).trim().toLowerCase() }));
   });
 });
 router.post('/api/bulk/apply', (req, res) => {
@@ -2533,8 +2534,9 @@ router.post('/api/bulk/apply', (req, res) => {
   if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
   const b = req.body || {};
   return withPgApi(res, async (db) => {
+    // 送料の表 = 1 件の保存と同じ (配送方法のとき saveSku が方法・金額を決める。確かめた行と違えば bulk.mjs が書かない)
     res.json(await bulkApplyChunk(db, { ...b, actor: String(req.session.email).trim().toLowerCase() },
-      { open: isOpen(), now: clockOverridden ? new Date(clock()) : undefined }));
+      { open: isOpen(), now: clockOverridden ? new Date(clock()) : undefined, shippingRates: await shippingRatesProvider() }));
   }, 'write');
 });
 

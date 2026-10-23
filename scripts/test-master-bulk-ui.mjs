@@ -9,6 +9,7 @@
  *   5 だめな分は直し方ごと (M7)・選び直せる分だけ選び直す (1 件の画面で直す分は入れない)
  *   6 390 幅: 帯と引き出しが画面に収まる・横にスワイプの案内 (M8)・ページが横にはみ出さない
  *   7 PR1 (列の選択・見出しで並び替え) と一緒: チェックの列は列の板に関係なく左端・並べ替えで選択が残る・横に送っても残る・チェックの欄では行が開かない
+ *   8 配送方法 (7 つ目の板): 単品もセットも・送料の表から選ぶ (キー 7)・前と後 = コード · 方法 / 金額 と利益・保存すると送料の表の方法と金額になる
  * 使い方: node scripts/test-master-bulk-ui.mjs   (Playwright / Chromium が無い = 失敗。飛ばすのは MASTER_EDIT_UI_SKIP=1)
  */
 import assert from 'node:assert/strict';
@@ -44,7 +45,7 @@ const { default: router, __setPgClientFactory, __setShippingRatesProvider } = aw
 
 const quiet = () => {};
 const ALL = Object.fromEntries(OWNED_COLUMNS.map((k) => [k, 'company']));
-const RATES = new Map([['S02', { method: '宅急便', cost: 520 }]]);
+const RATES = new Map([['S02', { method: '宅急便', cost: 520 }], ['B2', { method: '宅急便コンパクト', cost: 600 }]]);
 const pg = new PGlite();
 await pg.query(`create role deploy with createrole nocreatedb nosuperuser login password 'd'`);
 await pg.query(`alter database ${(await pg.query('select current_database() as d')).rows[0].d} owner to deploy`);
@@ -350,6 +351,43 @@ await ta('[7] PR1 と一緒: チェックの列は列の板の設定に関係な
   await p.click('#colbtn'); await p.click('#cp-reset'); await p.click('#cp-save');
   await p.waitForFunction(() => !document.querySelector('#colbtn').classList.contains('unsaved'));
   await p.keyboard.press('Escape');
+  await p.click('#bk-clear');
+});
+
+await ta('[8] 配送方法: 7 つ目の板・単品もセットも (例外は対象外)・送料の表から選ぶ・前と後 = 方法 / 金額 と利益・保存 = 送料の表の値', async (p) => {
+  await p.goto(q('エプロン'));
+  for (const c of ['a003', 's001', 'x001']) await ck(p, c).click();
+  await p.click('#bk-go');
+  await p.waitForSelector('.bk-tile[data-field="shipping_code"]');
+  assert.equal(await p.locator('.bk-tile').count(), 7);
+  assert.match(await p.textContent('.bk-tile[data-field="shipping_code"]'), /配送方法.*送料の表から選ぶ.*2 件 変えられる.*対象外 1/s);
+  assert.match(await p.textContent('#bk-foot'), /1〜7/);
+  await p.keyboard.press('7');
+  await p.waitForSelector('#bk-ship');
+  assert.deepEqual(await p.locator('#bk-ship option').evaluateAll((os) => os.map((o) => o.textContent)), ['(選ぶ)', 'S02 · 宅急便 / 520 円', 'B2 · 宅急便コンパクト / 600 円']);
+  assert.match(await p.textContent('.bk-nowdist'), /S02 · 宅急便 \/ 520 円 × 2/);
+  assert.equal(await p.isDisabled('#bk-next'), true, '選ぶまで進めない');
+  await p.selectOption('#bk-ship', 'B2');
+  assert.match(await p.textContent('#bk-live'), /2 件.*B2 · 宅急便コンパクト \/ 600 円/);
+  await p.click('#bk-next');
+  await p.waitForSelector('#bk-sum');
+  assert.match(await p.textContent('#bk-h'), /配送方法を B2 · 宅急便コンパクト \/ 600 円 にします/);
+  assert.match(await p.textContent('#bk-sum'), /選んだ商品 2 件 \+ 一緒に変わるセット 0 件 = 合計 2 件/);
+  const row = await p.textContent('.bk-pv[data-code="a003"]');
+  assert.match(row, /S02 · 宅急便 \/ 520 円.*B2 · 宅急便コンパクト \/ 600 円/s);
+  assert.match(row, /利益 .* → .*\(−80\)/s, '送料 80 円上がる = 利益 80 円下がる');
+  assert.match(await p.textContent('.bk-pv[data-code="s001"]'), /B2 · 宅急便コンパクト/);
+  assert.match(await p.textContent('.bk-pv.out[data-code="x001"]'), /対象外/);
+  await p.check('#bk-ok');
+  await p.click('#bk-apply');
+  await p.waitForSelector('#bk-rok');
+  assert.equal((await p.textContent('#bk-rok')).replace(/\D/g, ''), '2');
+  assert.match(await p.textContent('#bk-h'), /配送方法を B2 · 宅急便コンパクト \/ 600 円 に変えました/);
+  const db2 = async (code) => (await pg.query('select shipping_code as c, shipping_method as m, shipping_cost_jpy::int as y from core.skus where code = $1', [code])).rows[0];
+  assert.deepEqual(await db2('a003'), { c: 'B2', m: '宅急便コンパクト', y: 600 });
+  assert.deepEqual(await db2('s001'), { c: 'B2', m: '宅急便コンパクト', y: 600 });
+  assert.deepEqual(await db2('x001'), { c: 'S02', m: '宅急便', y: 520 });
+  await Promise.all([p.waitForLoadState('load'), p.click('[data-act="done"]')]);
   await p.click('#bk-clear');
 });
 
