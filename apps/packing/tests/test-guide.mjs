@@ -94,6 +94,23 @@ initPackingDB();
   assert.equal(getDB().prepare("SELECT value FROM pk_pack_meta WHERE key = 'schema_version'").get().value, "23");
   console.log("  ok  [M1] v22 を当てた DB → v23 で送り待ちの表ができる");
 }
+// 2 段目の途中のコミット (v22 で送り待ちの表を jpeg_sha256 なしで作った) DB → v23 で列を足してファイルから埋める
+{
+  const d0 = getDB();
+  d0.exec('DROP TABLE IF EXISTS pk_pack_guide_uploads');
+  d0.exec(`CREATE TABLE pk_pack_guide_uploads (op_id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, sku TEXT NOT NULL, caption TEXT NOT NULL DEFAULT '', worker TEXT NOT NULL,
+    batch_id INTEGER, file TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, next_at TEXT, last_error TEXT, position INTEGER, created_at TEXT NOT NULL, sent_at TEXT)`);
+  const upDir = path.join(tmp, 'packing-guide-uploads');
+  fs.mkdirSync(upDir, { recursive: true });
+  fs.writeFileSync(path.join(upDir, 'old-req.jpg'), Buffer.from('old photo bytes'));
+  d0.prepare(`INSERT INTO pk_pack_guide_uploads (op_id, request_id, sku, worker, file, created_at) VALUES ('op-old-1', 'old-req', 'sku1', 'w', 'old-req.jpg', '2026-10-23T00:00:00Z')`).run();
+  d0.prepare("UPDATE pk_pack_meta SET value = '22' WHERE key = 'schema_version'").run();
+  initPackingDB();
+  const r = getDB().prepare("SELECT jpeg_sha256 FROM pk_pack_guide_uploads WHERE op_id = 'op-old-1'").get();
+  assert.equal(r.jpeg_sha256, crypto.createHash('sha256').update(Buffer.from('old photo bytes')).digest('hex'));
+  getDB().prepare("DELETE FROM pk_pack_guide_uploads WHERE op_id = 'op-old-1'").run();
+  console.log('  ok  [M2] 途中のコミットの送り待ちの表 (jpeg_sha256 なし) → v23 で列を足してファイルから埋める');
+}
 const db = getDB();
 const now = utcNow();
 db.prepare(`INSERT INTO pk_pack_batches (id, tb_key, folder_name, work_date, slip_count, line_count,

@@ -641,6 +641,16 @@ const MIGRATIONS = {
       created_at  TEXT NOT NULL,
       sent_at     TEXT
     )`);
+    // 表が先にあった (2 段目の途中のコミットが v22 で作った・jpeg_sha256 なし) = 列を足して、ファイルから埋める (Codex 第 2 段階の確かめ 高)
+    const upCols = db.prepare('PRAGMA table_info(pk_pack_guide_uploads)').all().map((c) => c.name);
+    if (!upCols.includes('jpeg_sha256')) {
+      db.exec("ALTER TABLE pk_pack_guide_uploads ADD COLUMN jpeg_sha256 TEXT NOT NULL DEFAULT ''");
+      const dir = path.join(DATA_DIR, 'packing-guide-uploads');
+      const upd = db.prepare('UPDATE pk_pack_guide_uploads SET jpeg_sha256 = ? WHERE op_id = ?');
+      for (const r of db.prepare('SELECT op_id, file FROM pk_pack_guide_uploads').all()) {
+        try { upd.run(crypto.createHash('sha256').update(fs.readFileSync(path.join(dir, path.basename(r.file)))).digest('hex'), r.op_id); } catch { /* 無い・読めない = 空のまま (押し直しは別の中身として断る) */ }
+      }
+    }
     db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_guide_uploads_status ON pk_pack_guide_uploads(status, next_at)');
   },
 };
