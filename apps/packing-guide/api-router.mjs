@@ -10,6 +10,7 @@
  * 接続: env COMPANY_DB_MASTER_EDIT_URL (商品の画面と同じロール master_edit = 梱包指示の表の select だけ使う)。無い = 503
  *   GET /manifest         指示のある単品の全部 { ok, generated_at, guides: [{ code, sku_id, name, note, event_id, updated_at, updated_by, photos: [{ photo_id, sha256, position, caption, width, height }] }] }
  *   GET /photos/:id       写真の中身 (JPEG)。番号ごとに中身は変わらない
+ *   POST /photos          🆕 2 段目: 梱包の画面で撮った写真を足す (miniPC のサーバーが送る・下)
  */
 import express from 'express';
 import crypto from 'node:crypto';
@@ -62,6 +63,32 @@ router.get('/photos/:id', (req, res) => withDb(res, async (db) => {
   if (!p) return res.status(404).json({ ok: false, error: '写真がありません' });
   res.set('X-Content-Sha256', p.sha256);
   res.type('image/jpeg').send(p.image);
+}));
+
+/**
+ * 🆕 2 段目: 梱包の画面のカメラで撮った写真を足す (miniPC のサーバーが送り待ちから代わりに送る・iPad は鍵を持たない)
+ *   { request_id (miniPC が撮った 1 枚ごとに決める = 送り直しても 2 枚にならない), code, image (JPEG の base64), caption?, actor (作業者の名前) }
+ *   答え = { ok, photo_id, position, replay } / 断り = { ok: false, reason, error } (photos_full・not_single・not_found・bad_image・invalid_input …)
+ *   写真は Render でも作り直す (向き・長辺 1280px・メタデータを捨てる)。記録の人 = packing:<作業者> (via packing)
+ */
+const ACTOR_MAX = 60;
+router.post('/photos', express.json({ limit: '17mb' }), (req, res) => withDb(res, async (db) => {
+  const b = req.body || {};
+  try {
+    const requestId = PGD.requestIdIn(b.request_id);
+    const actorName = String(b.actor || '').replace(/[\u0000-\u001F\u007F]/g, '').trim().slice(0, ACTOR_MAX);
+    if (!actorName) return res.status(400).json({ ok: false, reason: 'invalid_input', error: '作業者の名前がありません' });
+    const caption = PGD.captionIn(b.caption);
+    const photo = await PGD.normalizePhoto(PGD.decodeImageBase64(b.image));
+    const sku = await PGD.skuForGuide(db, b.code);
+    if (!sku) return res.status(404).json({ ok: false, reason: 'not_found', error: `商品コード ${String(b.code || '').slice(0, 80)} は Company DB にありません` });
+    if (sku.sku_kind !== 'single') return res.status(400).json({ ok: false, reason: 'not_single', error: '梱包指示は単品の商品だけです' });
+    const r = await PGD.addPackingPhoto(db, { requestId, actor: `packing:${actorName}`, via: 'packing', skuId: sku.sku_id, photo, caption });
+    res.json({ ok: true, code: sku.code, photo_id: r.photo_id, position: r.position, replay: r.replay });
+  } catch (e) {
+    if (e instanceof PGD.PackingGuideError) return res.status(e.status).json({ ok: false, reason: e.reason, error: e.message });
+    throw e;
+  }
 }));
 
 export default router;

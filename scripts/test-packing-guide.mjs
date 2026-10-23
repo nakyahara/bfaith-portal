@@ -409,6 +409,43 @@ await ta('[X2] 配りの口 (Render → miniPC): 鍵が無い設定 = 503・鍵�
   } finally { s2.close(); delete process.env.PACKING_GUIDE_KEY; }
 });
 
+await ta('[X3] 配りの口の写真を足す (梱包の画面で撮った・2 段目): 作り直して保存 (via packing・人 = packing:<作業者>)・押し直し = 前の答え・断り (3 枚・セット・無いコード・読めない写真・人なし)・鍵', async () => {
+  const AR = await import('../apps/packing-guide/api-router.mjs');
+  const a3 = express();
+  a3.use('/apps/packing-guide-api', AR.default);
+  const s3 = http.createServer(a3);
+  await new Promise((r) => s3.listen(0, '127.0.0.1', r));
+  const B = `http://127.0.0.1:${s3.address().port}/apps/packing-guide-api`;
+  const post = async (body, key = 'secret-1') => {
+    const r = await fetch(B + '/photos', { method: 'POST', headers: { 'Content-Type': 'application/json', ...(key ? { 'x-packing-guide-key': key } : {}) }, body: JSON.stringify(body) });
+    return { status: r.status, j: await r.json().catch(() => ({})) };
+  };
+  const img = (await sharp({ create: { width: 1800, height: 2400, channels: 3, background: { r: 5, g: 90, b: 60 } } }).jpeg().toBuffer()).toString('base64');
+  const s2id = await skuIdOf('s002');
+  try {
+    process.env.PACKING_GUIDE_KEY = 'secret-1';
+    assert.equal((await post({}, null)).status, 401);
+    const before = (await asEditor(() => PG.readPackingGuide(db, s2id))).photos.length;
+    const rid = uuid();
+    const r = await post({ request_id: rid, code: 'S002', image: img, caption: '立てて入れる', actor: '三宅晴菜' });
+    assert.equal(r.status, 200, JSON.stringify(r.j));
+    assert.deepEqual([r.j.ok, r.j.code, r.j.position, r.j.replay], [true, 's002', before + 1, false]);
+    const ph = (await asEditor(() => PG.readPackingGuide(db, s2id))).photos.at(-1);
+    assert.deepEqual([ph.caption, ph.width, ph.height, ph.added_via, ph.added_by], ['立てて入れる', 960, 1280, 'packing', 'packing:三宅晴菜']);
+    const again = await post({ request_id: rid, code: 'S002', image: img, caption: '立てて入れる', actor: '三宅晴菜' });
+    assert.deepEqual([again.j.replay, again.j.photo_id], [true, r.j.photo_id]);
+    while ((await asEditor(() => PG.readPackingGuide(db, s2id))).photos.length < 3) await post({ request_id: uuid(), code: 's002', image: img, actor: '三宅晴菜' });
+    const full = await post({ request_id: uuid(), code: 's002', image: img, actor: '三宅晴菜' });
+    assert.deepEqual([full.status, full.j.reason], [409, 'photos_full']);
+    assert.deepEqual([(await post({ request_id: uuid(), code: 'pgset1', image: img, actor: 'a' })).j.reason], ['not_single']);
+    assert.deepEqual([(await post({ request_id: uuid(), code: 'nope', image: img, actor: 'a' })).status], [404]);
+    const badImg = await post({ request_id: uuid(), code: 's003', image: Buffer.from('not image').toString('base64'), actor: 'a' });
+    assert.deepEqual([badImg.status, badImg.j.reason], [400, 'bad_image']);
+    assert.equal((await post({ request_id: uuid(), code: 's003', image: img, actor: '  ' })).status, 400);
+    assert.equal((await post({ request_id: 'x', code: 's003', image: img, actor: 'a' })).status, 400);
+  } finally { s3.close(); delete process.env.PACKING_GUIDE_KEY; }
+});
+
 server.close();
 console.log(`${passed} passed`);
 clearTimeout(killer);

@@ -604,7 +604,7 @@ const MIGRATIONS = {
     }
     db.exec("CREATE INDEX IF NOT EXISTS idx_pk_pack_tasks_returned_notify ON pk_pack_tasks(status, returned_notified_at)");
   },
-  // v22: 梱包指示の写し (中原さん 2026-10-23・正 = Render の Company DB の 0101。apps/packing/guide-sync.js が Render の配りの口から取る)。
+  // v22: 梱包指示の写しと、梱包の画面で撮った写真の送り待ち (中原さん 2026-10-23・正 = Render の Company DB の 0101。apps/packing/guide-sync.js)。
   //   SKU ごとに 1 行 (写真の並び・一言・大きさ = photos_json・写真の中身は DATA_DIR/packing-guides/<sha256>.jpg)。
   //   丸ごと入れ替える (写真が全部そろった版だけ)。取れなくても前の写しで出し続ける (取れた時刻を画面に出す)
   22: () => {
@@ -618,6 +618,26 @@ const MIGRATIONS = {
       updated_at  TEXT,
       updated_by  TEXT
     )`);
+    // 梱包の画面のカメラで撮った写真の送り待ち (iPad → このサーバー → Render)。撮ったらすぐここに残す = 通信が切れても消えない。
+    //   request_id = Render に送る 1 枚の番号 (送り直しても 2 枚にならない)・op_id = iPad の押した 1 回 (押し直しは同じ行)
+    //   status: pending (送る) / sent (Render の Company DB に入った) / failed (断られた = 送り直さない・理由を画面に)
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_guide_uploads (
+      op_id       TEXT PRIMARY KEY,
+      request_id  TEXT NOT NULL UNIQUE,
+      sku         TEXT NOT NULL,           -- 撮った商品のコード (梱包の明細・セットを展開した構成品)
+      caption     TEXT NOT NULL DEFAULT '',
+      worker      TEXT NOT NULL,
+      batch_id    INTEGER,
+      file        TEXT NOT NULL,           -- DATA_DIR/packing-guide-uploads/<request_id>.jpg
+      status      TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'sent', 'failed')),
+      attempts    INTEGER NOT NULL DEFAULT 0,
+      next_at     TEXT,                    -- 次に送ってよい時刻 (失敗の後は間をあける)
+      last_error  TEXT,
+      position    INTEGER,                 -- 入った位置 (何枚目)
+      created_at  TEXT NOT NULL,
+      sent_at     TEXT
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_guide_uploads_status ON pk_pack_guide_uploads(status, next_at)');
   },
 };
 

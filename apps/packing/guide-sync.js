@@ -163,12 +163,129 @@ export function guidesFor(codes, { photoBase = '/apps/packing/guide-photos' } = 
   return out;
 }
 
+// ─── 🆕 2 段目: 梱包の画面のカメラで撮った写真を Render へ送る (送り待ち = pk_pack_guide_uploads) ───
+//   iPad → このサーバー (撮ったらすぐ SQLite とファイルに残す) → Render の配りの口 POST /photos (鍵はこのサーバーだけが持つ)。
+//   送れた = sent (写しを取り直す = 画面に出る) / 断られた (3 枚ある・単品でない・Company DB に無い・写真が読めない…) = failed (送り直さない・理由を画面に) /
+//   つながらない・Render の誤り = pending のまま間をあけて送り直す (同じ request_id = 2 枚にならない)
+export const GUIDE_UPLOAD_DIR = path.join(DATA_DIR, 'packing-guide-uploads');
+const UPLOAD_BACKOFF_MIN = [1, 2, 5, 10, 30];
+/** 断り (送り直しても同じ) = failed にする答え。それ以外の 4xx (鍵が違う 401 など) と 5xx は送り直す */
+const FINAL_REASONS = new Set(['photos_full', 'not_single', 'not_found', 'bad_image', 'too_large', 'invalid_input', 'cancelled', 'request_reused']);
+
+const uploadRow = (opId) => getDB().prepare('SELECT * FROM pk_pack_guide_uploads WHERE op_id = ?').get(opId);
+const uploadView = (r) => (r ? { op_id: r.op_id, sku: r.sku, status: r.status, position: r.position, error: r.last_error || null, attempts: r.attempts } : null);
+
+/**
+ * 撮った写真を送り待ちに入れる (同じ op_id の押し直し = 前の行)。送るのは sendGuideUploads。
+ * jpeg = 画面が縮めた JPEG (このサーバーは作り直さない = Render が作り直す)
+ */
+export function enqueueGuidePhoto({ opId, sku, caption = '', worker, batchId = null, jpeg }) {
+  const prev = uploadRow(opId);
+  if (prev) return uploadView(prev);
+  const requestId = crypto.randomUUID();
+  fs.mkdirSync(GUIDE_UPLOAD_DIR, { recursive: true });
+  const file = path.join(GUIDE_UPLOAD_DIR, `${requestId}.jpg`);
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, jpeg);
+  fs.renameSync(tmp, file);
+  getDB().prepare(`INSERT INTO pk_pack_guide_uploads (op_id, request_id, sku, caption, worker, batch_id, file, status, created_at, next_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`).run(opId, requestId, sku, caption, worker, batchId, path.basename(file), utcNow(), utcNow());
+  return uploadView(uploadRow(opId));
+}
+
+async function postJson(pathPart, body) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 60_000);
+  try {
+    const r = await fetchImpl(baseUrl() + pathPart, {
+      method: 'POST', headers: { 'x-packing-guide-key': process.env.PACKING_GUIDE_KEY, 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: ctl.signal,
+    });
+    let j = null;
+    try { j = await r.json(); } catch { /* */ }
+    return { status: r.status, j: j || {} };
+  } finally { clearTimeout(t); }
+}
+
+/** 1 行を送る。戻り値 = 送った後の行の様子 */
+async function sendOne(row) {
+  const db = getDB();
+  const later = (msg) => {
+    const wait = UPLOAD_BACKOFF_MIN[Math.min(row.attempts, UPLOAD_BACKOFF_MIN.length - 1)];
+    db.prepare(`UPDATE pk_pack_guide_uploads SET attempts = attempts + 1, last_error = ?, next_at = ? WHERE op_id = ? AND status = 'pending'`)
+      .run(String(msg).slice(0, 300), new Date(Date.now() + wait * 60000).toISOString().slice(0, 19) + 'Z', row.op_id);
+  };
+  let jpeg;
+  try { jpeg = fs.readFileSync(path.join(GUIDE_UPLOAD_DIR, path.basename(row.file))); } catch {
+    db.prepare(`UPDATE pk_pack_guide_uploads SET status = 'failed', last_error = ? WHERE op_id = ?`).run('写真のファイルがありません (撮り直してください)', row.op_id);
+    return uploadView(uploadRow(row.op_id));
+  }
+  try {
+    const r = await postJson('/photos', { request_id: row.request_id, code: row.sku, image: jpeg.toString('base64'), caption: row.caption, actor: row.worker });
+    if (r.status === 200 && r.j.ok) {
+      db.prepare(`UPDATE pk_pack_guide_uploads SET status = 'sent', sent_at = ?, position = ?, last_error = NULL, attempts = attempts + 1 WHERE op_id = ?`)
+        .run(utcNow(), Number(r.j.position) || null, row.op_id);
+    } else if (r.status >= 400 && r.status < 500 && FINAL_REASONS.has(r.j.reason)) {
+      db.prepare(`UPDATE pk_pack_guide_uploads SET status = 'failed', last_error = ?, attempts = attempts + 1 WHERE op_id = ?`)
+        .run(String(r.j.error || r.j.reason).slice(0, 300), row.op_id);
+    } else {
+      later(`HTTP ${r.status}${r.j.error ? ` (${r.j.error})` : ''}`);
+    }
+  } catch (e) {
+    later(e?.name === 'AbortError' ? '時間切れ' : (e?.message || e));
+  }
+  return uploadView(uploadRow(row.op_id));
+}
+
+let sending = null;
+/**
+ * 送り待ちを送る (opId を渡すと、その 1 枚だけを今すぐ = 間をあける時刻を待たない)。1 つでも送れたら写しを取り直す。
+ * 戻り値 = opId の行の様子 (渡したとき) / { sent, failed, pending }
+ */
+export async function sendGuideUploads({ opId = null } = {}) {
+  if (!guideSyncEnabled() || guideUrlProblem()) return opId ? uploadView(uploadRow(opId)) : { sent: 0, failed: 0, pending: 0 };
+  while (sending) await sending.catch(() => {});
+  let done;
+  sending = new Promise((r) => { done = r; });
+  try {
+    const db = getDB();
+    const rows = opId
+      ? [uploadRow(opId)].filter((r) => r && r.status === 'pending')
+      : db.prepare(`SELECT * FROM pk_pack_guide_uploads WHERE status = 'pending' AND (next_at IS NULL OR next_at <= ?) ORDER BY created_at LIMIT 20`).all(utcNow());
+    const out = { sent: 0, failed: 0, pending: 0 };
+    for (const r of rows) {
+      const v = await sendOne(r);
+      out[v.status]++;
+    }
+    if (out.sent) await pullGuides();
+    return opId ? uploadView(uploadRow(opId)) : out;
+  } finally { sending = null; done(); }
+}
+
+/** 画面の様子: 商品ごとの送り待ちの数と、最近 (2 日) 断られたもの */
+export function guideUploadsFor(codes) {
+  const norms = new Set((codes || []).map(normSku).filter(Boolean));
+  const out = {};
+  if (!norms.size) return out;
+  try {
+    const since = new Date(Date.now() - 2 * 86400e3).toISOString().slice(0, 19) + 'Z';
+    for (const r of getDB().prepare(`SELECT * FROM pk_pack_guide_uploads WHERE status = 'pending' OR (status = 'failed' AND created_at >= ?) ORDER BY created_at`).all(since)) {
+      const k = normSku(r.sku);
+      if (!norms.has(k)) continue;
+      const o = out[k] || (out[k] = { pending: 0, failed: [] });
+      if (r.status === 'pending') o.pending++;
+      else o.failed.push({ error: r.last_error, worker: r.worker, at: r.created_at });
+    }
+  } catch (e) { console.error('[packing] 写真の送り待ちを読めない:', e.message); }
+  return out;
+}
+
 let timer = null;
-/** 数分ごとに取る (起動の直後にも 1 回)。鍵が無い = 何もしない */
+/** 数分ごとに送り待ちを送ってから写しを取る (起動の直後にも 1 回)。鍵が無い = 何もしない */
 export function startGuidePoller() {
   if (timer || !guideSyncEnabled()) return false;
   const sec = Math.max(30, Number(process.env.PACKING_GUIDE_POLL_SEC) || 120);
-  const tick = () => pullGuides().then((r) => { if (!r.ok && !r.skipped) console.warn(`[packing] 梱包指示の取得に失敗 (前の写しで続ける): ${r.error}`); });
+  const tick = () => sendGuideUploads().catch((e) => console.warn(`[packing] 写真の送り待ちを送れない: ${e.message}`))
+    .then(() => pullGuides()).then((r) => { if (!r.ok && !r.skipped) console.warn(`[packing] 梱包指示の取得に失敗 (前の写しで続ける): ${r.error}`); });
   setTimeout(tick, 5_000).unref?.();
   timer = setInterval(tick, sec * 1000);
   timer.unref?.();

@@ -53,6 +53,27 @@ fake.post('/service-api/ne-products/names', express.json(), (req, res) => res.js
 fake.use((req, res, next) => { calls++; if (req.headers['x-packing-guide-key'] !== 'k1') return res.status(401).json({ ok: false, error: 'bad key' }); next(); });
 fake.get('/api/manifest', (req, res) => res.json(manifest));
 fake.get('/api/photos/:id', (req, res) => { const b = photoOverride?.[req.params.id] || PHOTOS.get(req.params.id); if (!b) return res.status(404).end(); res.type('image/jpeg').send(b); });
+// 2 段目: 撮った写真を足す (本物は Company DB の ops.add_sku_packing_photo。ここは同じ答えの形を真似る)
+const posted = [];          // 届いた順 { request_id, code, caption, actor }
+let postMode = 'ok';        // ok / down (500) / full (409 photos_full)
+const seenReq = new Map();  // request_id → 答え (押し直し = 前の答え)
+let nextPhotoId = 100;
+fake.post('/api/photos', express.json({ limit: '20mb' }), (req, res) => {
+  const b = req.body;
+  posted.push({ request_id: b.request_id, code: b.code, caption: b.caption, actor: b.actor });
+  if (postMode === 'down') return res.status(500).json({ ok: false, error: 'Render が落ちている' });
+  if (seenReq.has(b.request_id)) return res.json({ ...seenReq.get(b.request_id), replay: true });
+  if (postMode === 'full') return res.status(409).json({ ok: false, reason: 'photos_full', error: '写真はもう 3 枚あります。どれかを外してから足してください' });
+  const buf = Buffer.from(b.image, 'base64');
+  const id = String(nextPhotoId++);
+  PHOTOS.set(id, buf);
+  let g = manifest.guides.find((x) => x.code.toLowerCase() === String(b.code).toLowerCase());
+  if (!g) { g = { code: b.code, sku_id: id, name: `撮った商品 ${b.code}`, note: '', event_id: id, photos: [] }; manifest.guides.push(g); }
+  g.photos.push({ photo_id: id, sha256: sha(buf), position: g.photos.length + 1, caption: b.caption || '', width: 10, height: 10 });
+  const ans = { ok: true, code: b.code, photo_id: id, position: g.photos.length, replay: false };
+  seenReq.set(b.request_id, ans);
+  res.json(ans);
+});
 const fakeServer = http.createServer(fake);
 await new Promise((r) => fakeServer.listen(0, '127.0.0.1', r));
 process.env.PACKING_GUIDE_URL = `http://127.0.0.1:${fakeServer.address().port}/api`;
@@ -199,6 +220,94 @@ await ta('[V4] 写しが古い (30 分を超えた) = 枠の下に小さく知�
   assert.equal(sha(Buffer.from(await ok.arrayBuffer())), sha(PHOTOS.get('11')));
   assert.equal((await fetch(`${base}/apps/packing/guide-photos/${'0'.repeat(64)}.jpg`)).status, 404);
   assert.equal((await fetch(`${base}/apps/packing/guide-photos/..%2Fpicking.db`)).status, 404);
+});
+
+// ─── 2 段目: 撮って登録 ───
+// 作業者の名簿 (picking の表・同じ picking.db)
+db.exec(`CREATE TABLE IF NOT EXISTS pk_workers (code TEXT PRIMARY KEY, name TEXT NOT NULL, sort INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1)`);
+db.prepare(`INSERT OR IGNORE INTO pk_workers (code, name) VALUES ('w01', '三宅晴菜')`).run();
+const shot = await sharp({ create: { width: 2000, height: 1500, channels: 3, background: { r: 250, g: 180, b: 20 } } }).jpeg().toBuffer();
+const upload = async (fields, file = shot) => {
+  const fd = new FormData();
+  for (const [k, v] of Object.entries(fields)) fd.append(k, v);
+  if (file) fd.append('photo', new Blob([file], { type: 'image/jpeg' }), 'g.jpg');
+  const r = await fetch(`${base}/apps/packing/api/guide-photos`, { method: 'POST', body: fd });
+  return { status: r.status, j: await r.json().catch(() => ({})) };
+};
+const upRow = (op) => db.prepare('SELECT * FROM pk_pack_guide_uploads WHERE op_id = ?').get(op);
+
+await ta('[U1] 撮った写真を登録: 送り待ちに残してすぐ送る (sent・何枚目)・写しを取り直して出る・押し直し (同じ op_id) = 2 枚にならない・記録の人 = 作業者', async () => {
+  const r = await upload({ op_id: 'op-u1-aaaaaaa', sku: 'sku2', caption: '底に段ボール', worker_name: '三宅晴菜', batch_id: '1' });
+  assert.equal(r.status, 200, JSON.stringify(r.j));
+  assert.deepEqual([r.j.ok, r.j.status, r.j.position], [true, 'sent', 1]);
+  const row = upRow('op-u1-aaaaaaa');
+  assert.equal(row.status, 'sent');
+  assert.ok(fs.existsSync(path.join(GS.GUIDE_UPLOAD_DIR, row.file)), '撮った写真のファイルは残る');
+  assert.deepEqual(posted.at(-1), { request_id: row.request_id, code: 'sku2', caption: '底に段ボール', actor: '三宅晴菜' });
+  assert.equal(GS.guidesFor(['sku2']).get('sku2').photos[0].caption, '底に段ボール', '送れたら写しを取り直す');
+  const n = posted.length;
+  const again = await upload({ op_id: 'op-u1-aaaaaaa', sku: 'sku2', caption: '底に段ボール', worker_name: '三宅晴菜', batch_id: '1' });
+  assert.deepEqual([again.j.status, again.j.position], ['sent', 1]);
+  assert.equal(posted.length, n, '送れた行は送り直さない');
+});
+
+await ta('[U2] つながらない = 送り待ち (pending・間をあけて送り直す・同じ request_id)・断られた = failed (送り直さない・理由)・形の誤り = 400', async () => {
+  postMode = 'down';
+  const r = await upload({ op_id: 'op-u2-bbbbbbb', sku: 'sku2', caption: '', worker_name: '三宅晴菜', batch_id: '1' });
+  assert.deepEqual([r.status, r.j.ok, r.j.status], [200, true, 'pending']);
+  let row = upRow('op-u2-bbbbbbb');
+  assert.deepEqual([row.status, row.attempts], ['pending', 1]);
+  assert.match(row.last_error, /HTTP 500/);
+  assert.ok(Date.parse(row.next_at) > Date.now(), '間をあける');
+  assert.deepEqual(await GS.sendGuideUploads(), { sent: 0, failed: 0, pending: 0 }, '時刻の前は送らない');
+  postMode = 'ok';
+  db.prepare(`UPDATE pk_pack_guide_uploads SET next_at = ? WHERE op_id = ?`).run('2000-01-01T00:00:00Z', 'op-u2-bbbbbbb');
+  const reqIds = posted.filter((p) => p.request_id === row.request_id).length;
+  assert.deepEqual(await GS.sendGuideUploads(), { sent: 1, failed: 0, pending: 0 });
+  assert.equal(posted.filter((p) => p.request_id === row.request_id).length, reqIds + 1, '同じ request_id で送り直す');
+  assert.equal(upRow('op-u2-bbbbbbb').position, 2);
+  // 断られた (もう 3 枚ある) = failed
+  postMode = 'full';
+  const f = await upload({ op_id: 'op-u2-ccccccc', sku: 'sku2', caption: '', worker_name: '三宅晴菜', batch_id: '1' });
+  assert.deepEqual([f.j.ok, f.j.status], [false, 'failed']);
+  assert.match(f.j.error, /3 枚/);
+  assert.equal(upRow('op-u2-ccccccc').status, 'failed');
+  assert.deepEqual(await GS.sendGuideUploads(), { sent: 0, failed: 0, pending: 0 }, '断られたものは送り直さない');
+  assert.match(GS.guideUploadsFor(['sku2']).sku2.failed.at(-1).error, /3 枚/);
+  postMode = 'ok';
+  // 形の誤り
+  assert.equal((await upload({ op_id: 'op-u2-ddddddd', sku: 'sku2', worker_name: '知らない人', batch_id: '1' })).status, 400);
+  assert.equal((await upload({ op_id: 'x', sku: 'sku2', worker_name: '三宅晴菜' })).status, 400);
+  assert.equal((await upload({ op_id: 'op-u2-eeeeeee', sku: '', worker_name: '三宅晴菜' })).status, 400);
+  assert.equal((await upload({ op_id: 'op-u2-fffffff', sku: 'sku2', worker_name: '三宅晴菜' }, Buffer.from('<svg></svg>'.padEnd(64, ' ')))).status, 400);
+  assert.equal((await upload({ op_id: 'op-u2-ggggggg', sku: 'sku2', worker_name: '三宅晴菜', caption: 'あ'.repeat(101) })).status, 400);
+  assert.equal(upRow('op-u2-ddddddd'), undefined, '断ったら送り待ちに残さない');
+});
+
+await ta('[V5] 画面で撮って登録: 明細の「📷 梱包写真を登録」→ カメラ → 確かめる (一言) → 登録 → 指示の枠に出る・セットの明細 = 構成品を選ぶ', async () => {
+  await open();
+  await goSlip(2);
+  assert.equal(await page.locator('.guide-cam').count(), 1);
+  const shotFile = path.join(tmp, 'shot.jpg');
+  fs.writeFileSync(shotFile, await sharp({ create: { width: 1200, height: 900, channels: 3, background: { r: 20, g: 120, b: 250 } } }).jpeg().toBuffer());
+  const n = posted.length;
+  await page.locator('.guide-cam').click();
+  await page.setInputFiles('#guideCamInput', shotFile);
+  await page.waitForSelector('#guideCamOverlay', { state: 'visible' });
+  await page.fill('#guideCamCaption', '箱の向きに注意');
+  await page.locator('#guideCamOk').click();
+  await page.waitForFunction(() => document.getElementById('guideCamOverlay').style.display === 'none', null, { timeout: 15000 });
+  await page.waitForFunction(() => /箱の向きに注意/.test(document.querySelector('.guide-box')?.innerText || ''), null, { timeout: 15000 });
+  assert.equal(posted.length, n + 1);
+  assert.equal(posted.at(-1).caption, '箱の向きに注意');
+  assert.match(await page.locator('.guide-box').innerText(), /箱の向きに注意/);
+  // セットの明細 = どの構成品か選ぶ
+  await goSlip(3);
+  await page.locator('.guide-cam').click();
+  assert.equal(await page.locator('#guidePickOverlay').isVisible(), true);
+  assert.equal(await page.locator('.gpick-opt').count(), 2);
+  await page.locator('#guidePickCancel').click();
+  assert.equal(await page.locator('#guidePickOverlay').isVisible(), false);
 });
 
 await browser.close();
