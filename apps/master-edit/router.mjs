@@ -1214,7 +1214,7 @@ router.post('/api/variation/check', (req, res) => {
   });
 });
 /**
- * 🆕 #1706 Codex R2 M: 発注の設定の 6 つの「入力なし」= その request_id の記録 (保存の記録 ops.master_edit_requests = 成功・失敗とも) がまだ無いとき (初回) だけ確かめる。
+ * 🆕 #1706 Codex R2 M: 発注の設定の 3 つの「入力なし」= その request_id の記録 (保存の記録 ops.master_edit_requests = 成功・失敗とも) がまだ無いとき (初回) だけ確かめる。
  *   数えるかは画面と同じ答え (orderNoneApplies)。押し直し (記録がある) = 確かめない・一言も作らない (lib が前の答え・前の誤りを返す) =
  *   その時の発注アプリの読める / 読めないで押し直しが変わらない。戻り値 = prepareOrderBlanks の答え ({ ok, note } / { ok: false, status, json })
  */
@@ -1266,7 +1266,7 @@ router.post('/api/new/variation', (req, res) => {
   const gate = editorGate(req);
   if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
   // 🆕 必須でない項目 = 値か「入力なし」(印 blanks) のどちらか。どちらでもない = 400 (何も書かない)・入力なしの一覧は理由に足す (lib/master-register-blanks.mjs)
-  //   発注の設定の 6 つは、ここでは数えない (下 = その request_id の記録がまだ無いときだけ・要求のハッシュに入らない = #1706 Codex R2 M)
+  //   発注の設定の 3 つは、ここでは数えない (下 = その request_id の記録がまだ無いときだけ・要求のハッシュに入らない = #1706 Codex R2 M)
   let pre = prepareRegisterBody('variation', req.body || {});
   // 🆕 2026-10-17 (#Codex R1 M3): 参考 URL の欄が無かった前の画面の本文 = 参考 URL を数えずに確かめ直しておき、下で request_id の記録があるとき
   //   (前の画面で保存できた登録の押し直し = lib が前の答えを返す) だけ通す。記録が無い = 新しい登録 = 断る (画面を開き直してもらう)
@@ -1685,7 +1685,7 @@ router.post('/api/new', (req, res) => {
   const gate = editorGate(req);
   if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
   // 🆕 必須でない項目 = 値か「入力なし」(印 blanks) のどちらか (発注の設定は欄が出る人だけ・カードを作らない = カードの欄は数えない)。入力なしの一覧は理由に足す
-  //   発注の設定の 6 つは、ここでは数えない (下 = その request_id の記録がまだ無いときだけ・要求のハッシュに入らない = #1706 Codex R2 M)
+  //   発注の設定の 3 つは、ここでは数えない (下 = その request_id の記録がまだ無いときだけ・要求のハッシュに入らない = #1706 Codex R2 M)
   const pre = prepareRegisterBody(String((req.body || {}).kind ?? ''), req.body || {});
   if (!pre.ok) return res.status(pre.status).json(pre.json);
   const b = pre.body;

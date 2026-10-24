@@ -2675,7 +2675,12 @@ await ta('[BL1] 入力なしの決まり (lib): 種類ごとの項目と並び�
   // 🆕 0084: メーカー (原価の次 = 画面の上からの順)。missingBlankKeys は渡さない = 数える (サーバーの checkRegisterBlanks は makerApplicable のときだけ)
   assert.deepEqual(BLK.missingBlankKeys('single', single), ['cost', 'maker', 'shipping_code', 'inbound_date_managed', 'card.official_url', 'card.amazon', 'card.reference_urls', 'card.set_decision',
     'card.yahoo.price', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path']);
-  assert.deepEqual(BLK.missingBlankKeys('single', single, { orderApplicable: true }).slice(2, 8), ['order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit']);
+  // 🆕 2026-10-24 中原さん「この項目は任意にして商品登録の必須要件にしないで」: ケース・容量 (ケースロット・ケースグループ・容量/個) は数えない
+  assert.deepEqual(BLK.missingBlankKeys('single', single, { orderApplicable: true }).slice(2, 6), ['order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'shipping_code']);
+  for (const k of ['order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit']) {
+    assert.ok(!BLK.BLANK_KEYS.single.includes(k) && !BLK.BLANK_KEYS.variation.includes(k) && !BLK.BLANK_KEYS.set.includes(k), k + ' は「値か入力なし」に数えない');
+    assert.ok(!Object.prototype.hasOwnProperty.call(BLK.blankLabelsOf('single'), k), k + ' の名前を画面に渡さない');
+  }
   assert.deepEqual(BLK.missingBlankKeys('single', { ...single, card: { create: false } }), ['cost', 'maker', 'shipping_code', 'inbound_date_managed'], 'カードを作らない = カードの欄は数えない');
   assert.deepEqual(BLK.missingBlankKeys('single', { ...single, card: { create: false } }, { makerApplicable: false }), ['cost', 'shipping_code', 'inbound_date_managed'], '0084 の欄が無い = メーカーは数えない');
   assert.deepEqual(BLK.missingBlankKeys('set', { kind: 'set', values: {}, card: {} }, { orderApplicable: true }), ['exception_cost', 'shipping_code', 'card.official_url', 'card.amazon', 'card.reference_urls',
@@ -2694,6 +2699,12 @@ await ta('[BL1] 入力なしの決まり (lib): 種類ごとの項目と並び�
   const all = BLK.missingBlankKeys('single', single);
   assert.deepEqual(BLK.checkRegisterBlanks('single', { ...single, blanks: [...all].reverse() }, { makerApplicable: true }), all);
   assert.deepEqual(BLK.checkRegisterBlanks('single', { ...single, blanks: [...all].reverse() }), all.filter((k) => k !== 'maker'), '0084 の欄が無い = メーカーの印は使わない');
+  // 🆕 2026-10-24: 前の版の画面 (開いたまま) がケース・容量に付けた「入力なし」の印 = 断らずに使わない (理由にも残さない)
+  const oldCase = ['order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit'];
+  assert.deepEqual(BLK.checkRegisterBlanks('single', { ...single, blanks: [...all, ...oldCase] }, { makerApplicable: true, orderApplicable: true, only: 'main' }), all);
+  assert.deepEqual(BLK.checkRegisterBlanks('variation', { children: [{ code: 'a-1', jan: '4901234567894' }], values: { cost: { jpy: '1' } }, card: { official_url: 'u', amazon_url: 'a', reference_urls: ['r'] },
+    blanks: ['shipping_code', 'inbound_date_managed', ...oldCase] }, { only: 'main' }), ['shipping_code', 'inbound_date_managed']);
+  assert.equal(BLK.blankReasonOf('single', null, ['cost', ...oldCase]), '新商品の登録 · 入力なし: 原価');
   const err = (fn) => { try { fn(); } catch (e) { return e; } assert.fail('断らなかった'); };
   let e = err(() => BLK.checkRegisterBlanks('single', { ...single, blanks: all.filter((k) => k !== 'shipping_code') }));
   assert.deepEqual([e.status, e.reason, e.extra.field, e.extra.blank_key, e.extra.screen_outdated], [400, 'blank_unmarked', 'shipping_code', 'shipping_code', undefined]);
@@ -2782,7 +2793,7 @@ await ta('[BL2] 登録の API (単品): 印の無い項目 = 400 (どの項目�
   assert.equal(await skuId('bl-web-4'), undefined);
 });
 
-await ta('[BL3] 登録の API (セット・発注の設定): セットは例外原価・発送方法・カードの欄 / 発注アプリに書ける人だけ発注の設定の 6 つも聞く (書けない人 = 聞かない)・発注条件グループの「なし」= 入力なし', async () => {
+await ta('[BL3] 登録の API (セット・発注の設定): セットは例外原価・発送方法・カードの欄 / 発注アプリに書ける人だけ発注の設定の 3 つも聞く (ケース・容量は聞かない) (書けない人 = 聞かない)・発注条件グループの「なし」= 入力なし', async () => {
   const setBody = { request_id: uuid(), kind: 'set', code: 'bl-set-1', values: { name: '入力なしのセット', standard_price: '2000', reorder_months: '1', shipping_code: 'S01', components: [{ code: 's001', qty: 2 }] }, card: { create: true } };
   let r = await call('POST', '/apps/master-edit/api/new', { body: setBody, blanks: 'raw' });
   assert.deepEqual([r.status, r.j.reason, r.j.field], [400, 'blank_unmarked', 'exception_cost'], r.text);
@@ -2794,12 +2805,24 @@ await ta('[BL3] 登録の API (セット・発注の設定): セットは例外�
   const po = blankBody('bl-po-1', { card: { create: false } });
   r = await call('POST', '/apps/master-edit/api/new', { body: { ...po, blanks: ['cost', 'maker', 'shipping_code', 'inbound_date_managed'] }, session: 'po-editor', blanks: 'raw' });
   assert.deepEqual([r.status, r.j.reason, r.j.field, r.j.blank_key], [400, 'blank_unmarked', 'order_settings.order_lot', 'order_settings.order_lot'], r.text);
-  // 発注ロットだけ入れて、ほかは入力なし (発注条件グループ・原料グループの「なし」も入力なし)
-  const blanks = ['cost', 'maker', 'shipping_code', 'inbound_date_managed', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit'];
-  r = await call('POST', '/apps/master-edit/api/new', { body: { ...po, order_settings: { order_lot: '12', condition_id: '', material_group_id: '' }, blanks }, session: 'po-editor', blanks: 'raw' });
+  // 発注ロットだけ入れて、ほかは入力なし (発注条件グループ・原料グループの「なし」も入力なし)。🆕 2026-10-24: ケース・容量は空のまま (印なし) で通る
+  const blanks = ['cost', 'maker', 'shipping_code', 'inbound_date_managed', 'order_settings.condition', 'order_settings.material'];
+  r = await call('POST', '/apps/master-edit/api/new', { body: { ...po, order_settings: { order_lot: '12', condition_id: '', material_group_id: '', case_lot: '', case_group: '', capacity_per_unit: '' }, blanks }, session: 'po-editor', blanks: 'raw' });
   assert.equal(r.status, 200, r.text);
-  assert.equal((await regEvents('bl-po-1'))[0].reason, '新商品の登録 · 入力なし: 原価・メーカー・発送方法・入荷日の管理 · 発注の設定の入力なし: 発注条件グループ・原料グループ・ケースロット・ケースグループ・容量');
-  assert.equal(attrsOf('bl-po-1').order_lot, 12);
+  assert.equal((await regEvents('bl-po-1'))[0].reason, '新商品の登録 · 入力なし: 原価・メーカー・発送方法・入荷日の管理 · 発注の設定の入力なし: 発注条件グループ・原料グループ');
+  assert.deepEqual([attrsOf('bl-po-1').order_lot, attrsOf('bl-po-1').case_lot, attrsOf('bl-po-1').case_group, attrsOf('bl-po-1').capacity_per_unit], [12, null, null, null]);
+  // 🆕 2026-10-24: 前の版の画面がケース・容量に付けた「入力なし」の印 = 断らない (記録の一言にも足さない)・ケース・容量に値を入れた = 発注アプリに入る
+  r = await call('POST', '/apps/master-edit/api/new', { body: { ...blankBody('bl-po-3', { card: { create: false } }), order_settings: { order_lot: '6' },
+    blanks: [...blanks, 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit'] }, session: 'po-editor', blanks: 'raw' });
+  assert.equal(r.status, 200, r.text);
+  assert.equal((await regEvents('bl-po-3'))[0].reason, '新商品の登録 · 入力なし: 原価・メーカー・発送方法・入荷日の管理 · 発注の設定の入力なし: 発注条件グループ・原料グループ');
+  r = await call('POST', '/apps/master-edit/api/new', { body: { ...blankBody('bl-po-4', { card: { create: false } }), order_settings: { order_lot: '6', case_lot: '24', case_group: 'G1', capacity_per_unit: '100' }, blanks }, session: 'po-editor', blanks: 'raw' });
+  assert.equal(r.status, 200, r.text);
+  assert.deepEqual([attrsOf('bl-po-4').case_lot, attrsOf('bl-po-4').case_group, attrsOf('bl-po-4').capacity_per_unit], [24, 'G1', 100]);
+  // 値を入れたときの形は今までどおり確かめる (ケースロット 0 = 400・何も作らない)
+  r = await call('POST', '/apps/master-edit/api/new', { body: { ...blankBody('bl-po-5', { card: { create: false } }), order_settings: { order_lot: '6', case_lot: '0' }, blanks }, session: 'po-editor', blanks: 'raw' });
+  assert.deepEqual([r.status, r.j.field], [400, 'order_settings.case_lot'], r.text);
+  assert.equal(await skuId('bl-po-5'), undefined);
   // 発注ロットに値と入力なしの両方 = 断る
   r = await call('POST', '/apps/master-edit/api/new', { body: { ...blankBody('bl-po-2', { card: { create: false } }), order_settings: { order_lot: '3' }, blanks: [...blanks, 'order_settings.order_lot'] }, session: 'po-editor', blanks: 'raw' });
   assert.deepEqual([r.status, r.j.reason, r.j.field], [400, 'blank_with_value', 'order_settings.order_lot'], r.text);
@@ -2818,7 +2841,10 @@ await ta('[BL4] 画面とつかいかた: 新商品の画面に「入力なし�
   assert.ok(!r.text.includes('data-none-all') && !r.text.includes('空の欄を全部'), 'まとめて入力なしにするボタンは置かない (中原さん 10/13: 1 つずつ押す)');
   assert.ok(r.text.indexOf('/public/me-none.js') < r.text.indexOf('/public/me-new.js'), 'me-none.js を先に読む');
   r = await call('GET', '/apps/master-edit/new?kind=single', { session: 'po-editor' });
-  assert.deepEqual(nonesOf(r.text).filter((k) => k.startsWith('order_settings.')), ['order_settings.order_lot', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit']);
+  // 🆕 2026-10-24: ケース・容量は「入力なし」を出さない (入れなくてよい)
+  assert.deepEqual(nonesOf(r.text).filter((k) => k.startsWith('order_settings.')), ['order_settings.order_lot']);
+  for (const k of ['case_lot', 'case_group', 'capacity_per_unit']) assert.ok(!r.text.includes('data-none-part="order_settings.' + k + '"'), k);
+  assert.ok(r.text.includes('id="po-case-opt"') && r.text.includes('入れなくても登録できます'), 'ケース・容量は入れなくてよいと出す');
   for (const id of ['po-cond-mode', 'po-mat-mode']) assert.match((new RegExp('<div class="seg" role="group" id="' + id + '"[^>]*>').exec(r.text) || [''])[0], /data-value=""/, id + ' は初めは選ばない形');
   r = await call('GET', '/apps/master-edit/new?kind=set');
   // 🆕 2026-10-21: セットの発送方法は必須 = 「入力なし」のチェックを置かない・必須の印を出す
@@ -2901,20 +2927,20 @@ await ta('[BL6] #1706 Codex R2 M: 発注の設定の「入力なし」は要求�
   // 理由 (ハッシュに入る) は発注の設定の入力なしで変わらない
   const one0 = blankBody('bl6-x', { card: { create: false } });
   const main = ['cost', 'maker', 'shipping_code', 'inbound_date_managed'];   // 🆕 0084: メーカーも (この DB は 0084 の欄が出る)
-  const ord = ['order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit'];
+  const ord = ['order_settings.order_lot', 'order_settings.condition', 'order_settings.material'];   // 🆕 2026-10-24: ケース・容量は数えない
   assert.equal(BLK.prepareRegisterBody('single', { ...one0, blanks: [...main, ...ord] }).body.reason, BLK.prepareRegisterBody('single', { ...one0, blanks: main }).body.reason);
   assert.equal(BLK.blankReasonOf('single', null, [...main, ...ord]), '新商品の登録 · 入力なし: 原価・メーカー・発送方法・入荷日の管理');
   const ob = BLK.prepareOrderBlanks('single', { ...one0, blanks: [...main, ...ord] }, { orderApplicable: true, reason: '新商品の登録 · 入力なし: 原価' });
-  assert.deepEqual([ob.ok, ob.note], [true, ' · 発注の設定の入力なし: 発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量']);
+  assert.deepEqual([ob.ok, ob.note], [true, ' · 発注の設定の入力なし: 発注ロット・発注条件グループ・原料グループ']);
   assert.equal(BLK.prepareOrderBlanks('single', { ...one0, blanks: main }, { orderApplicable: false }).note, null, '発注の欄が出ない = 聞かない');
   const nb = BLK.prepareOrderBlanks('single', { ...one0, blanks: main }, { orderApplicable: true });
   assert.deepEqual([nb.ok, nb.status, nb.json.reason, nb.json.field], [false, 400, 'blank_unmarked', 'order_settings.order_lot']);
   const unread = async (fn) => { podb.exec('ALTER TABLE po_material_groups RENAME TO po_material_groups_regall'); try { return await fn(); } finally { podb.exec('ALTER TABLE po_material_groups_regall RENAME TO po_material_groups'); } };
-  // ① 読めた (6 つも入力なし) → 読めない の押し直し = 200 replayed (前は理由が変わって 409)
+  // ① 読めた (3 つも入力なし) → 読めない の押し直し = 200 replayed (前は理由が変わって 409)
   const b1 = { ...blankBody('bl6-a', { card: { create: false } }), blanks: [...main, ...ord] };
   let r = await call('POST', '/apps/master-edit/api/new', { body: b1, session: 'po-editor', blanks: 'raw' });
   assert.equal(r.status, 200, r.text);
-  assert.equal((await regEvents('bl6-a'))[0].reason, '新商品の登録 · 入力なし: 原価・メーカー・発送方法・入荷日の管理 · 発注の設定の入力なし: 発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量');
+  assert.equal((await regEvents('bl6-a'))[0].reason, '新商品の登録 · 入力なし: 原価・メーカー・発送方法・入荷日の管理 · 発注の設定の入力なし: 発注ロット・発注条件グループ・原料グループ');
   r = await unread(() => call('POST', '/apps/master-edit/api/new', { body: b1, session: 'po-editor', blanks: 'raw' }));
   assert.deepEqual([r.status, r.j.replayed], [200, true], r.text);
   // ② 読めない (画面に発注の欄が無い = 印も無い) → 読めた の押し直し = 200 replayed (前は 400 blank_unmarked)

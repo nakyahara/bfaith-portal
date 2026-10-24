@@ -109,6 +109,11 @@ main { padding: 22px 28px 90px; min-width: 0; }
 .crumb-row .crumb { margin-bottom: 0; min-width: 0; }
 .crumb-row .crumb .mono { overflow-wrap: anywhere; }
 .pn { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+/* 🆕 2026-10-24: 商品の画面のパンくずの帯の右 = 前へ・次へ と 新しい単品・セット (狭い幅は折り返す) */
+.crumb-acts { display: flex; align-items: center; justify-content: flex-end; gap: 6px 14px; flex-wrap: wrap; margin-left: auto; min-width: 0; }
+.crumb-acts .pn { margin-left: 0; }
+.sku-new { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.sku-new .btn { white-space: nowrap; }
 .pn .btn { white-space: nowrap; }
 .pn-pos { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .pn-pos.out { color: var(--warn); }

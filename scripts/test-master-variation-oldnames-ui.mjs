@@ -360,7 +360,7 @@ await ta('[N5] 参考 URL は 20 個まで (足すボタン)・API: 形の違う
     values: { standard_price: '1', cost: { jpy: '1' }, tax_rate: '0.1', sales_class: '1', primary_supplier: '0001', reorder_months: '1', expiry_managed: '0', inbound_date_managed: '0', shipping_code: 'A1' },
     card: { official_url: 'https://a.example', amazon_url: 'https://www.amazon.co.jp/dp/B000000000' } };
   const post = (body) => p.evaluate(async ([b0, x]) => { const r = await fetch(b0 + '/api/new/variation', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ request_id: crypto.randomUUID(), ...x }) }); return [r.status, await r.json()]; }, [B, body]);
-  const ORDER = ['order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit'];
+  const ORDER = ['order_settings.order_lot', 'order_settings.condition', 'order_settings.material'];   // 🆕 2026-10-24: ケース・容量は数えない
   // 🆕 0084: 今の画面はメーカーも「値か入力なし」を送る (送らない = 参考 URL の形より先にメーカーで 400)。下の前の画面 (legacy) はメーカーも無いまま = 参考 URL の前の画面の答え・押し直しも前の答え
   let r = await post({ ...base, card: { ...base.card, reference_urls: ['ftp://x.example'] }, blanks: [...ORDER, 'children.jan', 'maker'] });
   assert.deepEqual([r[0], r[1].field], [400, 'card.reference_urls'], JSON.stringify(r));

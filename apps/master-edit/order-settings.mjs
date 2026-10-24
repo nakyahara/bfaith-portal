@@ -38,7 +38,7 @@ export function orderScreen(req, editor, code = null, { supplier = null } = {}) 
 }
 
 /**
- * 🆕 2026-10-13 (入力なし・#1706 Codex R1 M2): 新商品の登録で発注の設定の 6 つの項目を「値か入力なし」として数えるか。
+ * 🆕 2026-10-13 (入力なし・#1706 Codex R1 M2): 新商品の登録で発注の設定の 3 つの項目 (発注ロット・発注条件グループ・原料グループ。🆕 2026-10-24: ケース・容量は数えない) を「値か入力なし」として数えるか。
  *   画面 (views/_order.ejs の「入力なし」と public/me-order.js の items) と API (lib/master-register-blanks.mjs の orderApplicable) は
  *   どちらもこの 1 つの答えを使う = 権限が無い・発注アプリの設定を読めない (画面に欄が出ない) ときは、API も聞かない
  */
