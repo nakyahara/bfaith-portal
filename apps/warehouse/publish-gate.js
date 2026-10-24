@@ -288,12 +288,13 @@ export const PUBLISH_UNGATED_SCRIPTS = Object.freeze({
   'apps/warehouse/fetch-amazon-listing-issues.js': 'Amazon の出品の状態だけ (SP-API と注文・FBA 在庫・手数料の表)',
   'apps/warehouse/alert-amazon-listing.js': '出品とカートの知らせだけ (写しと注文・FBA 在庫の表)',
   'apps/warehouse/fetch-amazon-bsr.js': 'Amazon の売れ筋順位だけ (SP-API と注文・手数料の表)',
-  // Amazon AI 分析用のレポート (2026-10-22・見張りの後・DBバックアップの前)。SP-API のレポートを自分の表に入れるだけ・返品のアラートは返品の明細と raw_sp_orders だけを読む
+  // Amazon AI 分析用のレポート (2026-10-22・見張りの後・DBバックアップの前)。SP-API のレポートを自分の表に入れるだけ・返品のアラートは返品の明細と raw_sp_orders だけ・補てん漏れのアラートは台帳・補てんの明細と在庫計画の売価だけを読む
   'apps/warehouse/fetch-amazon-sales-traffic.js': 'SP-API のアクセス・転換率のレポートだけ',
   'apps/warehouse/fetch-amazon-returns.js': 'SP-API の返品のレポートだけ',
   'apps/warehouse/monitor-amazon-returns.js': '返品の明細と注文だけ',
   'apps/warehouse/fetch-amazon-reimbursements.js': 'SP-API の補てんのレポートだけ',
   'apps/warehouse/fetch-amazon-ledger.js': 'SP-API の在庫の台帳のレポートだけ',
+  'apps/warehouse/monitor-amazon-reimb-gap.js': '在庫の台帳と補てんの明細・在庫計画の売価だけ',
 });
 
 /** 止めた朝に fail の ping を代わりに打つ工程 (自分で ping を打つ = 台帳に項目がある) */
