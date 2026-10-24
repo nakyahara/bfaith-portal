@@ -14,7 +14,7 @@
  *   それを古い順に、次の分で消していく (先入れ先出し。🚨 その日より後に起きた分でしか消さない = 取り始める前の紛失への補てんを今の紛失に当てる誤りは「出さない」側に倒れる):
  *     ① 同じ理由の数量が正の行 (破損の取り消しなど) ② 見つかった (FOUND_REASONS = F・数量が正) = 紛失だけを消す。消す紛失が無ければ「余り」として持つ
  *     ③ 補てん (Lost_Warehouse / Damaged_Warehouse・現金と在庫の両方 = quantity-reimbursed-total)。同じ種類を先に、無ければ別の種類も
- *     ④ 補てんの取り消し (数量が負) = 先に「見つかった余り」を消す (見つかった → Amazon が補てんを取り消した = 差し引きゼロ)、残りは最後に補てんで消した分を戻す
+ *     ④ 補てんの取り消し (数量が負) = 先に「見つかった余り」を消す (見つかった → Amazon が補てんを取り消した = 差し引きゼロ)、残りは取り消された補てん (original-reimbursement-id) が消した分を戻す (分からなければ同じ種類の補てん → どれでも、新しい順)
  *   残った分の発生日から: 待つ日数 (紛失 WAIT_DAYS_LOST・破損 WAIT_DAYS_DAMAGED = Amazon の自動の補てん・見つかるのを待つ) より前 = 「待っている」(載せない)
  *                      申請の期限 (発生から CLAIM_DEADLINE_DAYS 日) を過ぎた = 「期限切れの可能性」(件数だけ) / そのあいだ = 候補
  *   見込みの金額 = 個数 × 単価 (① その FNSKU (無ければ SKU) の最後の補てんの単価 amount-per-unit ② 在庫計画の売価 your_price ③ 分からなければ数量だけ)
@@ -133,7 +133,7 @@ export function reimbUnits(row) {
 
 /**
  * 1 つの FNSKU の出来事を古い順に突き合わせ、残った紛失・破損の塊を返す (純粋な関数。試験で直接呼ぶ)
- * @param {{ date: string, type: 'loss'|'restore'|'found'|'reimb', kind?: 'lost'|'damaged'|'any', qty: number, unrec?: number|null }[]} events
+ * @param {{ date: string, type: 'loss'|'restore'|'found'|'reimb', kind?: 'lost'|'damaged'|'any', qty: number, id?: string, origId?: string }[]} events  (id / origId = 補てんの ID と取り消された補てんの ID)
  * @returns {{ open: { date, kind, qty }[], foundSurplus: number }}
  */
 export function matchEvents(events) {
@@ -168,16 +168,25 @@ export function matchEvents(events) {
       if (qty > 0) {
         const a = consume(qty, (p) => e.kind === 'any' || p.kind === e.kind);
         const b = a.rest > 0 ? consume(a.rest, () => true) : { taken: [] };
-        reimbursed.push(...a.taken, ...b.taken);
+        for (const p of [...a.taken, ...b.taken]) reimbursed.push({ ...p, id: e.id ?? null });
       } else {
         let n = -qty;
         const s = Math.min(foundSurplus, n); foundSurplus -= s; n -= s;
-        while (n > 0 && reimbursed.length) {
-          const last = reimbursed[reimbursed.length - 1];
-          const q = Math.min(last.qty, n);
-          reopen({ date: last.date, kind: last.kind, qty: q });
-          last.qty -= q; n -= q;
-          if (last.qty <= 0) reimbursed.pop();
+        // 戻す塊: ① 取り消された補てん (original-reimbursement-id) が消した塊 ② 同じ種類の補てんが消した塊 ③ どれでも。それぞれ新しい順 (Codex R1 P2)
+        const pickers = [
+          ...(e.origId ? [(p) => p.id === e.origId] : []),
+          ...(e.kind && e.kind !== 'any' ? [(p) => p.kind === e.kind] : []),
+          () => true,
+        ];
+        for (const pick of pickers) {
+          for (let i = reimbursed.length - 1; i >= 0 && n > 0; i--) {
+            const p = reimbursed[i];
+            if (!pick(p)) continue;
+            const q = Math.min(p.qty, n);
+            reopen({ date: p.date, kind: p.kind, qty: q });
+            p.qty -= q; n -= q;
+            if (p.qty <= 0) reimbursed.splice(i, 1);
+          }
         }
       }
     }
@@ -229,7 +238,7 @@ export function evaluateReimbGap(db, { today = jstToday(), rules = RULES } = {})
     const k = r.msku.toLowerCase();
     skuToFnsku.set(k, skuToFnsku.has(k) && skuToFnsku.get(k) !== r.fnsku ? null : r.fnsku);
   }
-  const reimbRows = db.prepare(`SELECT approval_date_jst, seller_sku, fnsku, reason, quantity_reimbursed_cash, quantity_reimbursed_inventory, quantity_reimbursed_total, original_reimbursement_type
+  const reimbRows = db.prepare(`SELECT approval_date_jst, reimbursement_id, original_reimbursement_id, seller_sku, fnsku, reason, quantity_reimbursed_cash, quantity_reimbursed_inventory, quantity_reimbursed_total, original_reimbursement_type
     FROM amazon_fba_reimbursements WHERE approval_date_jst >= ? AND approval_date_jst <= ? ORDER BY approval_date_jst`).all(windowFrom, today);
   for (const r of reimbRows) {
     const kind = reimbKind(r, rules);
@@ -237,7 +246,7 @@ export function evaluateReimbGap(db, { today = jstToday(), rules = RULES } = {})
     const fnsku = r.fnsku || (r.seller_sku ? skuToFnsku.get(r.seller_sku.toLowerCase()) : null);
     if (!fnsku || !byFnsku.has(fnsku)) continue;   // 期間に紛失・破損の無い FNSKU への補てん = 突き合わせる相手が無い
     const qty = reimbUnits(r);
-    if (qty) byFnsku.get(fnsku).events.push({ date: r.approval_date_jst, type: 'reimb', kind, qty });
+    if (qty) byFnsku.get(fnsku).events.push({ date: r.approval_date_jst, type: 'reimb', kind, qty, id: r.reimbursement_id, origId: r.original_reimbursement_id || null });
   }
 
   // 単価: ① 最後の補てんの単価 (FNSKU → SKU) ② 在庫計画の売価
@@ -263,7 +272,8 @@ export function evaluateReimbGap(db, { today = jstToday(), rules = RULES } = {})
     const { open } = matchEvents(g.events);
     if (!open.length) continue;
     const waitOf = (k) => (k === 'lost' ? rules.WAIT_DAYS_LOST : rules.WAIT_DAYS_DAMAGED);
-    const claim = [], wait = [], gone = [];
+    let claim = [];
+    const wait = [], gone = [];
     for (const p of open) {
       const age = daysBetween(p.date, today);
       const daysLeft = rules.CLAIM_DEADLINE_DAYS - age;
@@ -279,8 +289,13 @@ export function evaluateReimbGap(db, { today = jstToday(), rules = RULES } = {})
     // Amazon の未照合 (見せるだけ。TRUST_AMAZON_UNRECONCILED なら個数をそこまで削る): 候補の期間 (待つ日数を過ぎ・期限の前) の紛失・破損の行の合計
     const inRange = g.lossRows.filter((r) => { const age = daysBetween(r.date, today); return age >= waitOf(r.kind) && age <= rules.CLAIM_DEADLINE_DAYS; });
     const amazonUnreconciled = inRange.length && inRange.every((r) => r.unrec !== null) ? inRange.reduce((s, r) => s + r.unrec, 0) : null;
-    let units = sum(claim);
-    if (rules.TRUST_AMAZON_UNRECONCILED && amazonUnreconciled !== null) units = Math.min(units, amazonUnreconciled);
+    if (rules.TRUST_AMAZON_UNRECONCILED && amazonUnreconciled !== null && sum(claim) > amazonUnreconciled) {
+      // 塊そのものを削る (新しい方から) = 紛失・破損の内訳・期限・金額も削った後の塊から出す (Codex R1 P2)
+      let keep = amazonUnreconciled;
+      claim = claim.map((p) => { const q = Math.min(p.qty, keep); keep -= q; return { ...p, qty: q }; }).filter((p) => p.qty > 0);
+      if (!claim.length) continue;
+    }
+    const units = sum(claim);
     if (units < rules.MIN_UNITS) continue;
     const value = price.unitPrice ? units * price.unitPrice : null;
     if (value !== null && value < rules.MIN_VALUE_YEN) continue;

@@ -109,6 +109,27 @@ await t('紛失 → 補てん → 見つかった → 補てんの取り消し =
   assert.deepEqual([units(r, 'X001'), units(r, 'X002')], [0, 1]);
   assert.equal(r.items.find((i) => i.fnsku === 'X002').firstDate, ago(50));   // 戻った分は元の発生日 (期限も元の日から)
 });
+await t('🚨 補てんの取り消しは、取り消された補てん (original-reimbursement-id) が消した塊を戻す (最後の補てんの塊ではない・Codex R1 P2)', () => {
+  const db = openDb();
+  led(db, { date: ago(55), reason: 'M', qty: -1 });
+  reimb(db, { date: ago(45), qty: 1 });                                   // この紛失の補てん
+  const lostReimbId = `RB${rid}`;
+  led(db, { date: ago(5), reason: 'E', qty: -1 });
+  reimb(db, { date: ago(3), reason: 'Damaged_Warehouse', qty: 1 });
+  db.prepare(`INSERT INTO amazon_fba_reimbursements (reimbursement_id, seller_sku, fnsku, occurrence, approval_date, approval_date_jst, reason, quantity_reimbursed_total, original_reimbursement_id, original_reimbursement_type, report_id, generation, first_seen_at, fetched_at)
+    VALUES ('RV1', 'sku-a', 'X001', 1, ?, ?, 'Reimbursement_Reversal', -1, ?, 'Lost_Warehouse', 'R', 1, 'x', 'x')`).run(ago(2), ago(2), lostReimbId);
+  const r = ev(db);
+  assert.equal(r.items.length, 1);
+  assert.deepEqual([r.items[0].lostUnits, r.items[0].damagedUnits, r.items[0].firstDate, r.items[0].daysLeft, r.items[0].urgent], [1, 0, ago(55), 5, true]);
+  assert.equal(r.pending.items, 0);   // 5 日前の破損は補てん済みのまま (待っている に戻さない)
+  // ID が無い取り消しでも、同じ種類の補てんの塊を先に戻す
+  const m = matchEvents([
+    { date: '2026-09-01', type: 'loss', kind: 'lost', qty: 1 }, { date: '2026-09-02', type: 'reimb', kind: 'lost', qty: 1, id: 'A' },
+    { date: '2026-10-01', type: 'loss', kind: 'damaged', qty: 1 }, { date: '2026-10-02', type: 'reimb', kind: 'damaged', qty: 1, id: 'B' },
+    { date: '2026-10-05', type: 'reimb', kind: 'lost', qty: -1 },
+  ]);
+  assert.deepEqual(m.open, [{ date: '2026-09-01', kind: 'lost', qty: 1 }]);
+});
 await t('🚨 紛失より前の補てん・見つかった (取り始める前の紛失の分) は、後の紛失に当てない = 候補に出る', () => {
   const db = openDb();
   reimb(db, { date: ago(60), qty: 1 });
@@ -200,6 +221,14 @@ await t('Amazon の未照合は見せるだけ (既定)。TRUST_AMAZON_UNRECONCI
   led(db, { date: ago(35), reason: 'M', qty: -2, unrec: 0 });
   assert.deepEqual([units(ev(db)), ev(db).items[0].amazonUnreconciled], [2, 0]);
   assert.equal(ev(db, { ...RULES, TRUST_AMAZON_UNRECONCILED: true }).items.length, 0);
+  // 削るときは塊ごと (内訳・期限・金額もそろえる。Codex R1 P2)
+  const db2 = openDb();
+  led(db2, { date: ago(50), reason: 'M', qty: -1, unrec: 0 });
+  led(db2, { date: ago(35), reason: 'M', qty: -2, unrec: 1 });
+  const trusted = ev(db2, { ...RULES, TRUST_AMAZON_UNRECONCILED: true });
+  const it = trusted.items[0];
+  assert.deepEqual([it.units, it.lostUnits, it.damagedUnits, it.amazonUnreconciled, it.firstDate], [1, 1, 0, 1, ago(50)]);
+  assert.match(buildGapMessage(trusted), /計 1 個[\s\S]*紛失 1 個/);
 });
 
 console.log('③ 表が空・取得が古い・台帳の古い日');
