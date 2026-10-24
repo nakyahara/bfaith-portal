@@ -1552,6 +1552,14 @@ async function main() {
   const agedAlertResult = runScript('apps/warehouse/alert-fba-aged-inventory.js', 'FBA長期在庫アラート', 60000);
   results.push({ name: 'FBA長期在庫アラート', ...agedAlertResult, warn: agedAlertResult.success && isWarnSummary(agedAlertResult.summary) });
 
+  // データの新しさ (2026-10-24・2026-10-23 にモールのログイン切れで Yahoo統計・au PAY・Qoo10 の分析が何週間も止まっていたのが朝のまとめに出ていなかった)。
+  // モールの取込 (楽天・Yahoo・au PAY・Qoo10 の分析・レビュー)・注文の取得の後。決まった一覧の表の最新の日付を読み、しきい値を超えたら止まっている。
+  // 今朝の自動取得 (fetch-all) の exit 3 = ログイン切れも出す。止まっている・ログイン切れ・止めているものの台帳の期限切れ = ⚠️ (exit 0)。
+  // GChat は 1 通にまとめ、新しく止まった日と 7 日ごとの念押しだけ。読むだけ (自分の記録の表 data_freshness_alert_state だけ書く)・再試行に載せない
+  // 🚨 Amazon AI 分析用の表は、この後 (見張りの後) に今朝の分を取る = ここでは前の朝までの分で見る (しきい値は 3 日以上)
+  const freshnessResult = runScript('apps/warehouse/monitor-data-freshness.js', 'データの新しさ', 120000);
+  results.push({ name: 'データの新しさ', ...freshnessResult, warn: freshnessResult.success && isWarnSummary(freshnessResult.summary) });
+
   // 売上分類別粗利集計 (mgmt-accounting) の売上自動同期は Render 完結（server.js の常駐
   // スケジューラが in-process で実行）に移行したため、daily-sync(miniPC)からの起動は撤去。
 
