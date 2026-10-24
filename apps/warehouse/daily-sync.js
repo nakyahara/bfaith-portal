@@ -1785,7 +1785,8 @@ async function main() {
   // 遅らせないように、見張りの後・DBバックアップの前に置く (バックアップに新しい表が入る)。publish-gate.js では「止めない工程」(m_products を読まない)
   //   アクセス・転換率 = GET_SALES_AND_TRAFFIC_REPORT (1 日 = 1 レポート・直近 5 日を毎朝取り直す・日ごとに置き換え)
   //   返品 = GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA (直近 60 日を UPSERT) → 取れた朝だけ返品のアラート (控えめ・GCHAT_WEBHOOK が無ければ送らない・exit 0)
-  //   補てん = GET_FBA_REIMBURSEMENTS_DATA (直近 60 日を UPSERT)・在庫の台帳 = GET_LEDGER_DETAIL_VIEW_DATA (直近 30 日を日ごとに置き換え) = 保存まで
+  //   補てん = GET_FBA_REIMBURSEMENTS_DATA (直近 60 日を UPSERT)・在庫の台帳 = GET_LEDGER_DETAIL_VIEW_DATA (直近 30 日を日ごとに置き換え)
+  //     → 両方が取れた朝だけ補てん漏れのアラート (monitor-amazon-reimb-gap.js。週 1 回・火曜・1 通・GCHAT_WEBHOOK が無ければ送らない・exit 0)
   //   SP-API の主取得が失敗した朝は全部スキップ (カート価格と同じ)。どれかが失敗しても後ろは続ける。🚨 引数を必ず渡す (runScript は引数なしだと '7' を足す)
   //   createReport / getReportDocument は 1 分に 1 回 (burst 15)。アクセスのレポートだけは別に「5 分に 3 回」= 直近 5 日は 3 つ → 5 分待って 2 つ (約 10 分)。timeout は polling の上限 (15〜25 分) より長く
   if (spResult.success) {
@@ -1803,6 +1804,14 @@ async function main() {
     results.push({ name: 'Amazon補てん', ...reimbResult, warn: reimbResult.success && isWarnSummary(reimbResult.summary) });
     const ledgerResult = runScript('apps/warehouse/fetch-amazon-ledger.js --days 30', 'Amazon在庫台帳', 2100000);
     results.push({ name: 'Amazon在庫台帳', ...ledgerResult, warn: ledgerResult.success && isWarnSummary(ledgerResult.summary) });
+    // 補てん漏れ (紛失・破損したのに補てんされていない在庫) を週 1 回 (火曜)・1 通で GChat へ。API は呼ばない (台帳と補てんの表を突き合わせるだけ)。
+    // 台帳と補てんの取得が両方成功した朝だけ (古い明細で判定しない)。曜日でない・今週は送った = 何もしない。送れなくても exit 0
+    if (reimbResult.success && ledgerResult.success) {
+      const reimbGapResult = runScript('apps/warehouse/monitor-amazon-reimb-gap.js --daily', 'Amazon補てん漏れアラート', 120000);
+      results.push({ name: 'Amazon補てん漏れアラート', ...reimbGapResult, warn: reimbGapResult.success && isWarnSummary(reimbGapResult.summary) });
+    } else {
+      console.log('[DailySync] Amazon補てん / 在庫台帳 の取得が失敗したため 補てん漏れアラートをスキップ (古い明細で判定しない)');
+    }
   } else {
     console.log('[DailySync] SP-API 失敗のため Amazon のアクセス・返品・補てん・在庫台帳の取得をスキップ');
     for (const name of ['Amazonアクセス・転換率', 'Amazon返品', 'Amazon補てん', 'Amazon在庫台帳']) {

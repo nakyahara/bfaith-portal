@@ -461,7 +461,7 @@ export const JOBS_REGISTRY = [
       + '🆕 2026-10-22: 「CompanyDB見張り」の後・「DBバックアップ」の前 (今ある工程を遅らせないため・バックアップに新しい表が入る) に AI の分析・アラート用の SP-API レポート 4 つ (共通の部品 apps/warehouse/sp-api-report.js・取得の記録 = warehouse.db の sp_report_fetch_days)。'
       + '「Amazonアクセス・転換率」(fetch-amazon-sales-traffic.js --days 5。GET_SALES_AND_TRAFFIC_REPORT を 1 日 = 1 レポート・日ごとに置き換え → amazon_sales_traffic_sku_daily / _daily / 元の JSON = _raw)・'
       + '「Amazon返品」(fetch-amazon-returns.js --days 60 → amazon_fba_returns を UPSERT) → 取れた朝だけ「Amazon返品アラート」(monitor-amazon-returns.js。返品が多い SKU・同じ理由が急に増えた SKU を 1 通・同じ SKU は 7 日出さない・GCHAT_WEBHOOK が無ければ送らない・exit 0)・'
-      + '「Amazon補てん」(fetch-amazon-reimbursements.js --days 60 → amazon_fba_reimbursements を UPSERT)・「Amazon在庫台帳」(fetch-amazon-ledger.js --days 30 → amazon_inventory_ledger を日ごとに置き換え)。'
+      + '「Amazon補てん」(fetch-amazon-reimbursements.js --days 60 → amazon_fba_reimbursements を UPSERT)・「Amazon在庫台帳」(fetch-amazon-ledger.js --days 30 → amazon_inventory_ledger を日ごとに置き換え) → 両方が取れた朝だけ「Amazon補てん漏れアラート」(monitor-amazon-reimb-gap.js --daily。🆕 2026-10-24。紛失・破損したのに補てんされていない FNSKU を週 1 回 (火曜)・1 通・同じ週は 2 通送らない (amazon_reimb_gap_alert_log)・GCHAT_WEBHOOK が無ければ送らない・exit 0)。'
       + 'SP-API の主取得 (「Amazon SP-API」) が失敗した朝は全部 ⏭️。写しの反映が世代と違う朝も止めない (publish-gate.js の止めない工程)。再試行には載せない (翌朝また直近を取り直す)。新しい定期実行は無い (この台帳の ping に乗る)。止まると AI の分析の材料が古びるだけ (業務は止まらない)。'
       + '🆕 2026-10-12: 「Company DB 在庫日次 (fba_jp / fba_us)」の後に「Company DB 出品一覧 (Amazon)」(apps/company-db/push/amazon-listings.mjs --send。受け皿 = ops.amazon_listing_report (migration 0074)。'
       + '材料 = 前の夜に「expected-profit-nightly」(23:30) が取って残した出品レポート GET_MERCHANT_LISTINGS_ALL_DATA の TSV (DATA_DIR/mall-items-history/amazon/ の manifest の最後の complete の回)。'
