@@ -6,7 +6,7 @@
  *   1 対象外 / 保存できない の判定 (値の前 = 項目の板の数): 例外の SKU は常に対象外・セットの原価 / 税率 / 仕入先 / 売上分類・取扱を中止した商品 (取扱を戻す以外)・
  *     登録をやめた・無いコード / 先の日の原価 (含むセットも)・NE に取り込む CSV が出ている = 最初から「保存できない」(Codex M5)
  *   2 200 件の上限 (選ぶ時点・API も 413)・重なりは 1 つ・20 件ずつ
- *   3 全部の項目 (原価・売価・取扱・売上分類・税率・仕入先) の一括の保存 = 1 件の保存 (saveSku) と同じ記録 (人・request_id・理由「一括 ◯ 件」)
+ *   3 全部の項目 (原価・売価・取扱・売上分類・税率・仕入先・配送方法) の一括の保存 = 1 件の保存 (saveSku) と同じ記録 (人・request_id・理由「一括 ◯ 件」)
  *   4 部分の成功: 途中で 1 件だめでも、できた分は変えたまま。だめな分は理由と直し方の組 (Codex M7)
  *   5 二重押し: 同じ一括の番号でもう一度送っても二重に書かない (前の結果が返る・やり直した分も)
  *   6 同じセットの構成品を続けて変える = version_conflict → この一括の分だけなら読み直して 1 回だけやり直す / ほかの人の変更があれば「だめ」
@@ -33,6 +33,7 @@ const { forceNewOpen } = await import('./fixtures/master-widen.mjs');
 const W = await import('../lib/master-write.mjs');
 const C = await import('../lib/master-cutover.mjs');
 const B = await import('../apps/master-edit/bulk.mjs');
+const { masterProfit } = await import('../lib/profit-estimate.js');
 const { default: router, __setPgClientFactory, __setClock, __setShippingRatesProvider } = await import('../apps/master-edit/router.mjs');
 
 let passed = 0;
@@ -41,7 +42,8 @@ const quiet = () => {};
 const ALL = Object.fromEntries(OWNED_COLUMNS.map((k) => [k, 'company']));
 const NOW = new Date('2030-01-10T03:00:00Z');
 const TODAY = '2030-01-10';
-const RATES = new Map([['S02', { method: '宅急便', cost: 520 }]]);
+// 送料の表 (B2 = 金額に小数 = 保存と同じく円に丸める)
+const RATES = new Map([['S02', { method: '宅急便', cost: 520 }], ['B2', { method: '宅急便コンパクト', cost: 600.4 }], ['C01', { method: 'ネコポス', cost: 198 }]]);
 
 // ── Company DB ──
 const pg = new PGlite();
@@ -102,13 +104,13 @@ for (const code of ['b001', 's003']) {
 async function as(role, fn) { await pg.query(`set role ${role}`); try { return await fn(); } finally { await pg.query('set role deploy'); } }
 const editor = (fn) => as('master_edit', fn);
 const editableNow = async () => B.editableOf(await C.readCutoverPhase(db), await OG.readScreenOwnership(db), true);
-const inspect = async (codes) => editor(async () => B.bulkInspect(db, { codes }, { now: NOW, editable: await editableNow(), suppliers: [{ code: '0001', name: 'AMC' }, { code: '0002', name: 'ビーフリー' }] }));
-const preview = async (codes, field, value, { reason = null, actor = 'naka@test' } = {}) => editor(async () => B.bulkPreview(db, { codes, field, value, reason },
-  { now: NOW, editable: await editableNow(), suppliers: [{ code: '0001', name: 'AMC' }, { code: '0002', name: 'ビーフリー' }], actor }));
-/** 保存の 1 回分 (切符 + 商品の印)。over = 送る中身を書き換える (差し替えの試験) */
-const applyChunk = (pv, part, { actor = 'naka@test', over = {}, nowMs } = {}) => editor(() => B.bulkApplyChunk(db, {
+const inspect = async (codes, { rates = RATES, editable } = {}) => editor(async () => B.bulkInspect(db, { codes }, { now: NOW, editable: editable || await editableNow(), suppliers: [{ code: '0001', name: 'AMC' }, { code: '0002', name: 'ビーフリー' }], shippingRates: rates }));
+const preview = async (codes, field, value, { reason = null, actor = 'naka@test', rates = RATES } = {}) => editor(async () => B.bulkPreview(db, { codes, field, value, reason },
+  { now: NOW, editable: await editableNow(), suppliers: [{ code: '0001', name: 'AMC' }, { code: '0002', name: 'ビーフリー' }], shippingRates: rates, actor }));
+/** 保存の 1 回分 (切符 + 商品の印)。over = 送る中身を書き換える (差し替えの試験)・rates = 保存のときの送料の表 */
+const applyChunk = (pv, part, { actor = 'naka@test', over = {}, nowMs, rates = RATES } = {}) => editor(() => B.bulkApplyChunk(db, {
   actor, ticket: pv.ticket, field: pv.field, value: pv.value, reason: pv.reason, total: pv.counts.chg,
-  items: part.map((x) => ({ code: x.code, token: x.token, self: x.self, mac: x.mac })), ...over }, { open: true, now: NOW, nowMs }));
+  items: part.map((x) => ({ code: x.code, token: x.token, self: x.self, mac: x.mac })), ...over }, { open: true, now: NOW, nowMs, shippingRates: rates }));
 /** 確かめ → 保存 (20 件ずつ)。before = 確かめと保存の間にすること */
 async function run(codes, field, value, { reason = null, actor = 'naka@test', before = null, p = null } = {}) {
   const pv = p || await preview(codes, field, value, { reason, actor });
@@ -141,9 +143,9 @@ await ta('[1] 項目の板の判定: 例外は常に対象外・セット・中�
     assert.equal(v('nope-1', f), 'out', `無い ${f}`);
   }
   assert.deepEqual(Object.fromEntries(Object.keys(B.BULK_FIELDS).map((f) => [f, v('s001', f)])),
-    { cost: 'out', standard_price: 'ok', handling: 'ok', sales_class: 'out', tax_rate: 'out', primary_supplier: 'out' });
+    { cost: 'out', standard_price: 'ok', handling: 'ok', sales_class: 'out', tax_rate: 'out', primary_supplier: 'out', shipping_code: 'ok' });
   assert.deepEqual(Object.fromEntries(Object.keys(B.BULK_FIELDS).map((f) => [f, v('d001', f)])),
-    { cost: 'out', standard_price: 'out', handling: 'ok', sales_class: 'out', tax_rate: 'out', primary_supplier: 'out' });
+    { cost: 'out', standard_price: 'out', handling: 'ok', sales_class: 'out', tax_rate: 'out', primary_supplier: 'out', shipping_code: 'out' });
   assert.equal(v('b001', 'cost'), 'block'); assert.equal(v('b001', 'standard_price'), 'ok');
   assert.equal(v('b003', 'cost'), 'block'); assert.match(r.items.find((x) => x.code === 'b003').fields.cost.why, /含むセット s003/);
   assert.equal(v('b002', 'cost'), 'ok'); assert.equal(v('b002', 'standard_price'), 'ok'); assert.equal(v('b002', 'tax_rate'), 'ok');   // 🆕 10/19 (0094): CSV が出ていても保存できる
@@ -239,6 +241,116 @@ await ta('[3] 売上分類・仕入先: 単品だけ・選べない仕入先は 
   const r2 = await run(['a004', 'a005'], 'primary_supplier', '2');
   assert.ok(r2.results.every((x) => x.ok), JSON.stringify(r2.results));
   assert.equal((await row('a004')).sup, '0002'); assert.equal((await row('a005')).sup, '0002');
+});
+
+const ship = async (code) => (await pg.query('select shipping_code as code, shipping_method as method, shipping_cost_jpy::int as cost from core.skus where code = $1', [code])).rows[0];
+
+await ta('[15] 配送方法: 単品もセットも (自分の値)・送料の表のコードだけ (無い = 400・表が読めない = 503 / 板は保存できない)・前と後 = 方法と金額と利益・保存の後 = 送料の表の金額 (円に丸める)', async () => {
+  // 板: 送料の表がある = 単品もセットも変えられる・例外 / 中止は対象外。今の値 = 送料コード。選べる値 = 送料の表 (金額は円に丸める)
+  const i = await inspect(['a004', 's001', 'x001', 'd001']);
+  assert.deepEqual(i.items.map((x) => [x.code, x.fields.shipping_code.verdict, x.fields.shipping_code.now]), [['a004', 'ok', 'S02'], ['s001', 'ok', 'S02'], ['x001', 'out', 'S02'], ['d001', 'out', 'S02']]);
+  assert.deepEqual(i.shippingRates, [{ code: 'S02', method: '宅急便', cost: 520 }, { code: 'B2', method: '宅急便コンパクト', cost: 600 }, { code: 'C01', method: 'ネコポス', cost: 198 }]);
+  // 今の値の方法・金額 = 商品に保存してある値 (送料の表の今の金額で補わない・#Codex R1 Medium)
+  const i2 = await inspect(['a004'], { rates: new Map([['S02', { method: '表の宅急便', cost: 999 }]]) });
+  assert.deepEqual(i2.items[0].fields.shipping_code.ship, { code: 'S02', method: '宅急便', cost: 520 });
+  const i0 = await inspect(['a004', 's001'], { rates: null });
+  assert.deepEqual(i0.items.map((x) => [x.fields.shipping_code.verdict, x.fields.shipping_code.reason]), [['block', 'shipping_rates_unavailable'], ['block', 'shipping_rates_unavailable']]);
+  assert.equal(i0.items[0].fields.standard_price.verdict, 'ok', 'ほかの項目は送料の表に関係ない');
+  assert.equal(i0.shippingRates, null);
+  // 確かめ: 表に無いコード = 400・表が読めない = 503・空 = 400
+  await assert.rejects(() => preview(['a004'], 'shipping_code', 'ZZZ'), (e) => e.status === 400 && /送料の表にありません/.test(e.message));
+  await assert.rejects(() => preview(['a004'], 'shipping_code', 'B2', { rates: null }), (e) => e.status === 503 && e.reason === 'shipping_rates_unavailable');
+  await assert.rejects(() => preview(['a004'], 'shipping_code', '  '), (e) => e.status === 400 && /新しい値を入れて|配送方法を選んで/.test(e.message));
+  // 前と後 (方法・金額 = 保存で書く値・利益の前後)・一緒に変わるセットは無い
+  const p = await preview(['a004', 's001', 'x001', 'd001'], 'shipping_code', 'B2');
+  assert.deepEqual(p.items.map((x) => [x.code, x.verdict]), [['a004', 'chg'], ['s001', 'chg'], ['x001', 'out'], ['d001', 'out']]);
+  const a = p.items.find((x) => x.code === 'a004');
+  assert.deepEqual([a.before, a.after], ['S02', 'B2']);
+  assert.deepEqual(a.ship, { before: { code: 'S02', method: '宅急便', cost: 520 }, after: { code: 'B2', method: '宅急便コンパクト', cost: 600 } });
+  const cur = await W.readCurrent(db, await sid('a004'), TODAY);
+  const base = { price: cur.standard_price, cost: cur.cost_today.cost_jpy, taxRate: cur.tax_rate };
+  assert.deepEqual(a.profit, { before: masterProfit({ ...base, shipping: 520 }).profit, after: masterProfit({ ...base, shipping: 600 }).profit });
+  assert.ok(a.profit.after < a.profit.before, '送料が上がる = 利益が下がる');
+  assert.deepEqual(p.linked, []); assert.deepEqual(p.rate, { code: 'B2', method: '宅急便コンパクト', cost: 600 });
+  // 保存 = 1 件の保存と同じ (送料の表の方法・金額・記録の理由「一括 2 件」)
+  const r = await run(['a004', 's001'], 'shipping_code', 'B2', { p });
+  assert.ok(r.results.every((x) => x.ok), JSON.stringify(r.results));
+  assert.deepEqual(await ship('a004'), { code: 'B2', method: '宅急便コンパクト', cost: 600 });
+  assert.deepEqual(await ship('s001'), { code: 'B2', method: '宅急便コンパクト', cost: 600 });
+  assert.deepEqual(await ship('d001'), { code: 'S02', method: '宅急便', cost: 520 }, '対象外は変えない');
+  const ev = (await pg.query(`select reason_text, request_id from events.master_change_events where entity_type = 'sku' and entity_id = $1 and attribute like 'shipping%' order by event_id desc limit 1`, [await sid('s001')])).rows[0];
+  assert.deepEqual([ev.reason_text, ev.request_id], ['一括 2 件', B.bulkRequestId(r.bulkId, 's001', 0)]);
+  // もう一度同じ値 = 変わらない
+  const p2 = await preview(['a004'], 'shipping_code', 'B2');
+  assert.equal(p2.items[0].verdict, 'same'); assert.equal(p2.ticket, null);
+});
+
+await ta('[15] 配送方法: 確かめた後に送料の表が変わった = 書かない (latest)・表が読めない = 書かない (later)・押し直しは前の結果・切符に表の行が無い = 断る・持ち主の門 (切替前)', async () => {
+  const p = await preview(['m011', 'm012'], 'shipping_code', 'C01');
+  const todo = p.items.filter((x) => x.verdict === 'chg');
+  const n0 = await nEvents();
+  // 金額が変わった / コードが消えた / 表が読めない = だめ (何も書かない)
+  const moved = new Map([...RATES, ['C01', { method: 'ネコポス', cost: 210 }]]);
+  const r1 = (await applyChunk(p, todo, { rates: moved })).results;
+  assert.deepEqual(r1.map((x) => [x.ok, x.error.reason, x.error.group]), [[false, 'shipping_rate_changed', 'latest'], [false, 'shipping_rate_changed', 'latest']]);
+  assert.match(r1[0].error.message, /ネコポス 198 円 → ネコポス 210 円/);
+  const gone = new Map([...RATES].filter(([k]) => k !== 'C01'));
+  assert.equal((await applyChunk(p, todo, { rates: gone })).results[0].error.reason, 'shipping_rate_changed');
+  const r0 = (await applyChunk(p, todo, { rates: null })).results;
+  assert.deepEqual([r0[0].ok, r0[0].error.reason, r0[0].error.group], [false, 'shipping_rates_unavailable', 'later']);
+  assert.equal(await nEvents(), n0, '何も書いていない');
+  assert.equal((await ship('m011')).code, 'S02');
+  // 表が同じなら同じ切符で通る・押し直し (表が変わった後でも) = 前の結果 (二重に書かない)
+  const ok = (await applyChunk(p, todo)).results;
+  assert.ok(ok.every((x) => x.ok), JSON.stringify(ok));
+  assert.deepEqual(await ship('m011'), { code: 'C01', method: 'ネコポス', cost: 198 });
+  const n1 = await nEvents();
+  const again = (await applyChunk(p, todo, { rates: moved })).results;
+  assert.ok(again.every((x) => x.ok && x.replayed), JSON.stringify(again));
+  assert.equal(await nEvents(), n1);
+  // やり直し (rid1) の前も見る (#Codex R1 High): 構成品 (a005 は s002 に入らない → a001) の保存でセットの版が上がる = セットは version_conflict の記録 (rid0) を残す →
+  //   やり直しの読み直しで接続が切れた → 表が変わってから押し直す = 書かない / 表が同じなら書く (確かめた金額)
+  const pv = await preview(['a001', 's002'], 'shipping_code', 'C01');
+  const [ka, ks] = ['a001', 's002'].map((c) => pv.items.find((x) => x.code === c));
+  assert.equal((await applyChunk(pv, [ka])).results[0].ok, true);
+  let cut = false;
+  const cutDb = { query: async (sql, prm) => { if (!cut && String(sql).startsWith('begin isolation level repeatable read read only')) { cut = true; throw Object.assign(new Error('切れた (試験)'), { code: '08006' }); } return db.query(sql, prm); } };
+  const quietErr = console.error; console.error = () => {};
+  try {
+    const x = (await editor(() => B.bulkApplyChunk(cutDb, { actor: 'naka@test', ticket: pv.ticket, items: [{ code: 's002', token: ks.token, self: ks.self, mac: ks.mac }] }, { open: true, now: NOW, shippingRates: RATES }))).results[0];
+    assert.equal(x.ok, false);
+  } finally { console.error = quietErr; }
+  assert.ok(cut, '読み直しで切れた');
+  const rx = (await applyChunk(pv, [ks], { rates: moved })).results[0];
+  assert.deepEqual([rx.ok, rx.error.reason, !!rx.retried], [false, 'shipping_rate_changed', true]);
+  assert.equal((await ship('s002')).code, 'S02', 'やり直しでも新しい金額を書かない');
+  const ry = (await applyChunk(pv, [ks])).results[0];
+  assert.deepEqual([ry.ok, !!ry.retried], [true, true], JSON.stringify(ry));
+  assert.deepEqual(await ship('s002'), { code: 'C01', method: 'ネコポス', cost: 198 });
+  // 切符に送料の表の行が無い (画面からは来ない形) = 断る
+  const cur = await W.readCurrent(db, await sid('m013'), TODAY);
+  const it = { code: 'm013', token: W.editTokenOf(cur), self: B.bulkSelfToken(cur) };
+  const t = B.issueTicket({ actor: 'naka@test', field: 'shipping_code', value: 'C01', reason: null, seen: '0', items: [it] });
+  await assert.rejects(() => editor(() => B.bulkApplyChunk(db, { actor: 'naka@test', ticket: t.ticket, items: [{ ...it, mac: t.macs.get('m013') }] }, { open: true, now: NOW, shippingRates: RATES })),
+    (e) => e.status === 409 && e.reason === 'ticket_invalid');
+  // 値の差し替え (切符と違うコード) = 断る
+  await assert.rejects(() => applyChunk(p, todo, { over: { value: 'S02' } }), (e) => e.reason === 'ticket_mismatch');
+  // 持ち主の門: skus.shipping が company でない = 単品もセットも「保存できない (切替前)」(1 件の画面と同じ fieldOwnership)・ほかの項目は今までどおり
+  const owner = await OG.readScreenOwnership(db);
+  const loadMap = { ...owner.map, 'skus.shipping': 'load' };
+  assert.deepEqual([W.fieldOwnership('single', loadMap, true).shipping_code.editable, W.fieldOwnership('set', loadMap, true).shipping_code.editable, W.fieldOwnership('single', loadMap, true).standard_price.editable], [false, false, true]);
+  // 画面の「書ける」(editableOf = 種類ごとの fieldOwnership) のうち配送方法だけ閉じた形
+  const ed0 = await editableNow();
+  const ed = { ...ed0, single: { ...ed0.single, shipping_code: W.fieldOwnership('single', loadMap, true).shipping_code.editable }, set: { ...ed0.set, shipping_code: W.fieldOwnership('set', loadMap, true).shipping_code.editable } };
+  const i = await inspect(['m013', 's002'], { editable: ed });
+  assert.deepEqual(i.items.map((x) => [x.fields.shipping_code.verdict, x.fields.shipping_code.reason]), [['block', 'before_cutover'], ['block', 'before_cutover']]);
+  assert.match(i.items[0].fields.shipping_code.why, /切替前です: 配送方法/);
+  assert.equal(i.items[0].fields.standard_price.verdict, 'ok');
+  // 保存を開いていない = 1 件の保存の門で止まる (書かない)
+  const p3 = await preview(['m013'], 'shipping_code', 'B2');
+  const c = (await editor(() => B.bulkApplyChunk(db, { actor: 'naka@test', ticket: p3.ticket, items: p3.items.map((x) => ({ code: x.code, token: x.token, self: x.self, mac: x.mac })) }, { open: false, now: NOW, shippingRates: RATES }))).results[0];
+  assert.deepEqual([c.ok, c.error.reason], [false, 'before_cutover']);
+  assert.equal((await ship('m013')).code, 'S02');
 });
 
 console.log('やり直し・二重押し・部分の成功');
@@ -484,6 +596,14 @@ await ta('[9] 権限: 名簿にない人は確かめも保存も 403・Origin �
   const i = await call('POST', '/api/bulk/inspect', { body: { codes: ['a004', 'x001'] } });
   assert.equal(i.status, 200, i.text); assert.equal(i.j.items.length, 2);
   assert.ok(i.j.suppliers.some((s) => s.code === '0002') && !i.j.suppliers.some((s) => s.code === '0003'), '選べる仕入先 = 取引中だけ');
+  assert.deepEqual(i.j.shippingRates.map((r) => r.code), ['S02', 'B2', 'C01'], '選べる配送方法 = 送料の表 (router の shippingRatesProvider)');
+  // HTTP で配送方法: 確かめ → 保存 (router が送料の表を確かめと保存の両方に渡す)
+  const sp = await call('POST', '/api/bulk/preview', { body: { codes: ['a003'], field: 'shipping_code', value: 'C01' } });
+  assert.equal(sp.status, 200, sp.text); assert.deepEqual(sp.j.items[0].ship.after, { code: 'C01', method: 'ネコポス', cost: 198 });
+  const si = sp.j.items[0];
+  const sa = await call('POST', '/api/bulk/apply', { body: { ticket: sp.j.ticket, items: [{ code: 'a003', token: si.token, self: si.self, mac: si.mac }] } });
+  assert.equal(sa.status, 200, sa.text); assert.equal(sa.j.results[0].ok, true, sa.text);
+  assert.equal((await pg.query("select shipping_code from core.skus where code = 'a003'")).rows[0].shipping_code, 'C01');
   const big = await call('POST', '/api/bulk/inspect', { body: { codes: Array.from({ length: 201 }, (_, k) => `z${k}`) } });
   assert.equal(big.status, 413); assert.equal(big.j.reason, 'too_many');
   // HTTP で確かめ → 保存
@@ -556,7 +676,7 @@ await ta('[10] 一覧の描画 (本物の router): 左のチェック・帯と�
 
 await ta('[10] つかいかた: まとめて変える の節', async () => {
   const m = await call('GET', '/manual');
-  for (const w of ['まとめて変える', '200 件まで', '前と後', '確かめました', '一緒に変わるセット', '選び直せる', '続きを送る', '対象外', '保存できない', '先の日の原価']) assert.ok(m.text.includes(w), `つかいかたに「${w}」が無い`);
+  for (const w of ['まとめて変える', '200 件まで', '前と後', '確かめました', '一緒に変わるセット', '選び直せる', '続きを送る', '対象外', '保存できない', '先の日の原価', '配送方法']) assert.ok(m.text.includes(w), `つかいかたに「${w}」が無い`);
 });
 
 server.close();

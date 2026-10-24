@@ -1,7 +1,9 @@
 /**
  * bulk.mjs — 一覧で選んだ商品を、まとめて 1 つの項目だけ同じ値に変える (10/8 中原さん「見本どおりで OK」・PR2)
  *
- * 項目 = 原価 (今日からだけ・理由は選ぶ)・売価・取扱 (取扱中 / 中止・中止は理由が必須)・売上分類・税率・仕入先 (代表の仕入先)。値は「同じ値にする」だけ。
+ * 項目 = 原価 (今日からだけ・理由は選ぶ)・売価・取扱 (取扱中 / 中止・中止は理由が必須)・売上分類・税率・仕入先 (代表の仕入先)・配送方法 (送料コード)。値は「同じ値にする」だけ。
+ *   🆕 10/23 配送方法: 1 件の画面と同じ欄 (shipping_code・単品もセットも自分の値)・選べるのは送料の表 (router の shippingRatesProvider) のコードだけ。
+ *     方法と金額は保存 (saveSku) が送料の表から決める。確かめの切符に送料の表の行 (方法・金額) を入れ、保存のときに表が変わっていたら書かない (409 shipping_rate_changed)
  * 流れ (画面 = public/me-bulk.js):
  *   1. POST api/bulk/inspect  選んだ商品の、項目ごとの「変えられる / 対象外 / 保存できない」と今の値 (項目の板の数・値の欄の「今の値」)
  *   2. POST api/bulk/preview  項目と値を決めた後の「前と後」(1 件ずつの今の値・新しい値・利益・編集の印) と、一緒に変わるセット
@@ -42,6 +44,8 @@ export const BULK_FIELDS = Object.freeze({
   sales_class:      { label: '売上分類', single: 'sales_class', set: null, linked: null, setWhy: 'セットの売上分類は構成品から決まります (上書きはセットの画面で)' },
   tax_rate:         { label: '税率', single: 'tax_rate', set: null, linked: 'tax', setWhy: 'セットの税率は構成品から計算します (構成品を変えると自動で変わります)' },
   primary_supplier: { label: '仕入先', single: 'primary_supplier', set: null, linked: null, setWhy: 'セットの仕入先は構成品ごとです' },
+  // 🆕 10/23: セットも自分の配送方法を持つ (SET_FIELDS の shipping_code・構成品からは決まらない) = 単品もセットも変えられる。含むセットへは動かない
+  shipping_code:    { label: '配送方法', single: 'shipping_code', set: 'shipping_code', linked: null },
 });
 const HANDLING = Object.freeze({ active: '取扱中', discontinued: '中止' });
 /**
@@ -63,6 +67,7 @@ const GROUP_OF = {
   version_conflict: 'latest', retry: 'latest', request_id_reused: 'latest', not_found: 'latest',
   csv_issued: 'csv', reg_csv_issued: 'csv',
   nightly_load: 'later', locked: 'later', before_cutover: 'later', owner_unreadable: 'later', code_behind: 'later', error: 'later', not_sent: 'later',
+  shipping_rates_unavailable: 'later', shipping_rate_changed: 'latest',
 };
 export const fixGroupOf = (reason) => GROUP_OF[reason] || 'later';
 const FIX_WORDS = {
@@ -72,6 +77,7 @@ const FIX_WORDS = {
   csv_issued: 'マスタの判断 → NE に取り込む CSV でそのファイルを「使わない」にするか、翌朝の照合の後に選び直してください',
   reg_csv_issued: '「NE 登録の CSV」でそのファイルを「使わない」にしてから選び直してください',
   nightly_load: '夜間の取り込みが終わってから (少し待って) 選び直してください',
+  shipping_rate_changed: '送料の表が変わりました。選び直して「前と後を見る」からもう一度確かめてください',
 };
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -79,6 +85,21 @@ const TOKEN_RE = /^[0-9a-f]{64}$/;
 const bad = (message, field = 'bulk', reason = 'invalid_input') => new MasterWriteError(400, reason, message, { field });
 const num = (v) => (v == null ? null : Number(v));
 const KNOWN_COST = new Set(['COMPLETE', 'OVERRIDDEN']);
+
+/**
+ * 送料の表の 1 行 (送料コード → { code, method, cost })。金額は保存 (lib/master-write.mjs の commonDiff) と同じく円に丸める = 前と後に出す金額 = 保存で書く金額。
+ * 表が無い / コードが無い = null
+ */
+export function shippingRateOf(rates, code) {
+  const r = rates && typeof rates.get === 'function' ? rates.get(code) : null;
+  if (!r) return null;
+  return { code, method: r.method ?? null, cost: r.cost == null ? null : Math.round(Number(r.cost)) };
+}
+/** 商品に保存してある配送方法 (コード・方法・金額) = 前と後の「前」 */
+const shipNow = (cur) => ({ code: cur.shipping_code ?? null, method: cur.shipping_method ?? null, cost: cur.shipping_cost ?? null });
+/** 画面に渡す送料の表 (選べる配送方法)。読めない = null */
+export const shippingRateList = (rates) => (rates && typeof rates.keys === 'function' ? [...rates.keys()].map((code) => shippingRateOf(rates, code)) : null);
+const ratesGone = () => new MasterWriteError(503, 'shipping_rates_unavailable', '送料の表が読めないので、配送方法は変えられません (何も保存していません)。少し待ってから開き直してください', { field: 'value' });
 
 /** 一括の保存の request_id (一括の番号 + 商品コード + やり直しの回)。同じ一括の押し直しは同じ番号 = 二重に書かない */
 export function bulkRequestId(bulkId, code, attempt = 0) {
@@ -101,9 +122,10 @@ const hmac = (s) => crypto.createHmac('sha256', ticketKey).update(s).digest('hex
 const sameHex = (a, b) => typeof a === 'string' && typeof b === 'string' && a.length === b.length && /^[0-9a-f]+$/.test(a) && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
 export const itemMac = (ticketId, code, token, self) => hmac(`item|${ticketId}|${normSku(code)}|${token}|${self}`);
 /** 切符を作る。items = 変わる商品 [{ code, token, self }] → { ticket, id, macs: Map<コード, 印> } */
-export function issueTicket({ actor, field, value, reason, seen, items, nowMs = Date.now() }) {
+export function issueTicket({ actor, field, value, reason, seen, items, rate = null, nowMs = Date.now() }) {
   const id = crypto.randomUUID();
   const body = { v: 1, id, actor, field, value, reason: reason ?? null, seen: String(seen ?? '0'), n: items.length, exp: nowMs + TICKET_TTL_MS };
+  if (rate) body.rate = { method: rate.method ?? null, cost: rate.cost ?? null };   // 配送方法 = 確かめた送料の表の行 (保存のときに表と照らす)
   const b = Buffer.from(JSON.stringify(body)).toString('base64url');
   const macs = new Map(items.map((x) => [x.code, itemMac(id, x.code, x.token, x.self)]));
   return { ticket: `${b}.${hmac(`ticket|${b}`)}`, id, macs };
@@ -121,7 +143,7 @@ export function readTicket(ticket, nowMs = Date.now()) {
   return t;
 }
 /** 一括の操作の印 (切符の番号・人・項目・値・理由・確かめの瞬間・件数)。request_id はこれから決める = 中身の違う操作が前の結果を受け取らない (Codex R1 M3) */
-export const opKeyOf = (t) => sha256(stable({ id: t.id, actor: t.actor, field: t.field, value: t.value, reason: t.reason ?? null, seen: t.seen, n: t.n }));
+export const opKeyOf = (t) => sha256(stable({ id: t.id, actor: t.actor, field: t.field, value: t.value, reason: t.reason ?? null, seen: t.seen, n: t.n, ...(t.rate ? { rate: t.rate } : {}) }));
 
 /** 選んだ商品コード (画面から)。重なりは 1 つに・BULK_MAX 件まで */
 export function parseCodes(raw) {
@@ -155,6 +177,12 @@ export function parseFieldValue(field, raw) {
       const s = textIn(typeof raw === 'string' ? raw : String(raw), { label: '仕入先', field: 'value', max: 20 });
       if (!s) throw bad('仕入先を選んでください', 'value');
       return canonicalSupplierCode(s);
+    }
+    case 'shipping_code': {
+      // 形だけ (送料の表にあるかは確かめ = bulkPreview と保存 = saveSku で見る)。空にはしない (1 件の保存と同じ)
+      const s = textIn(typeof raw === 'string' ? raw : String(raw), { label: '配送方法', field: 'value', max: 20 });
+      if (!s) throw bad('配送方法を選んでください', 'value');
+      return s;
     }
     default: throw bad('知らない項目', 'field');
   }
@@ -258,6 +286,7 @@ function currentValue(cur, field) {
     case 'sales_class': return cur.sales_class;
     case 'tax_rate': return cur.tax_rate;
     case 'primary_supplier': return cur.primary_supplier;
+    case 'shipping_code': return cur.shipping_code ?? null;
     default: return null;
   }
 }
@@ -267,7 +296,7 @@ function currentValue(cur, field) {
  *   verdict: out (対象外) / block (保存できない) / ok (値の前) / same (今と同じ) / chg (変わる)
  *   reason = 機械の理由 (fixGroupOf で直し方の組)・why = 画面の文
  */
-export function judgeBulk(f, field, value, { editable } = {}) {
+export function judgeBulk(f, field, value, { editable, rates } = {}) {
   const F = BULK_FIELDS[field];
   if (!f.found) return { verdict: 'out', reason: 'not_found', why: 'Company DB にありません (消えたか、コードが変わった)' };
   const c = f.cur;
@@ -279,6 +308,8 @@ export function judgeBulk(f, field, value, { editable } = {}) {
   if (editable && editable[c.sku_kind] && editable[c.sku_kind][saveField] === false) {
     return { verdict: 'block', reason: 'before_cutover', why: `切替前です: ${F.label}はまだ NE・/register が正です` };
   }
+  // 配送方法: 送料の表が読めない (rates = null) = 保存できない (1 件の保存も 503)。rates を渡さない (undefined) = ここでは見ない (保存の前の対象外の確かめ)
+  if (field === 'shipping_code' && rates === null) return { verdict: 'block', reason: 'shipping_rates_unavailable', why: '送料の表が読めないので、配送方法は変えられません' };
   if (field === 'cost' && c.open_cost && c.open_cost.valid_from > (f.today || '')) {
     return { verdict: 'block', reason: 'cost_future', why: `先の日の原価があります (${c.open_cost.valid_from} から ${c.open_cost.cost_jpy.toLocaleString('ja-JP')} 円)。1 件の画面で直してください` };
   }
@@ -305,6 +336,7 @@ function isSame(c, field, value) {
     case 'sales_class': return c.sales_class === value;
     case 'tax_rate': return c.tax_rate === value;
     case 'primary_supplier': return normSku(c.primary_supplier ?? '') === normSku(value ?? '');
+    case 'shipping_code': return (c.shipping_code ?? null) === value;   // 1 件の保存 (commonDiff) と同じ = そのままの文字で比べる
     default: return false;
   }
 }
@@ -339,7 +371,7 @@ async function inSnapshot(db, fn) {
  * 1. 選んだ商品の項目ごとの判定 (値の前)。項目の板の数 (変えられる / 対象外 / 保存できない・Codex M5 = 先の日の原価は最初から「保存できない」) と「今の値」
  * opts = { now, editable (editableOf), suppliers: [{ code, name }] (代表にできる仕入先) }
  */
-export async function bulkInspect(db, input, { now = new Date(), editable = null, suppliers = [] } = {}) {
+export async function bulkInspect(db, input, { now = new Date(), editable = null, suppliers = [], shippingRates = null } = {}) {
   const codes = parseCodes(input?.codes);
   const today = jstDate(now);
   return inSnapshot(db, async () => {
@@ -348,22 +380,24 @@ export async function bulkInspect(db, input, { now = new Date(), editable = null
       f.today = today;
       const fields = {};
       for (const field of Object.keys(BULK_FIELDS)) {
-        const j = judgeBulk(f, field, undefined, { editable });
+        const j = judgeBulk(f, field, undefined, { editable, rates: shippingRates ?? null });
         fields[field] = { verdict: j.verdict, reason: j.reason ?? null, why: j.why ?? null, now: f.found ? currentValue(f.cur, field) : null };
       }
+      // 配送方法の今の値 = 商品に保存してある方法・金額 (送料の表の今の金額ではない・#Codex R1 Medium)
+      if (f.found) fields.shipping_code.ship = shipNow(f.cur);
       return { ...itemBase(f), fields };
     });
-    return { ok: true, today, max: BULK_MAX, chunk: BULK_CHUNK, items, suppliers, costReasons: COST_REASONS };
+    return { ok: true, today, max: BULK_MAX, chunk: BULK_CHUNK, items, suppliers, costReasons: COST_REASONS, shippingRates: shippingRateList(shippingRates) };
   });
 }
 
-/** 利益 (1 個あたり・参考) の前後。売価・原価だけ */
-function profitPair(cur, field, value) {
-  if (!['cost', 'standard_price'].includes(field)) return null;
+/** 利益 (1 個あたり・参考) の前後。売価・原価・配送方法 (rate = 送料の表の新しい行 = 保存で書く金額) だけ */
+function profitPair(cur, field, value, rate = null) {
+  if (!['cost', 'standard_price', 'shipping_code'].includes(field)) return null;
   const cost = cur.cost_today && KNOWN_COST.has(cur.cost_today.cost_status) ? cur.cost_today.cost_jpy : null;
   const base = { price: cur.standard_price, cost, taxRate: cur.tax_rate, shipping: cur.shipping_cost };
   const a = masterProfit(base);
-  const b = masterProfit({ ...base, [field === 'cost' ? 'cost' : 'price']: value });
+  const b = masterProfit(field === 'shipping_code' ? { ...base, shipping: rate ? rate.cost : null } : { ...base, [field === 'cost' ? 'cost' : 'price']: value });
   return { before: a.ok ? a.profit : null, after: b.ok ? b.profit : null };
 }
 
@@ -416,7 +450,7 @@ async function planLinked(db, field, value, facts, today) {
  * 2. 前と後 (項目と値を決めた後)。1 件ずつの今の値・新しい値・利益の前後・編集の印 (保存で使う)・一緒に変わるセット (保存と同じ計算)。
  * 読むだけ (同じ瞬間の値)。seen_event_id = この瞬間の変更の記録の番号 (保存の「その間の変更」の起点)
  */
-export async function bulkPreview(db, input, { now = new Date(), editable = null, suppliers = null, actor = null, nowMs = Date.now() } = {}) {
+export async function bulkPreview(db, input, { now = new Date(), editable = null, suppliers = null, shippingRates = null, actor = null, nowMs = Date.now() } = {}) {
   const codes = parseCodes(input?.codes);
   const field = input?.field;
   const value = parseFieldValue(field, input?.value);
@@ -426,12 +460,19 @@ export async function bulkPreview(db, input, { now = new Date(), editable = null
   if (field === 'primary_supplier' && suppliers && !suppliers.some((s) => normSku(canonicalSupplierCode(s.code)) === normSku(value))) {
     throw bad(`仕入先 ${value} は選べません (取引中で NE に登録済みの仕入先だけ)`, 'value', 'supplier_not_confirmed');
   }
+  // 配送方法 = 送料の表にあるコードだけ (1 件の保存と同じ)。表が読めない = 503 (何も確かめない)
+  let rate = null;
+  if (field === 'shipping_code') {
+    if (!shippingRates) throw ratesGone();
+    rate = shippingRateOf(shippingRates, value);
+    if (!rate) throw bad(`配送方法 ${value} は送料の表にありません`, 'value');
+  }
   const today = jstDate(now);
   return inSnapshot(db, async (seen) => {
     const facts = await readFacts(db, codes, today);
     for (const f of facts) {
       f.today = today;
-      Object.assign(f, judgeBulk(f, field, value, { editable }));
+      Object.assign(f, judgeBulk(f, field, value, { editable, rates: field === 'shipping_code' ? shippingRates : undefined }));
     }
     const { linked, setAfter, notes } = await planLinked(db, field, value, facts, today);
     const items = facts.map((f) => {
@@ -439,8 +480,13 @@ export async function bulkPreview(db, input, { now = new Date(), editable = null
       if (!f.found) return base;
       const before = currentValue(f.cur, field);
       const it = { ...base, before, after: f.verdict === 'chg' ? value : before };
+      // 配送方法の前と後 = 方法と金額も (前 = 今の商品の値・後 = 送料の表の行 = 保存で書く値)
+      if (field === 'shipping_code') {
+        const now0 = shipNow(f.cur);
+        it.ship = { before: now0, after: f.verdict === 'chg' ? rate : now0 };
+      }
       if (f.verdict === 'chg') {
-        Object.assign(it, { token: f.token, self: f.self, profit: profitPair(f.cur, field, value) });
+        Object.assign(it, { token: f.token, self: f.self, profit: profitPair(f.cur, field, value, rate) });
         // 選んだセットの取扱 = セット自身の値を変える。セットの取扱は構成品からも決まる (中止の構成品があれば中止のまま)
         if (field === 'handling' && f.cur.sku_kind === 'set') {
           it.after = setAfter.has(f.cur.sku_id) ? setAfter.get(f.cur.sku_id) : value;
@@ -454,12 +500,12 @@ export async function bulkPreview(db, input, { now = new Date(), editable = null
     const chg = items.filter((x) => x.verdict === 'chg');
     let ticket = null;
     if (chg.length) {
-      const t = issueTicket({ actor: who, field, value, reason, seen, items: chg, nowMs });
+      const t = issueTicket({ actor: who, field, value, reason, seen, items: chg, rate, nowMs });
       ticket = t.ticket;
       for (const x of chg) x.mac = t.macs.get(x.code);
     }
     return {
-      ok: true, field, value, reason, today, seen_event_id: seen, items, linked, notes: [...new Set(notes)], ticket, ticket_ttl_ms: TICKET_TTL_MS,
+      ok: true, field, value, reason, today, seen_event_id: seen, items, linked, notes: [...new Set(notes)], ticket, ticket_ttl_ms: TICKET_TTL_MS, rate,
       counts: { chg: count('chg'), same: count('same'), out: count('out'), block: count('block'), linked: linked.length },
       max: BULK_MAX, chunk: BULK_CHUNK,
     };
@@ -481,6 +527,8 @@ export function parseApply(input, { nowMs = Date.now() } = {}) {
   if (input?.reason !== undefined && (textIn(input.reason == null ? null : String(input.reason), { label: '理由', field: 'reason', max: BULK_REASON_MAX }) ?? null) !== (t.reason ?? null)) throw mismatch('理由');
   if (input?.total !== undefined && Number(input.total) !== t.n) throw mismatch('件数');
   const { field, value, n: total } = t;
+  // 配送方法の切符は確かめた送料の表の行を持つ (無い = 形が違う)
+  if (field === 'shipping_code' && !(t.rate && typeof t.rate === 'object')) throw new MasterWriteError(409, 'ticket_invalid', '確かめの切符の形が違います。何も保存していません。「前と後を見る」からもう一度確かめてください');
   const { reason, saveReason } = parseReason(field, value, t.reason, total);
   const raw = input?.items;
   if (!Array.isArray(raw) || !raw.length) throw bad('送る商品がありません', 'items');
@@ -500,7 +548,7 @@ export function parseApply(input, { nowMs = Date.now() } = {}) {
     return { code, token, self, eventId: t.seen };
   });
   // request_id の元 = 一括の操作の印 (切符の番号・人・項目・値・理由・件数)
-  return { actor, bulkId: opKeyOf(t), ticketId: t.id, field, value, total, reason, saveReason, items };
+  return { actor, bulkId: opKeyOf(t), ticketId: t.id, field, value, total, reason, saveReason, items, rate: t.rate ?? null };
 }
 
 /** 失敗の形 (画面に出す) */
@@ -548,7 +596,7 @@ async function bulkForeignChanges(db, { cur, seen, upto, bulkId, actor }) {
 
 /**
  * 3. 20 件ずつ保存する。1 件 = 1 回の saveSku (1 取引)。戻り値 = { ok, results: [{ code, ok, ... }] }
- * opts = { now (試験)・open (MASTER_EDIT_OPEN)・today (やり直しの読み直しの日) }
+ * opts = { now (試験)・open (MASTER_EDIT_OPEN)・today (やり直しの読み直しの日)・shippingRates (送料の表 = 1 件の保存と同じ。配送方法のときに使う) }
  */
 export async function bulkApplyChunk(db, input, opts = {}) {
   const req = parseApply(input, { nowMs: opts.nowMs ?? Date.now() });
@@ -580,7 +628,7 @@ async function applyOne(db, req, it, opts) {
   const values = saveValuesOf(req.field, pre.sku_kind, req.value, req.reason || req.saveReason);
   const rid0 = bulkRequestId(req.bulkId, pre.code, 0);
   const rid1 = bulkRequestId(req.bulkId, pre.code, 1);
-  const saveOpts = { open: opts.open === true, now: opts.now };
+  const saveOpts = { open: opts.open === true, now: opts.now, shippingRates: opts.shippingRates ?? null };
   // 押し直し: やり直しの保存がもう済んでいれば、その結果 (2 回目は書かない)
   //   request_id は一括の操作の印 (切符の番号・人・項目・値・理由・件数) から決まる = 同じ中身の操作だけがここに来る。人と商品も照らす (違えば request_id_reused)
   const prev1 = await requestRow(db, rid1);
@@ -591,6 +639,21 @@ async function applyOne(db, req, it, opts) {
     return failure(it.code, new MasterWriteError(x.status || 500, x.reason || 'error', x.message || '前の保存は失敗しました'), { retried: true, replayed: true });
   }
   const input = { actor: req.actor, code: pre.code, reason: req.saveReason, values };
+  // 配送方法: 確かめた後に送料の表 (方法・金額) が変わっていたら書かない (前と後で見せた金額と違う金額を書かない)。
+  //   新しく書くかもしれない保存 (その request_id の記録がまだ無い) の前に毎回見る = 1 回目 (rid0) もやり直し (rid1) も (#Codex R1 High:
+  //   rid0 の version_conflict の記録の後に切れて、表が変わってから押し直すと rid1 で新しい金額を書いた)。記録がもうある = saveSku が前の結果を返すだけ (書かない)。
+  //   照らした表 (opts.shippingRates) をそのまま保存に渡す
+  const rateGate = async (rid) => {
+    if (req.field !== 'shipping_code' || await requestRow(db, rid)) return null;
+    if (!opts.shippingRates) return failure(it.code, ratesGone());
+    const r = shippingRateOf(opts.shippingRates, req.value);
+    const was = req.rate || {};
+    if (r && r.method === (was.method ?? null) && r.cost === (was.cost ?? null)) return null;
+    const show = (x) => (x ? `${x.method ?? ''} ${x.cost == null ? '金額なし' : `${x.cost.toLocaleString('ja-JP')} 円`}`.trim() : '表に無い');
+    return failure(it.code, new MasterWriteError(409, 'shipping_rate_changed', `確かめた後に送料の表の ${req.value} が変わりました (${show(was)} → ${show(r)})。何も保存していません`));
+  };
+  const gate0 = await rateGate(rid0);
+  if (gate0) return gate0;
   try {
     return success(it.code, await saveSku(db, { ...input, requestId: rid0, seen: { token: it.token, event_id: it.eventId } }, saveOpts));
   } catch (e) {
@@ -605,6 +668,8 @@ async function applyOne(db, req, it, opts) {
       return { ok: true, token: editTokenOf(cur), eventId: upto };
     });
     if (!again.ok) return failure(it.code, e);
+    const gate1 = await rateGate(rid1);
+    if (gate1) return { ...gate1, retried: true };
     try {
       // seen.event_id は画面が見た番号のまま (押し直しが 2 つ並んでも保存の中身が同じになるように。その間の変更は上で確かめた)
       return success(it.code, await saveSku(db, { ...input, requestId: rid1, seen: { token: again.token, event_id: it.eventId } }, saveOpts), { retried: true });

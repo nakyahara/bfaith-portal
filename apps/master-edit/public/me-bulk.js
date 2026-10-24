@@ -31,7 +31,8 @@
     handling: { label: '取扱', icon: 'i-power', how: '取扱中 / 中止' },
     sales_class: { label: '売上分類', icon: 'i-layers', how: '1 自社 〜 4 輸出' },
     tax_rate: { label: '税率', icon: 'i-percent', how: '8% / 10%' },
-    primary_supplier: { label: '仕入先', icon: 'i-truck', how: '代表の仕入先' }
+    primary_supplier: { label: '仕入先', icon: 'i-truck', how: '代表の仕入先' },
+    shipping_code: { label: '配送方法', icon: 'i-box', how: '送料の表から選ぶ' }   // 🆕 10/23: 単品もセットも (方法と金額は送料の表から)
   };
   var FIELD_KEYS = Object.keys(FIELDS);
 
@@ -249,7 +250,7 @@
       return;
     }
     var t = e.target, typing = /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || '') && t.type !== 'radio' && t.type !== 'checkbox';
-    if (bk.step === 1 && bk.inspect && !typing && /^[1-6]$/.test(e.key) && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    if (bk.step === 1 && bk.inspect && !typing && /^[1-7]$/.test(e.key) && !e.ctrlKey && !e.metaKey && !e.altKey) {
       var fk = FIELD_KEYS[Number(e.key) - 1]; if (counts(fk).ok) { e.preventDefault(); chooseField(fk); }
     }
     // 2 = Enter で前と後へ (3 では Enter で保存しない = High 1)
@@ -272,7 +273,27 @@
       return Math.round(Number(v) * 100) + '%';
     }
     if (field === 'primary_supplier') return v + (supName(v) ? ' ' + supName(v) : '');
+    if (field === 'shipping_code') return fmtShip(typeof v === 'object' ? v : (rateOf(v) || { code: v, missing: true }));
     return String(v);
+  }
+  /** 送料の表 (inspect の shippingRates) の 1 行。無い = null */
+  function rateOf(code) {
+    var l = (bk && bk.inspect && bk.inspect.shippingRates) || [];
+    for (var i = 0; i < l.length; i++) if (l[i].code === code) return l[i];
+    return null;
+  }
+  /** 配送方法 = コード · 方法 / 金額 (1 件の画面の選び方と同じ形) */
+  function fmtShip(r) {
+    if (!r || r.code == null || r.code === '') return '未入力';
+    if (r.missing) return r.code + ' (表に無い)';
+    return r.code + (r.method ? ' · ' + r.method : '') + (r.cost == null ? '' : ' / ' + yen(r.cost) + ' 円');
+  }
+  /** 前と後の値 (配送方法は方法と金額も = サーバーの ship) */
+  function pvVal(x, which) { return bk.field === 'shipping_code' && x.ship ? x.ship[which] : x[which]; }
+  /** 確かめの後の「新しい値」の文 (配送方法 = 切符に入れた送料の表の行 = 保存で書く値。#Codex R1 Medium) */
+  function newValText() {
+    if (bk.field === 'shipping_code' && bk.preview && bk.preview.rate) return fmtShip(bk.preview.rate);
+    return fmtVal(bk.field, bk.val);
   }
   function fmtLinked(col, v) {
     if (col === 'cost') return v == null ? '空 (計算できない)' : yen(v) + ' 円';
@@ -336,7 +357,7 @@
           + '<span class="how">' + F.how + '</span>'
           + '<span class="who"><span><b>' + c.ok + '</b> 件 変えられる</span>' + (c.block ? '<span class="bl">· 保存できない ' + c.block + '</span>' : '') + (c.out ? '<span class="ex">· 対象外 ' + c.out + '</span>' : '') + '</span></button>';
       }).join('') + '</div>';
-    foot.innerHTML = '<button type="button" class="btn ghost" data-act="close">やめる</button><span class="sp"></span><span class="note">数字キー 1〜6 でも選べます</span>';
+    foot.innerHTML = '<button type="button" class="btn ghost" data-act="close">やめる</button><span class="sp"></span><span class="note">数字キー 1〜' + FIELD_KEYS.length + ' でも選べます</span>';
     var t = $('.bk-tile:not(.none)', body); if (t) t.focus();
   }
   function chooseField(f) {
@@ -345,10 +366,17 @@
   function okItems() { return bk.inspect.items.filter(function (it) { return it.fields[bk.field].verdict === 'ok'; }); }
   function renderValue(body, foot) {
     var F = FIELDS[bk.field], f = bk.field;
-    var dist = {}, order = [];
-    okItems().forEach(function (it) { var v = it.fields[f].now; var k = v == null ? '' : String(v); if (!dist[k]) { dist[k] = 0; order.push(k); } dist[k]++; });
+    var dist = {}, order = [], shipOf = {};
+    okItems().forEach(function (it) {
+      var fv = it.fields[f], v = fv.now, k;
+      // 配送方法 = 商品に保存してある コード・方法・金額 ごとに数える (送料の表の今の金額で補わない)
+      if (f === 'shipping_code' && fv.ship) { k = JSON.stringify([fv.ship.code, fv.ship.method, fv.ship.cost]); shipOf[k] = fv.ship; }
+      else k = v == null ? '' : String(v);
+      if (!dist[k]) { dist[k] = 0; order.push(k); } dist[k]++;
+    });
     order.sort(function (a, b) { return dist[b] - dist[a]; });
     var distHtml = order.map(function (k) {
+      if (shipOf[k]) return '<button type="button" data-pickval="' + esc(shipOf[k].code || '') + '" title="この配送方法を新しい値に入れる">' + esc(fmtShip(shipOf[k])) + ' <span class="x">× ' + dist[k] + '</span></button>';
       var v = k === '' ? null : (f === 'cost' || f === 'standard_price' || f === 'sales_class' || f === 'tax_rate' ? Number(k) : k);
       return '<button type="button" data-pickval="' + esc(k) + '" title="この値を新しい値に入れる">' + esc(fmtVal(f, v)) + ' <span class="x">× ' + dist[k] + '</span></button>';
     }).join('');
@@ -387,13 +415,19 @@
         + '<input class="in" id="bk-supq" placeholder="仕入先の名前・コードで絞る" value="' + esc(bk.supQ) + '" autocomplete="off" aria-label="仕入先を絞る">'
         + '<div class="bk-suplist" role="radiogroup" aria-label="新しい仕入先" id="bk-suplist">' + (list.map(function (s) { return '<label><input type="radio" name="bk-sup" value="' + esc(s.code) + '"' + (bk.val === s.code ? ' checked' : '') + '><span class="c">' + esc(s.code) + '</span>' + esc(s.name || '') + '</label>'; }).join('') || '<span class="hint">当てはまる仕入先がありません</span>') + '</div>'
         + '<span class="hint">選べるのは取引中で NE に登録済みの仕入先だけです</span><div class="bk-live" id="bk-live" aria-live="polite"></div></div></div>';
+    } else if (f === 'shipping_code') {
+      var rates = bk.inspect.shippingRates || [];
+      input = '<div class="bk-vrow"><label class="lab" for="bk-ship">新しい配送方法 <span class="req">必須</span></label><div class="ctl col">'
+        + '<select class="in w-m" id="bk-ship"><option value=""' + (bk.val ? '' : ' selected') + '>(選ぶ)</option>'
+        + rates.map(function (r) { return '<option value="' + esc(r.code) + '"' + (bk.val === r.code ? ' selected' : '') + '>' + esc(fmtShip(r)) + '</option>'; }).join('') + '</select>'
+        + '<span class="hint">方法と金額は送料の表から決まります</span><div class="bk-live" id="bk-live" aria-live="polite"></div></div></div>';
     }
     body.innerHTML = chosenHtml() + '<div class="bk-vbox"><div class="bk-vrow"><span class="lab">今の値</span><div class="ctl"><div class="bk-nowdist">' + (distHtml || '<span class="hint">変えられる商品がありません</span>') + '</div></div></div>' + input + '</div>';
     foot.innerHTML = '<button type="button" class="btn ghost" data-act="close">やめる</button><span class="sp"></span>'
       + '<button type="button" class="btn" data-act="to1">' + ic('i-chevl') + '戻る</button>'
       + '<button type="button" class="btn pri" data-act="to3" id="bk-next"' + (valueReady() ? '' : ' disabled') + '>前と後を見る ' + ic('i-arrow') + '<span class="kbd">Enter</span></button>';
     live();
-    var first = $('#bk-yen', body) || $('.seg button.on', body) || $('.seg button', body) || $('#bk-supq', body); if (first) first.focus();
+    var first = $('#bk-yen', body) || $('.seg button.on', body) || $('.seg button', body) || $('#bk-supq', body) || $('#bk-ship', body); if (first) first.focus();
   }
   /** 入れた値で何件変わるか (確かめの前の目安。確かめ = サーバーの preview) */
   function live() {
@@ -404,7 +438,9 @@
     var c = counts(bk.field), chg = 0, same = 0;
     okItems().forEach(function (it) {
       var now = it.fields[bk.field].now;
-      var isSame = bk.field === 'handling' && it.kind === 'set' ? it.handling_own === bk.val : (now == null ? false : String(now).toLowerCase() === String(bk.val).toLowerCase());
+      var isSame = bk.field === 'handling' && it.kind === 'set' ? it.handling_own === bk.val
+        : bk.field === 'shipping_code' ? now === bk.val   // 送料コードはそのままの文字で比べる (保存と同じ)
+          : (now == null ? false : String(now).toLowerCase() === String(bk.val).toLowerCase());
       if (isSame) same++; else chg++;
     });
     el.innerHTML = '<b>' + chg + ' 件</b> が ' + esc(fmtVal(bk.field, bk.val)) + ' に変わります · 変わらない ' + same + ' · 対象外 ' + c.out + (c.block ? ' · <span style="color:var(--warn)">保存できない ' + c.block + '</span>' : '');
@@ -443,9 +479,9 @@
     var total = n.chg + n.linked;
     var row = function (x) {
       var chg;
-      if (x.verdict === 'chg') chg = '<span class="old">' + esc(fmtVal(bk.field, x.before)) + '</span>' + ic('i-arrow', 'arrow') + '<span class="new' + (danger ? ' red' : '') + '">' + esc(fmtVal(bk.field, x.after)) + '</span>';
-      else if (x.verdict === 'same') chg = '<span class="new">' + esc(fmtVal(bk.field, x.before)) + '</span><span class="muted" style="font-size:12.5px">そのまま</span>';
-      else chg = '<span>' + esc(x.before === undefined ? '' : fmtVal(bk.field, x.before)) + '</span>';
+      if (x.verdict === 'chg') chg = '<span class="old">' + esc(fmtVal(bk.field, pvVal(x, 'before'))) + '</span>' + ic('i-arrow', 'arrow') + '<span class="new' + (danger ? ' red' : '') + '">' + esc(fmtVal(bk.field, pvVal(x, 'after'))) + '</span>';
+      else if (x.verdict === 'same') chg = '<span class="new">' + esc(fmtVal(bk.field, pvVal(x, 'before'))) + '</span><span class="muted" style="font-size:12.5px">そのまま</span>';
+      else chg = '<span>' + esc(x.before === undefined ? '' : fmtVal(bk.field, pvVal(x, 'before'))) + '</span>';
       var side = '';
       if (x.profit && x.verdict === 'chg') {
         var a = x.profit.before, b = x.profit.after;
@@ -464,7 +500,7 @@
     var tab = function (k, label, c) { return '<button type="button" class="chip' + (bk.tab === k ? ' on' : '') + (k === 'block' && c ? ' t-warn' : '') + '" data-tab="' + k + '"' + (c === 0 && k !== 'all' ? ' disabled style="opacity:.45"' : '') + '>' + label + ' <span class="n">' + c + '</span></button>'; };
     var reasonTxt = reasonText();
     body.innerHTML = chosenHtml() + '<div class="bk-verdict' + (danger ? ' danger' : '') + '">'
-      + '<div class="big" tabindex="-1" id="bk-h">' + F.label + 'を <em class="' + (danger ? 'red' : '') + '">' + esc(fmtVal(bk.field, bk.val)) + '</em> にします</div>'
+      + '<div class="big" tabindex="-1" id="bk-h">' + F.label + 'を <em class="' + (danger ? 'red' : '') + '">' + esc(newValText()) + '</em> にします</div>'
       + '<div class="sum" id="bk-sum">選んだ商品 <b>' + n.chg + ' 件</b> + 一緒に変わるセット <b>' + n.linked + ' 件</b> = 合計 <b>' + total + ' 件</b> が変わります</div>'
       + '<div class="small">' + (bk.field === 'cost' ? '<span>' + ic('i-lock') + ' ' + esc(p.today) + ' 今日から</span>' : '') + (reasonTxt ? '<span>理由: ' + esc(reasonTxt) + '</span>' : '')
       + '<span>変わらない ' + n.same + ' · 対象外 ' + n.out + (n.block ? ' · <span style="color:var(--warn)">保存できない ' + n.block + '</span>' : '') + '</span></div>'
@@ -472,7 +508,7 @@
       + '<div class="bk-tabs" role="group" aria-label="一覧の絞り込み">' + tab('all', 'ぜんぶ', items.length) + tab('chg', '変わる', n.chg) + tab('linked', '一緒に変わるセット', n.linked) + tab('block', '保存できない', n.block) + tab('same', '変わらない', n.same) + tab('out', '対象外', n.out) + '</div>'
       + '<div class="bk-list">' + shown.map(row).join('') + '</div>'
       + (p.linked.length && (bk.tab === 'all' || bk.tab === 'linked') ? '<div class="bk-sec">一緒に変わるセット (構成品が変わるため · 自動)</div><div class="bk-list">' + p.linked.map(linkRow).join('') + '</div>' : '')
-      + (n.chg ? '<div class="bk-confirm"><label class="chk"><input type="checkbox" class="ck" id="bk-ok"' + (bk.confirmed ? ' checked' : '') + '><span>件数 (合計 ' + total + ' 件)・新しい値 (' + esc(fmtVal(bk.field, bk.val)) + ')・一緒に変わるセットを確かめました</span></label>'
+      + (n.chg ? '<div class="bk-confirm"><label class="chk"><input type="checkbox" class="ck" id="bk-ok"' + (bk.confirmed ? ' checked' : '') + '><span>件数 (合計 ' + total + ' 件)・新しい値 (' + esc(newValText()) + ')・一緒に変わるセットを確かめました</span></label>'
         + '<div class="row"><button type="button" class="btn ' + (danger ? 'bk-dpri' : 'pri') + ' lg" data-act="apply" id="bk-apply"' + (bk.confirmed ? '' : ' disabled') + '>' + ic('i-check', '')
         + (danger ? '選んだ ' + n.chg + ' 件を中止にする' : '合計 ' + total + ' 件を変える') + (n.linked ? ' (セット ' + n.linked + ' を含む)' : '') + '</button>'
         + '<span class="bk-note">NE には今と同じく翌朝の照合のあとで反映します · 誰が・いつ・なぜは「変更の記録」に残ります</span></div></div>'
@@ -600,7 +636,7 @@
     var linkHtml = res.linked.length ? '<div class="bk-sec">一緒に変わったセット ' + res.linkedN + ' 件 (保存の後の本当の値)</div><div class="bk-list">' + res.linked.map(function (d) {
       return '<div class="bk-pv link"><div class="who"><div class="code">' + esc(d.code) + '</div></div><div class="chg"><span class="old">' + esc(fmtLinked(d.col, d.from)) + '</span>' + ic('i-arrow', 'arrow') + '<span class="new">' + esc(fmtLinked(d.col, d.to)) + '</span></div><div class="side"></div></div>';
     }).join('') + '</div>' : '';
-    body.innerHTML = '<h3 class="bk-q" tabindex="-1" id="bk-h" style="margin-bottom:12px">' + (res.ng.length ? ic('i-warn', '') : ic('i-check', '')) + F.label + 'を ' + esc(fmtVal(bk.field, bk.val)) + ' に変えました' + (res.ng.length ? ' (一部だめ)' : '') + '</h3>'
+    body.innerHTML = '<h3 class="bk-q" tabindex="-1" id="bk-h" style="margin-bottom:12px">' + (res.ng.length ? ic('i-warn', '') : ic('i-check', '')) + F.label + 'を ' + esc(newValText()) + ' に変えました' + (res.ng.length ? ' (一部だめ)' : '') + '</h3>'
       + '<div class="bk-cards"><div class="bk-rc ok"><div class="k">変えた</div><div class="v" id="bk-rok">' + res.ok.length + '<small>件</small></div></div>'
       + '<div class="bk-rc ' + (res.ng.length ? 'ng' : '') + '"><div class="k">だめ</div><div class="v" id="bk-rng">' + res.ng.length + '<small>件</small></div></div>'
       + '<div class="bk-rc"><div class="k">変えなかった</div><div class="v" style="color:var(--text2)">' + res.skip + '<small>件</small></div></div></div>'
@@ -648,6 +684,7 @@
     var pick = e.target.closest('[data-pickval]');
     if (pick && bk.step === 2 && pick.getAttribute('data-pickval') !== '') {
       var pv = pick.getAttribute('data-pickval');
+      if (bk.field === 'shipping_code' && !rateOf(pv)) { toast('この配送方法は送料の表にありません'); return; }
       bk.val = bk.field === 'cost' || bk.field === 'standard_price' || bk.field === 'sales_class' || bk.field === 'tax_rate' ? Number(pv) : pv;
       render(); return;
     }
@@ -673,6 +710,7 @@
       var o = $('#bk-reason-other'); if (o) { o.hidden = t.value !== ''; if (t.value === '') o.focus(); }
       live();
     } else if (t.name === 'bk-sup') { bk.val = t.value; live(); }
+    else if (t.id === 'bk-ship') { bk.val = t.value || null; live(); }
     else if (t.id === 'bk-ok') { bk.confirmed = t.checked; var b = $('#bk-apply'); if (b) b.disabled = !t.checked; }
   });
   $('#bk-drawer').addEventListener('focusout', function (e) {
