@@ -123,7 +123,7 @@ import { readDraftInNeCheck, draftInNeView, confirmDraftInNe, DRAFT_IN_NE_BUTTON
 import { runCardOutbox, runGroupOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
 import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
-import { listSkus, listNeighbors, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, splitMulti, EXPORT_MAX, ListTimeoutError, selectableSuppliers } from './read.mjs';
+import { listSkus, listNeighbors, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, splitMulti, EXPORT_MAX, ListTimeoutError, selectableSuppliers, advPickChoices } from './read.mjs';
 import { bulkInspect, bulkPreview, bulkApplyChunk, editableOf, BULK_MAX, BULK_CHUNK, COST_REASONS, FIX_GROUPS } from './bulk.mjs';
 import { buildListCsv, csvFileName, buildAmazonCsv, amazonCsvFileName, buildUnmappedCsv, unmappedCsvFileName } from './list-csv.mjs';
 import { LIST_COLUMNS, SORT_WORDS, DEFAULT_VIEW, ViewPrefsInputError } from './list-columns.mjs';
@@ -195,9 +195,9 @@ const canSeeBackorders = (req) => sessionHasApp(req.session, PO_APP_ID);
 
 /** 詳細検索 (POST /api/search) の大きさの上限 (#1620 Codex R2 M1)。1 つの欄の字数・1 つの値の字数・条件全体のバイト数 */
 const SEARCH_FIELD_MAX_CHARS = 64 * 1024;
-const SEARCH_VALUE_MAX = Object.freeze({ codes: 64, parents: 64, sups: 64, jans: 32, name: 200 });
+const SEARCH_VALUE_MAX = Object.freeze({ codes: 64, parents: 64, sups: 64, jans: 32, name: 200, makers: 20 });
 const SEARCH_COND_MAX_BYTES = 64 * 1024;
-const SEARCH_LABELS = Object.freeze({ codes: '商品コード', parents: '代表 (親) の商品コード', sups: '仕入先コード', jans: 'JAN', name: '商品名', q: '絞る欄' });
+const SEARCH_LABELS = Object.freeze({ codes: '商品コード', parents: '代表 (親) の商品コード', sups: '仕入先コード', jans: 'JAN', name: '商品名', makers: 'メーカー', q: '絞る欄' });
 
 /** NE 登録の CSV の画面の言葉 */
 const REG_EXPORT_STATES = Object.freeze({ built: '作った (まだ配っていない)', issued: '配った (NE に取り込んだら、翌朝自動で確かめます)', declared: '取り込んだと申告', closed: '閉じた' });
@@ -851,6 +851,8 @@ router.get('/', (req, res) => {
     const bulk = { on: !!db && locals.canEdit && !locals.closed, max: BULK_MAX, chunk: BULK_CHUNK, costReasons: COST_REASONS, groups: FIX_GROUPS, multiMax: MULTI_MAX };
     res.render(view('index.ejs'), { ...locals, ui2: true, nav: 'list', listPage: true, dbError, data, counts, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, extras, searchExpired, fmt, exportMax: EXPORT_LIMITS.max,
       listView, LIST_COLUMNS, SORT_WORDS, DEFAULT_VIEW, bulk, imgOf, IMAGE_STATE_WORDS,
+      // 🆕 詳細検索の「名前で選ぶ」(仕入先・メーカー) の名簿。読めない = 選ぶ欄を出さない (コードの欄はそのまま)
+      advPick: db ? await advPickChoices(db).catch(() => null) : null,
       // 🆕 0088: ブランド・商品の段階の列と絞り込み (ready = 表を読める = 札と絞り込みを出す)
       brandLifeList: { ready: db ? await brandLifeTablesExist(db).catch(() => false) : false, today: jstDate(new Date(clock())), stages: LIFE_STAGES, filters: LIFE_FILTERS, soonDays: END_SOON_DAYS, endBadge } });
   });

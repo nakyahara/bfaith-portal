@@ -412,7 +412,8 @@
     var f = e.target;
     if (e.defaultPrevented || !f || f.id !== 'adv-form' || !window.FormData || !window.fetch) return;
     var body = {}, qs = new URLSearchParams();
-    new FormData(f).forEach(function (v, k) { if (String(v).trim() !== '') { body[k] = String(v); qs.append(k, String(v)); } });
+    // 同じ名前が複数 (メーカーの選ぶ欄 = name=makers の複数選択) = 1 行 1 つにつなぐ (サーバーは改行で分ける)
+    new FormData(f).forEach(function (v, k) { if (String(v).trim() !== '') { body[k] = Object.prototype.hasOwnProperty.call(body, k) ? body[k] + '\n' + String(v) : String(v); qs.append(k, String(v)); } });
     if ((location.pathname + '?' + qs.toString()).length <= ADV_URL_MAX) return;   // 短い = GET のまま
     e.preventDefault();
     var b = $('button[type="submit"]', f); if (b) b.disabled = true;

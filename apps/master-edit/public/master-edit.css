@@ -690,6 +690,31 @@ details.adv[open] > summary { border-color: var(--line-strong); color: #fff; }
 .adv-grid .adv-sels { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .adv-grid .adv-foot { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding-top: 4px; border-top: 1px solid var(--line-soft); }
 @media (max-width: 1100px) { .adv-grid { grid-template-columns: 1fr 1fr; } .adv-grid .adv-codes { grid-row: auto; } }
+/* 🆕 詳細検索の「名前で選ぶ」(仕入先・メーカー・public/me-pick.js)。候補は欄のすぐ下 (.csug の見た目)・選んだ物は札 (× で外す) */
+.adv-grid .pick { display: flex; flex-direction: column; gap: 6px; min-width: 0; font-size: 13.5px; color: var(--text2); }
+.adv-grid .pick[hidden] { display: none; }
+.adv-grid .pick select.pk-native { height: auto; min-height: 96px; padding: 4px; }
+.pk-box { position: relative; min-width: 0; }
+.pk-box input.in { width: 100%; }
+.pk-box .csug { top: calc(100% + 4px); left: 0; width: 100%; max-height: min(360px, 55vh); }
+.pk-chips { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.pk-chips:empty { display: none; }
+.pk-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; min-width: 0; padding: 1px 2px 1px 10px; border-radius: 999px; border: 1px solid rgba(58, 231, 255, 0.35); background: var(--accent-bg); font-size: 13px; color: var(--text); }
+.pk-chip.off { border-color: var(--line-strong); background: transparent; }
+.pk-chip .cc, .csug .co.pk-o .cc { font-family: var(--mono); font-size: 12.5px; color: var(--muted); }
+.pk-chip .nm { overflow-wrap: anywhere; min-width: 0; }
+.pk-chip .tg, .csug .co .tg { flex: none; font-size: 11.5px; color: var(--muted); border: 1px solid var(--line-strong); border-radius: 999px; padding: 0 6px; }
+.pk-chip button { flex: none; width: 30px; height: 30px; border: 0; border-radius: 50%; background: transparent; color: var(--text2); font-size: 16px; line-height: 1; cursor: pointer; }
+.pk-chip button:hover, .pk-chip button:focus-visible { background: rgba(255, 255, 255, 0.1); color: #fff; }
+.csug .co.pk-o .l1 { flex-wrap: nowrap; }
+.csug .co.pk-o .cn { color: var(--text); }
+.csug .co.pk-o.pk-off .cn { color: var(--muted); }
+.csug .co .ck { flex: none; display: inline-grid; place-items: center; width: 18px; height: 18px; border: 1px solid var(--line-strong); border-radius: 5px; font-size: 12px; color: transparent; }
+.csug .co[aria-selected="true"] .ck { background: var(--accent); border-color: var(--accent); color: #04121f; }
+@media (max-width: 760px) {
+  .pk-chip button { width: 44px; height: 44px; }
+  .pk-box input.in { min-height: 44px; }
+}
 /* 参考の列 (在庫 = ロジザード・注文残 = 発注アプリ): 灰色で小さめ */
 .tbl .ref { color: var(--muted); font-size: 13px; }
 .tbl th.ref { line-height: 1.25; }

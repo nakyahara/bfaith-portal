@@ -12,6 +12,7 @@
  *     コードが左端でない / 外した・知らない項目 = 400)・Origin と JSON の守り・置き場が無い (読めない = いつもの列で一覧は出る / 保存は 503)
  *   5 画面の描画: 保存した列の並び・出さない列は hidden・仕入先の列 (出すと名前の下の字を消す)・注文残の権限・列の板の材料 (JSON)・画面の JS が読める
  *   6 在庫の並び (ロジザードの写し・セットは作れる数) = 一覧の値と同じ・写しが読めない = コード順・全部のコードも同じ
+ *   8 詳細検索のメーカー (0084・複数・メーカー未登録)・URL / 印に残る・並び・件数・CSV・知らない値は捨てる・索引で引く・仕入先を名前で選ぶ名簿 (10/24)
  * 使い方: node scripts/test-master-list.mjs
  */
 import assert from 'node:assert/strict';
@@ -558,6 +559,136 @@ await ta('[7] 画像の列 (10/17 中原さん): キャッシュの URL を出�
     await call('POST', '/api/view-prefs', { body: { order: [...LC.DEFAULT_VIEW.order], shown: [...LC.DEFAULT_VIEW.shown] } });
     try { pdb.close(); } catch { /* 閉じられなくてもよい */ }
   }
+});
+
+console.log('詳細検索の「名前で選ぶ」(仕入先・メーカー)');
+// 🆕 2026-10-24: メーカー (0084) の名簿と商品ごとのメーカー。書くのは本来 ops.create_maker / ops.set_product_maker だけ = 試験は持ち主のロールで守りの印を付けて直接入れる
+async function seedMakers() {
+  await pg.exec(`begin;
+    select set_config('ops.maker_protocol', '1', true);
+    insert into core.makers (name, name_norm, active, created_by_id, created_request_id) values
+      ('はちみつ本舗', core.maker_name_norm('はちみつ本舗'), true, 'naka@test', gen_random_uuid()),
+      ('ミカワ', core.maker_name_norm('ミカワ'), true, 'naka@test', gen_random_uuid()),
+      ('古いメーカー', core.maker_name_norm('古いメーカー'), false, 'naka@test', gen_random_uuid());
+    insert into core.product_makers (product_id, maker_id, set_by, set_via, request_id)
+      select k.product_id, m.maker_id, 'naka@test', 'sku_page', gen_random_uuid() from core.skus k join core.makers m
+        on (k.code, m.name) in (('a01', 'はちみつ本舗'), ('a02', 'はちみつ本舗'), ('a03', 'ミカワ'), ('a04', '古いメーカー'));
+    commit;`);
+  const ids = Object.fromEntries((await pg.query('select name, maker_id::text as id from core.makers')).rows.map((r) => [r.name, r.id]));
+  return { HONPO: ids['はちみつ本舗'], MIKAWA: ids['ミカワ'], OLD: ids['古いメーカー'] };
+}
+await ta('[8] メーカーで絞る (複数・メーカー未登録)・URL に残る (選ぶ欄の複数 / カンマ / 印)・並び・件数・CSV・知らない値は捨てる (SQL に入れない)・主キーで引く・仕入先を名前で選ぶ名簿', async () => {
+  const { HONPO, MIKAWA, OLD } = await seedMakers();
+  const codeAsc = await codesOf('');
+  // 決まった形: none が先・番号は小さい順・カンマ。知らない値は捨てる
+  assert.equal(R.normalizeFilters({ makers: [MIKAWA, HONPO, 'none', HONPO] }).makers, ['none', ...[HONPO, MIKAWA].sort((a, b) => a - b)].join(','));
+  for (const bad of ['0', '01', 'abc', "1'or'1'='1", '1)--', '12345678901234567890', '-1', '1.5', '{1}', 'NONE', '__proto__']) assert.equal(R.normalizeFilters({ makers: bad }).makers, '', bad);
+  assert.equal(R.normalizeFilters({ makers: '1;drop table core.skus' }).makers, '1', '区切り (; 空白) で分けて番号だけ残す');
+  assert.equal(R.normalizeFilters({ makers: { a: '1' } }).makers, '', 'オブジェクト (?makers[a]=1) = 捨てる');
+  // Codex R1 Medium: ?makers[toString]=1 (Express がオブジェクトにする) で 500 にしない・配列の中のオブジェクトも捨てる
+  assert.equal(R.normalizeFilters({ makers: { toString: '1' } }).makers, '');
+  assert.equal(R.normalizeFilters({ makers: ['2', { toString: '1' }, '3'] }).makers, '2,3');
+  assert.equal((await call('GET', '/?makers[toString]=1')).status, 200, 'オブジェクトの入力で落ちない');
+  assert.equal((await call('GET', '/api/codes?makers[toString]=1&makers[valueOf]=2')).status, 200);
+  // Codex R1 Medium: 501 件選んだ = 500 件までを使って知らせる (黙って落とさない)
+  const many = Array.from({ length: R.MULTI_MAX + 1 }, (_, i) => String(1000 + i));
+  assert.equal(R.normalizeFilters({ makers: many }).makers.split(',').length, R.MULTI_MAX + 1);
+  const cut = await R.listSkus(db, { makers: many.join(',') }, { now: NOW });
+  assert.deepEqual([cut.multiCut, cut.total], [true, 0], '501 件 = 500 件まで使ったと知らせる');
+  {
+    // Codex R2 Low: 未登録 + 500 件 = 未登録も 1 件に数えて 500 件 (番号は 499 件だけ SQL へ)
+    const cap = [];
+    const c2 = await R.listSkus({ query: (t, p) => { cap.push(p || []); return pg.query(t, p); } }, { makers: ['none', ...many.slice(0, R.MULTI_MAX)].join(',') }, { now: NOW });
+    const arr = cap.flat().find((x) => Array.isArray(x) && x.includes('1000'));
+    assert.deepEqual([c2.multiCut, arr.length, c2.total], [true, R.MULTI_MAX - 1, 6]);
+  }
+  assert.ok(R.ADV_KEYS.includes('makers'));
+  // 絞る (単品の商品の行ごと = 一覧の「メーカー」の列と同じ)
+  const by = (qs) => codesOf(qs);
+  assert.deepEqual(await by(`?makers=${HONPO}`), ['a01', 'a02']);
+  assert.deepEqual(await by(`?makers=${HONPO}&makers=${MIKAWA}`), ['a01', 'a02', 'a03'], '選ぶ欄の複数 (?makers=1&makers=2)');
+  assert.deepEqual(await by(`?makers=${encodeURIComponent(`${MIKAWA},${HONPO}`)}`), ['a01', 'a02', 'a03'], 'カンマで区切っても同じ');
+  assert.deepEqual(await by(`?makers=${OLD}`), ['a04'], '使っていないメーカーでも絞れる');
+  assert.deepEqual(await by('?makers=none'), ['a05', 'a06', 'a07', 'a08', 'a09', 'a10'], 'メーカー未登録 = 単品でメーカーが無い (セット・例外は入れない)');
+  assert.deepEqual(await by(`?makers=none&makers=${MIKAWA}`), ['a03', 'a05', 'a06', 'a07', 'a08', 'a09', 'a10'], '未登録 + メーカー = どちらか');
+  assert.deepEqual(await by(`?makers=${HONPO}&kind=set`), [], 'セットはメーカーを持たない');
+  assert.deepEqual(await by('?makers=999999'), [], '名簿に無い番号 = 当たらない');
+  assert.deepEqual(await by(`?makers=${HONPO}&sups=2`), ['a01'], 'ほかの詳細検索と一緒 (仕入先 0002 かつ はちみつ本舗)');
+  // 知らない値 = 条件ごと捨てる (全部)・人の入力を SQL に入れない (番号は $番号の bigint[])
+  for (const bad of ["1'or'1'='1", 'x)--', 'abc']) {
+    sqlLog.length = 0;
+    assert.deepEqual(await by(`?makers=${encodeURIComponent(bad)}`), codeAsc, bad);
+    assert.ok(sqlLog.every((t) => !t.includes(bad) && !/drop table/i.test(t)), `${bad}: SQL に入れない`);
+  }
+  sqlLog.length = 0;
+  await by(`?makers=${HONPO}`);
+  assert.ok(sqlLog.some((t) => /x\.maker_id = any\(\$\d+::bigint\[\]\)/.test(t)) && sqlLog.every((t) => !t.includes(`= any('{${HONPO}}`)), '番号は $番号で渡す');
+  // 並び・ページ分け・件数・CSV
+  const rows = (await shownRows()).filter((x) => ['a01', 'a02', 'a03'].includes(x.code));
+  assert.deepEqual(await by(`?makers=${HONPO},${MIKAWA}&sort=price&dir=desc`), expectedOrder(rows, 'price', 'desc'), '絞ったものを並べる');
+  const p2 = await R.listSkus(db, { makers: `${HONPO},${MIKAWA}`, offset: '1' }, { now: NOW });
+  assert.deepEqual([p2.total, p2.rows.map((x) => x.code)], [3, ['a02', 'a03']], 'ページ分け (offset) と件数');
+  let r = await call('GET', `/?makers=${MIKAWA}&makers=${HONPO}&kind=single`);
+  assert.equal(r.status, 200);
+  assert.deepEqual(listOrder(r.text), ['a01', 'a02', 'a03']);
+  assert.ok(r.text.includes('<b>3</b> 件'), '件数');
+  const mk = [HONPO, MIKAWA].sort((a, b) => a - b).join('%2C');
+  assert.match(r.text, new RegExp(`id="copy-all" data-url="api/codes\\?kind=single&amp;makers=${mk}"`), 'コピーのリンクも同じ条件 (決まった形)');
+  assert.match(r.text, new RegExp(`id="csv-link" href="list\\.csv\\?kind=single&amp;makers=${mk}"`));
+  assert.match(r.text, new RegExp(`<details class="more filters-more"[\\s\\S]*?<input type="hidden" name="makers" value="${mk.replace('%2C', ',')}">`), 'もっと絞る のフォームが持ち回る');
+  assert.match(r.text, new RegExp(`<a class="chip[^"]*" href="\\?makers=${mk}"`), '区分の札 (全部) を押しても残る');
+  assert.match(r.text, /<details class="more adv" open id="adv">[\s\S]*?使っている/, '詳細検索の板を開いておく');
+  const csv = await (await fetch(`${BASE}/list.csv?makers=${HONPO}`, { headers: { 'x-test-session': 'editor' } })).text();
+  assert.deepEqual(csv.replace(/^﻿/, '').trim().split('\r\n').slice(1).map((l) => /^"([^"]*)"/.exec(l)[1]), ['a01', 'a02'], 'CSV も同じ条件');
+  // 選ぶ欄: 名簿 (使うメーカーが先・使っていない印)・選んでいる物・メーカー未登録
+  const mkSel = /<select multiple class="in pk-native" name="makers" id="adv-makers"[^>]*>([\s\S]*?)<\/select>/.exec(r.text)[1];
+  const opts = [...mkSel.matchAll(/<option value="([^"]+)"([^>]*)>([^<]*)<\/option>/g)].map((m) => [m[1], / selected/.test(m[2]), / data-off/.test(m[2]), m[3]]);
+  assert.deepEqual(opts, [['none', false, false, 'メーカー未登録'], [HONPO, true, false, 'はちみつ本舗'], [MIKAWA, true, false, 'ミカワ'], [OLD, false, true, '古いメーカー (使っていない)']]);
+  r = await call('GET', '/?makers=none&makers=987654');
+  const opts2 = [.../<select multiple class="in pk-native" name="makers"[^>]*>([\s\S]*?)<\/select>/.exec(r.text)[1].matchAll(/<option value="([^"]+)"[^>]*?( selected)?>/g)].filter((m) => m[2]).map((m) => m[1]);
+  assert.deepEqual(opts2, ['none', '987654'], '名簿に無い番号も選んだまま残す (条件を黙って落とさない)');
+  assert.ok(r.text.includes('src="/apps/master-edit/public/me-pick.js?v='), '画面の JS');
+  // 長い条件の印 (POST api/search): 選ぶ欄の複数 = 改行でつないで送る (me-shell.js)。印の中身 = 決まった形
+  const sr = await call('POST', '/api/search', { body: { makers: `${MIKAWA}\n${HONPO}`, codes: 'a01\na02\na03\na04', sort: 'code', dir: 'desc' } });
+  assert.equal(sr.status, 200, sr.text);
+  assert.match(sr.j.url, /\?dir=desc&s=[A-Za-z0-9_-]+$/, '詳細検索の項目は印に');
+  assert.deepEqual(await codesOf('?' + sr.j.url.split('?')[1]), ['a03', 'a02', 'a01'], '印の中身 (メーカー + コード)・並び');
+  r = await call('GET', '/?' + sr.j.url.split('?')[1]);
+  assert.match(r.text, new RegExp(`<option value="${HONPO}" data-name="はちみつ本舗" selected>`), '印で開いても選んだまま');
+  assert.equal((await call('POST', '/api/search', { body: { makers: '1'.repeat(30) } })).status, 413, '1 つの値の長さの上限');
+  // 表が読めない (0084 の前・ロールの流し直しの前) = 選んだメーカーは当たらない・未登録 = 単品の全部・欄は出さない (条件は隠した欄で持ち回る)
+  await pg.query('revoke select on core.product_makers from master_edit');
+  try {
+    assert.deepEqual(await by(`?makers=${HONPO}`), []);
+    assert.deepEqual(await by('?makers=none&kind=single'), ['a01', 'a02', 'a03', 'a04', 'a05', 'a06', 'a07', 'a08', 'a09', 'a10']);
+    r = await call('GET', `/?makers=${HONPO}`);
+    assert.equal(r.status, 200);
+    assert.ok(!r.text.includes('id="adv-makers"'), 'メーカーの欄は出さない');
+    assert.ok(r.text.includes(`<input type="hidden" name="makers" value="${HONPO}">`), '条件は隠した欄で持ち回る');
+  } finally { await pg.query('grant select on core.product_makers to master_edit'); }
+  // 速さ: 商品ごとに主キー (product_id) で引ける形 (列を関数で包まない)。小さい表は planner が全部読むので seqscan を止めて見る
+  {
+    const cap = [];
+    await R.listSkus({ query: (t, p) => { cap.push([t, p]); return pg.query(t, p); } }, { makers: `none,${HONPO}` }, { now: NOW, mode: 'codes' });
+    const [t, p] = cap.find(([x]) => /core\.product_makers x where x\.product_id = s\.product_id and x\.maker_id/.test(x));
+    await pg.exec('set enable_seqscan = off');
+    try {
+      const plan = JSON.stringify((await pg.query(`explain (format json) ${t}`, p)).rows[0]);
+      assert.match(plan, /product_makers_pkey|ix_product_makers_maker/, `メーカーの表は索引で引く ${plan.slice(0, 400)}`);
+    } finally { await pg.exec('reset enable_seqscan'); }
+  }
+  // 仕入先を名前で選ぶ名簿: 全部の仕入先 (取引中が先・取引なしは印)・選ぶとコードの欄に足す (画面の JS) = コードの欄の条件のまま
+  await pg.query("insert into core.suppliers (company_id, code, name, active) values (1, '0099', 'やめた問屋 <b>', false)");
+  r = await call('GET', '/');
+  const sup = /<div class="pick" id="sup-pick" data-pick="into" data-into="adv-sups"[^>]*hidden>[\s\S]*?<select multiple id="sup-pick-src" hidden aria-hidden="true" tabindex="-1">([\s\S]*?)<\/select>/.exec(r.text);
+  assert.ok(sup, '仕入先の選ぶ部品 (JS が無いときは隠す)');
+  assert.deepEqual([...sup[1].matchAll(/<option value="([^"]+)" data-code="[^"]+" data-name="([^"]*)"( data-off)?>/g)].map((m) => [m[1], m[2], !!m[3]]),
+    [['0001', 'AMC', false], ['0002', 'ビーフリー', false], ['0010', '東和', false], ['0099', 'やめた問屋 &lt;b&gt;', true]], '取引中が先・取引なしは印・名前は字のまま (HTML にしない)');
+  assert.deepEqual(await by('?sups=0099'), [], '選んだ仕入先 = コードの欄の条件');
+  assert.deepEqual(await by('?sups=0002%0A0010'), ['a01', 'a03', 'a06', 'a09', 'a10']);
+  const choices = await R.advPickChoices(db);
+  assert.deepEqual(choices.makers.map((m) => m[1]), ['はちみつ本舗', 'ミカワ', '古いメーカー']);
+  assert.deepEqual(choices.makers.map((m) => m[2]), [true, true, false]);
 });
 
 server.close();
