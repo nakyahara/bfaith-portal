@@ -468,7 +468,8 @@ console.log('\n■ 9. Render の mirror (本物の表の形)');
   ok(/決済ベース/.test(out.buybox_lost.sales_basis) && out.buybox_lost.items[0].sales_28d_yen > 0 && out.buybox_lost.items[0].product_name === '商品B',
     '売上・商品名は finance の統合 view (決済ベース)', out.buybox_lost);
   const others = ITEM_KEYS.filter((k) => k !== 'buybox_lost');
-  ok(others.every((k) => out[k].status === 'no_data' && /表が無い/.test(out[k].reason)), 'mirror に無い 8 項目は no_data (表が無い)', others.map((k) => out[k].reason));
+  // feat/mirror-amazon-ai で mirror に受け皿の表ができる = まだ送られていない朝は「表が空」、受け皿が無い mirror なら「表が無い」
+  ok(others.every((k) => out[k].status === 'no_data' && /表が無い|表が空/.test(out[k].reason)), 'mirror にまだ無い 8 項目は no_data (表が無い / 表が空)', others.map((k) => out[k].reason));
   try { db.close(); } catch { /* noop */ }
 }
 
