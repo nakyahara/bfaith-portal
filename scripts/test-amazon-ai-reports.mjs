@@ -412,7 +412,10 @@ await t('1 つの塊 (見出しのコメントで囲む) で 見張りの後・D
   const between = ds.slice(iWatch, iHead).split('\n').slice(1).join('\n')
     .replace(/  \/\/ ── Amazon AI 分析用の出品・カート・BSR \(2026-10-22\)[\s\S]*?  \/\/ ── Amazon AI 分析用の出品・カート・BSR ここまで[^\n]*\n?/, '');
   assert.doesNotMatch(between, /runScript\(|results\.push\(/);
-  assert.doesNotMatch(ds.slice(iTail, iBackup), /runScript\(|results\.push\(/);
+  // この塊と DBバックアップのあいだに置いてよいのは、この塊の表を Render へ送る段 (2026-10-24・sync-amazon-ai-mirror.js) だけ
+  const afterTail = ds.slice(iTail, iBackup).split('\n').slice(1).join('\n')
+    .replace(/  \/\/ ── Amazon AI 分析用の表を Render の mirror へ \(2026-10-24[\s\S]*?  \/\/ ── Amazon AI 分析用の表を Render の mirror へ ここまで[^\n]*\n?/, '');
+  assert.doesNotMatch(afterTail, /runScript\(|results\.push\(/);
   for (const f of AI_FILES) assert.equal(ds.split(`'apps/warehouse/${f}`).length - 1, 1, `${f} が塊の外にもある / 無い`);
   // spResult は main の同じ深さ (塊の位置まで括弧が閉じない) で宣言されている
   const iSp = ds.indexOf("const spResult = runScript('apps/warehouse/sp-api-orders.js'");

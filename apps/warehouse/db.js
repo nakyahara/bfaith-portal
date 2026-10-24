@@ -14,6 +14,7 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 import { createSettlementVersionSchema } from './amazon-settlement-versions.js';
+import { seedAmazonAiMirrorContracts } from '../../lib/amazon-ai-mirror.js';
 
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'warehouse.db');
@@ -1910,6 +1911,12 @@ function createTables() {
       owner               = excluded.owner,
       updated_at          = excluded.updated_at
   `);
+
+  // ---- Amazon AI の分析が読む表 13 種: contract auto-seed (2026-10-24)
+  // amazon_sales_traffic_* / amazon_listing_* / amazon_fba_returns / _reimbursements / sp_report_fetch_days / amazon_catalog_rank_daily /
+  // fba_planning_daily(_days) / fact_amazon_ads_sku_attrib / ads_attrib_fetch_days → mirror_<表名> (sync-amazon-ai-mirror.js)。
+  // 列・日数の定義は lib/amazon-ai-mirror.js (受け手と共有)。送り手も送る前に同じ UPSERT をする
+  seedAmazonAiMirrorContracts(db);
 
   // ---- 楽天RPP広告費 mirror sync: contract auto-seed (mall-csv-fetcher P1、2026-07-09)
   // fact_rakuten_ads_rpp (月次×商品) / fact_rakuten_ads_rpp_daily (日次×キャンペーン合計) を

@@ -1810,6 +1810,14 @@ async function main() {
     }
   }
   // ── ここまで Amazon AI 分析用のレポート ──────────────────────────────────────────
+  // ── Amazon AI 分析用の表を Render の mirror へ (2026-10-24・ai-insights の facts-amazon.js が mirror_<表名> を読む) ──
+  // 上の取得 (出品・BSR・アクセス・返品・補てん) と、前の段の在庫計画の履歴・広告の帰属売上の後 = 今朝の分まで送る (Render同期 の段は取得より前なので 1 日遅れる)。
+  // 表・列・日数は lib/amazon-ai-mirror.js。表ごとに直近を日ごとに置き換え・止まっていた日は埋め直す・初回は残す日数ぶん全部 (run を小分け)。
+  // 表が無い・まだ空 = ⏭️ (失敗にしない)。SP-API が失敗した朝も送る (元の表の今の中身を写すだけ)。retry には載せない (翌朝の回が続きから送る)。
+  //   🚨 引数を必ず渡す (runScript は引数なしだと '7' を足す)。DATA_DIR は env (runScript が子へ渡す)
+  const amazonAiMirrorResult = runScript('apps/warehouse/sync-amazon-ai-mirror.js --daily', 'Amazon AI mirror sync', 2400000);
+  results.push({ name: 'Amazon AI mirror sync', ...amazonAiMirrorResult });
+  // ── Amazon AI 分析用の表を Render の mirror へ ここまで ──────────────────────────────
 
   // ─── warehouse.db 日次バックアップ (VACUUM INTO → gzip → rclone offsite → 世代管理) ───
   // 一番最後の段 (2026-10-11 中原さん Q1 = a。前は見張り・照合の前 = 照合 ② と新商品の許可がバックアップ (約 93 分) を待っていた)。中身は変えない。

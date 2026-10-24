@@ -294,6 +294,7 @@ export const PUBLISH_UNGATED_SCRIPTS = Object.freeze({
   'apps/warehouse/monitor-amazon-returns.js': '返品の明細と注文だけ',
   'apps/warehouse/fetch-amazon-reimbursements.js': 'SP-API の補てんのレポートだけ',
   'apps/warehouse/fetch-amazon-ledger.js': 'SP-API の在庫の台帳のレポートだけ',
+  'apps/warehouse/sync-amazon-ai-mirror.js': 'Amazon AI の分析の表 (アクセス・出品・返品・補てん・BSR・在庫計画・広告の帰属) を Render へ送るだけ',
 });
 
 /** 止めた朝に fail の ping を代わりに打つ工程 (自分で ping を打つ = 台帳に項目がある) */

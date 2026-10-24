@@ -20,6 +20,7 @@ import {
   STORE_BENCH_COLS, STORE_DEVICE_BASE_COLS, STORE_DEVICE_OPT_COLS, STORE_DEVICE_REAL_COLS,
   CATEGORY_DEMO_COLS,
 } from '../../lib/rakuten-dd-columns.js';
+import { AMAZON_AI_MIRROR_ENTITIES, mirrorTableDdl, mirrorIndexDdl } from '../../lib/amazon-ai-mirror.js';   // import を持たない部品
 
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'warehouse-mirror.db');
@@ -68,6 +69,10 @@ export let skuMapInitError = null;
 // 世代つきの対も 503 で断る。世代なしの対は今までどおり (表が無い = 一度も有効になっていない。表があって行があれば有効のまま = 409)
 export let skuMapGenerationInitError = null;
 
+// Amazon AI の分析 (ai-insights の facts-amazon.js) が読む表 (2026-10-24・lib/amazon-ai-mirror.js) も同様。
+// 作れなくても他の表は続ける。立っている間はこの表への sync を 503 で断る (router)
+export let amazonAiInitError = null;
+
 export function initMirrorDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   // リトライ再入時 (2026-07-12 障害対応: 一過性失敗の自己回復) に前のハンドルを
@@ -83,6 +88,7 @@ export function initMirrorDB() {
   productScoutInitError = null;
   skuMapInitError = null;
   skuMapGenerationInitError = null;
+  amazonAiInitError = null;
   db = new Database(DB_FILE);
   // PRAGMA は接続単位の設定。SQLite のデフォルトは foreign_keys=OFF / recursive_triggers=OFF なので、
   // f_mis_shipments の FK 制約 と append-only trigger を機能させるために毎接続で明示する必要がある。
@@ -1211,6 +1217,26 @@ function createTables() {
       at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
     };
     console.error('[Mirror] SKUマップ表の初期化失敗 (mirror本体は継続):', e.message);
+  }
+
+  // ─── Amazon AI の分析が読む表 13 種 (2026-10-24。ミニPC apps/warehouse/sync-amazon-ai-mirror.js が毎朝送る) ───
+  // mirror_<元の表名> = facts-amazon.js (ai-insights) の TABLES の 1 番目の候補。列の名前と型は元の表のまま (読む列と主キーだけ)。
+  // 定義は lib/amazon-ai-mirror.js (送り手と共有)。古い行は受け手が消す (router の retention)。
+  // fail-soft: 新mirror表のDDLは fail-soft 必須 (2026-07-12 障害の教訓)
+  try {
+    db.transaction(() => {
+      for (const spec of AMAZON_AI_MIRROR_ENTITIES) {
+        db.exec(mirrorTableDdl(spec));
+        for (const ddl of mirrorIndexDdl(spec)) db.exec(ddl);
+      }
+    })();
+  } catch (e) {
+    amazonAiInitError = {
+      message: String(e.message || e),
+      code: e.code || null,
+      at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
+    };
+    console.error('[Mirror] Amazon AI の分析の表の初期化失敗 (mirror本体は継続):', e.message);
   }
 
   // ─── 日次出荷サマリ (出荷日 × モール × 配送方法 の伝票件数、2026-08-05) ───
