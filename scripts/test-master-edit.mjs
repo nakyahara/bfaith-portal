@@ -2650,6 +2650,13 @@ await ta('[22] 1 つの商品の画面の「← 前へ」「次へ →」(10/17 
   // 画面: 前へ・次へを出す場所 (最初は隠す) と画面の JS
   const page = await call('GET', '/sku/s002');
   assert.match(page.text, /<nav class="pn" id="sku-pn" aria-label="一覧の前後の商品" data-code="s002" hidden><\/nav>/);
+  // 🆕 2026-10-24 中原さん: 商品の画面の右上 (前へ・次へ の隣) にも「新しいセット」「新しい単品」= 一覧の右上と同じ先・一覧と同じく誰にでも出す (見るだけの人も)
+  for (const [session, html] of [['editor', page.text], ['admin', (await call('GET', '/sku/s002', { session: 'admin' })).text], ['editor', (await call('GET', '/sku/set001')).text]]) {
+    const box = (/<div class="crumb-acts">([\s\S]*?)<\/div>\s*<\/div>/.exec(html) || [])[1] || '';
+    assert.match(box, /<a class="btn sm" id="sku-new-set" href="[^"]*\/apps\/master-edit\/new\?kind=set">[\s\S]*?新しいセット<\/a>/, session);
+    assert.match(box, /<a class="btn sm" id="sku-new-single" href="[^"]*\/apps\/master-edit\/new\?kind=single">[\s\S]*?新しい単品<\/a>/, session);
+    assert.ok(box.indexOf('id="sku-pn"') < box.indexOf('id="sku-new"'), '前へ・次へ の後');
+  }
   assert.ok((await checkScripts(page.text, 0)).some((s) => s.includes("'api/neighbors?'")), '画面の JS (me-prevnext.js) を読む');
   // 絞り込み・並びのいろいろ: 前・次・場所が全部コピーの並びと同じ (最初・真ん中・最後)
   for (const qs of ['', 'kind=single', 'kind=single&sort=name&dir=desc', 'sort=kind', 'sort=profit', 'sort=rate&dir=desc', 'sort=sales_class', 'q=s00', 'q=' + encodeURIComponent('ｓ００'), 'state=available&sort=price', 'missing=reorder']) {

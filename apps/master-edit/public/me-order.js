@@ -5,8 +5,10 @@
  *   - 新商品の登録 (mode = new): 下書きの保存と一緒に送る = MasterEdit.orderSettings.collect() を me-new.js が本文の order_settings に入れる
  *   - 商品の画面 (mode = sku): 自分の「発注の設定を保存」(POST /api/sku/:code/order-settings・開いたときの印 seen)。Company DB の保存とは別。
  *     未保存の数は MasterEdit.dirty() に足す (離れるときの確認に出る)
- *   🆕 2026-10-13 (入力なし): 新商品の登録では、6 つの項目 (発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量) は
+ *   🆕 2026-10-13 (入力なし): 新商品の登録では、3 つの項目 (発注ロット・発注条件グループ・原料グループ) は
  *     どれも「値」か「入力なし」(グループは「なし」= 入力なし)。MasterEdit.orderSettings.items() = 画面が数える項目 (書けないとき = 空)
+ *   🆕 2026-10-24 中原さん「この項目は任意にして商品登録の必須要件にしないで」: ケース・容量 (ケースロット・ケースグループ・容量/個) は数えない
+ *     (空 = 入れない・「入力なし」は無い)。値を入れたときの形はサーバー (発注アプリの部品) が今までどおり確かめる
  *   🆕 ⑤-1 / ⑤-2 (CompanyDB構想 27 §2.4): 先方品番・入数 (発注アプリの先方番号対応表・仕入先ごと)
  *     - 新商品の登録 (単品): 2 つの欄を collect() の vendor_code / qty_per_unit に入れる (任意・「入力なし」には数えない)
  *     - 商品の画面: 1 行ずつ「保存」(POST /api/sku/:code/vendor-code・開いたときの版 base_updated_at)・「消す」(…/delete)。
@@ -162,9 +164,6 @@
       chk('order_settings.order_lot', '発注ロット', '#po-order_lot'),
       grp('order_settings.condition', 'po-cond-mode', 'po-condition_id', '発注条件グループ', function () { return !!(val('po-nc-name') && val('po-nc-id') && val('po-nc-type') && val('po-nc-value')); }, '#po-nc-name'),
       grp('order_settings.material', 'po-mat-mode', 'po-material_group_id', '原料グループ', function () { return !!(val('po-nm-name') && val('po-nm-id')); }, '#po-nm-name'),
-      chk('order_settings.case_lot', 'ケースロット', '#po-case_lot'),
-      chk('order_settings.case_group', 'ケースグループ', '#po-case_group'),
-      chk('order_settings.capacity_per_unit', '容量 / 個', '#po-capacity_per_unit'),
     ];
   }
   ME.orderSettings = { collect: collect };

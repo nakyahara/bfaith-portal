@@ -1011,9 +1011,9 @@ await ta('[35] 新商品の登録 (単品・10/5): あと N つ (① がそろ�
   assert.equal(await dirty(p), 0);
   // 🆕 2026-10-13 (入力なし): 必須 8 + 必須でない 18 (原価・Amazon・公式ページ・発送方法・セット商品・発注の設定 6・入荷日の管理・参考 URL・Yahoo! 5) = 26
   //   🆕 0080: + ロジザードのバーコード (必須 = 値か空欄) = 27 / 🆕 0084: + メーカー (値か入力なし) = 28
-  assert.match(await p.textContent('#remain'), /あと\s*28\s*つ/);
+  assert.match(await p.textContent('#remain'), /あと\s*25\s*つ/);
   assert.equal(await p.isDisabled('#save'), true);
-  assert.match(await p.textContent('#save'), /あと 28 つ: 商品コード/);
+  assert.match(await p.textContent('#save'), /あと 25 つ: 商品コード/);
   await p.fill('#reason', '理由だけ');
   assert.equal(await dirty(p), 0, '保存の理由は数えない');
   await p.click('#checklist button:has-text("税率")');
@@ -1038,25 +1038,25 @@ await ta('[35] 新商品の登録 (単品・10/5): あと N つ (① がそろ�
   await p.waitForSelector('#code-msg.ok');
   await p.fill('#f-name', 'UI 新商品 1');
   await p.fill('#f-standard_price', '1280');
-  assert.match(await p.textContent('#save'), /あと 25 つ: 税率/);
+  assert.match(await p.textContent('#save'), /あと 22 つ: 税率/);
   await p.click('#f-tax_rate button[data-v="0.08"]');
   // 2026-10-08 中原さん: 代表の仕入先は ① (必須)・発送方法は ③ (あとでも可) = 発送方法を選んでも保存できない
   await p.selectOption('#shipping', 'S02');
-  assert.match(await p.textContent('#save'), /あと 23 つ: 代表の仕入先/);
+  assert.match(await p.textContent('#save'), /あと 20 つ: 代表の仕入先/);
   assert.equal(await p.isDisabled('#save'), true, '代表の仕入先が無い = 押せない');
   await p.selectOption('#f-primary_supplier', '0001');
   // 🆕 0061: 売上分類・推奨保有月数・ロジザードの有効期限の管理もそろうまで押せない
-  assert.match(await p.textContent('#save'), /あと 22 つ: 売上分類/);
+  assert.match(await p.textContent('#save'), /あと 19 つ: 売上分類/);
   assert.equal(await p.isDisabled('#save'), true);
   await fillReq(p);
   // 🆕 2026-10-13: 必須がそろっても、必須でない項目が「値」も「入力なし」も無いうちは押せない
-  assert.match(await p.textContent('#save'), /あと 18 つ: 原価/);
+  assert.match(await p.textContent('#save'), /あと 15 つ: 原価/);
   assert.equal(await p.isDisabled('#save'), true);
   // 出品カードを作らない = ③ と Yahoo! を数えない (product-hub につながない)
   await p.click('#card-create button[data-v="0"]');
   assert.equal(await p.isHidden('#card-fields'), true);
   assert.match(await p.textContent('#checklist'), /カードを作らない/);
-  assert.match(await p.textContent('#save'), /あと 9 つ: 原価/, 'カードを作らない = 原価・メーカー・発注の設定 6・入荷日の管理');
+  assert.match(await p.textContent('#save'), /あと 6 つ: 原価/, 'カードを作らない = 原価・メーカー・発注の設定 3 (ケース・容量は数えない)・入荷日の管理');
   // ② (NE 登録の CSV まで) も入れる・残りは入力なし
   await p.fill('#cost-jpy', '500');
   await noneRest(p);
@@ -1091,7 +1091,7 @@ await ta('[35b] 新商品の登録 (2026-10-08 中原さん): 発送方法を選
   await p.fill('#f-name', '発送方法なしの単品');
   await p.fill('#f-standard_price', '990');
   await p.click('#f-tax_rate button[data-v="0.1"]');
-  assert.match(await p.textContent('#save'), /あと 24 つ: 代表の仕入先/);
+  assert.match(await p.textContent('#save'), /あと 21 つ: 代表の仕入先/);
   assert.equal(await p.isDisabled('#save'), true);
   await p.selectOption('#f-primary_supplier', '0001');
   await fillReq(p);
@@ -2613,7 +2613,7 @@ await ta('[64] 入力なし (単品・1440): 必須がそろっても押せな�
   await p.goto(B + '/new?kind=single');
   await fillSingleReq(p, 'ui-none-1');
   assert.equal(await p.isDisabled('#save'), true, '必須だけでは押せない');
-  assert.match(await p.textContent('#save'), /あと 19 つ: 原価/);
+  assert.match(await p.textContent('#save'), /あと 16 つ: 原価/);
   assert.match(await p.textContent('#checklist'), /④ そのほかの項目/);
   // 原価: 値を入れてから「入力なし」= 値を消す・印
   await p.fill('#cost-jpy', '300');
@@ -2645,7 +2645,11 @@ await ta('[64] 入力なし (単品・1440): 必須がそろっても押せな�
   // 発注条件グループ = 「なし」が入力なし (右の一覧も「なし」)
   await p.click('#po-cond-mode button[data-v="none"]');
   assert.match(await liOf(p, '発注条件グループ').getAttribute('class'), /\bnone\b/);
-  // 🆕 中原さん 10/13 (答え 2 = b): まとめて「入力なし」にするボタンは無い (Yahoo!・ケース・容量も 1 つずつ押す)
+  // 🆕 中原さん 10/13 (答え 2 = b): まとめて「入力なし」にするボタンは無い (Yahoo! も 1 つずつ押す)
+  // 🆕 2026-10-24 中原さん「この項目は任意にして商品登録の必須要件にしないで」: ケース・容量は右の一覧に出さない・「入力なし」も無い (空のまま保存できる)
+  const ckText = await p.textContent('#checklist');
+  for (const t of ['ケースロット', 'ケースグループ', '容量']) assert.ok(!ckText.includes(t), t + ' が右の一覧にある');
+  assert.equal(await p.locator('[data-none="order_settings.case_lot"], [data-none="order_settings.case_group"], [data-none="order_settings.capacity_per_unit"]').count(), 0);
   assert.equal(await p.locator('[data-none-all], .nonebulk').count(), 0, 'まとめて入力なしにするボタンがある');
   assert.match(await p.textContent('#sec-yahoo'), /欄ごとに「入力なし」を押します/);
   await p.click('#sec-yahoo > summary');
@@ -2682,10 +2686,10 @@ await ta('[64] 入力なし (単品・1440): 必須がそろっても押せな�
   // 登録の後の商品の画面に「ロジザードのバーコード」(いま = 打った値)
   assert.match(await p.innerText('#sec-lzbc'), /X00UIN0001/);
   // 送る印 = サーバーと同じ並び (lib/master-register-blanks.mjs の BLANK_KEYS)
-  assert.deepEqual(bodies[0].blanks, ['maker', 'order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit',
+  assert.deepEqual(bodies[0].blanks, ['maker', 'order_settings.order_lot', 'order_settings.condition', 'order_settings.material',
     'shipping_code', 'inbound_date_managed', 'card.official_url', 'card.reference_urls', 'card.set_decision', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path']);
   // 発注の設定の入力なしは理由の後ろの一言 (要求のハッシュに入らない・#1706 Codex R2 M)
-  assert.equal(await regReason('ui-none-1'), '新商品の登録 · 入力なし: メーカー・発送方法・入荷日の管理・公式ページURL・参考URL・セット商品・Yahoo!売価(佐川)・Yahoo!配送方法・Yahoo!カテゴリID・Yahoo!path · 発注の設定の入力なし: 発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量');
+  assert.equal(await regReason('ui-none-1'), '新商品の登録 · 入力なし: メーカー・発送方法・入荷日の管理・公式ページURL・参考URL・セット商品・Yahoo!売価(佐川)・Yahoo!配送方法・Yahoo!カテゴリID・Yahoo!path · 発注の設定の入力なし: 発注ロット・発注条件グループ・原料グループ');
   assert.deepEqual(await skuRow('ui-none-1'), { name: '入力なしの試験 ui-none-1', price: 1200, tax: 0.1, shipping_code: null });
 });
 
@@ -4084,6 +4088,40 @@ await ta('[88] 詳細検索の「名前で選ぶ」スマホ 390: 板を開い�
   assert.ok(m.x.length >= 3 && m.x.every((h) => h >= 44) && m.co >= 44 && m.inp >= 44, '押す所は 44px ' + JSON.stringify(m));
   assert.ok(m.list[0] >= 0 && m.list[1] <= 390, '候補の箱は画面の中 ' + JSON.stringify(m.list));
 }, { width: 390, height: 844 });
+
+// ── 🆕 2026-10-24 中原さん: 1 つの商品の画面から「新しい単品」「新しいセット」(一覧の右上と同じ先) ──
+await ta('[89] 商品の画面の「新しい単品」「新しいセット」: 右上 (前へ・次へ の隣)・どのタブでも見える・押すと新商品の登録 (単品 / セット)・未保存のまま押す = 離れるときの確認・スマホ 390 ではみ出さない・44px', async (p) => {
+  const st = () => p.evaluate(() => {
+    const vis = (id) => { const el = document.getElementById(id); if (!el) return null; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && !el.closest('[hidden]'); };
+    return { set: vis('sku-new-set'), single: vis('sku-new-single'), hrefs: ['sku-new-set', 'sku-new-single'].map((id) => document.getElementById(id).getAttribute('href').replace(/^.*\/new/, '/new')) };
+  });
+  await p.goto(B + '/sku/s002');
+  assert.deepEqual(await st(), { set: true, single: true, hrefs: ['/new?kind=set', '/new?kind=single'] });
+  for (const tab of ['#tab-sales', '#tab-moves', '#tab-basic']) {
+    await p.click(tab);
+    const s = await st();
+    assert.deepEqual([s.set, s.single], [true, true], tab + ' でも見える');
+  }
+  await Promise.all([p.waitForURL(/\/new\?kind=single$/), p.click('#sku-new-single')]);
+  assert.equal(await p.getAttribute('a.kindcard.on', 'href'), '?kind=single');
+  await p.goto(B + '/sku/set001');
+  await Promise.all([p.waitForURL(/\/new\?kind=set$/), p.click('#sku-new-set')]);
+  assert.equal(await p.getAttribute('a.kindcard.on', 'href'), '?kind=set');
+  // 未保存のまま押す = 離れるときの確認 (ここに残る = 同じ画面)
+  await p.goto(B + '/sku/s002');
+  await p.click('#name-edit');
+  await p.fill('#f-name', 'なまえを変えた');
+  await p.click('#sku-new-single');
+  await p.waitForSelector('#leave-bg.on', { timeout: 5000 });
+  assert.equal(new URL(p.url()).pathname, '/apps/master-edit/sku/s002');
+  // スマホ 390: はみ出さない・押す所は 44px
+  await p.setViewportSize({ width: 390, height: 844 });
+  await p.goto(B + '/sku/s002');
+  const m = await p.evaluate(() => ({ doc: document.documentElement.scrollWidth, view: innerWidth,
+    btns: ['sku-new-set', 'sku-new-single'].map((id) => { const r = document.getElementById(id).getBoundingClientRect(); return [Math.round(r.height), Math.round(r.left), Math.round(r.right)]; }) }));
+  assert.ok(m.doc <= m.view, `横にはみ出す ${m.doc} > ${m.view}`);
+  assert.ok(m.btns.every(([h, l, r]) => h >= 44 && l >= 0 && r <= m.view), JSON.stringify(m.btns));
+});
 
 await browser.close();
 server.close();

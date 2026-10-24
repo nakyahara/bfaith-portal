@@ -100,7 +100,15 @@
     <div class="crumb-row">
     <nav class="crumb" aria-label="いまの場所"><a href="<%= base %>/" data-list-back>商品・セット</a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><span class="mono" aria-current="page"><%= c.code %></span></nav>
     <%# 🆕 10/17: 来た一覧の中の前・次の商品 (me-prevnext.js が来た一覧の条件で api/neighbors に聞いて出す。一覧から来ていない・読めない = 出さない) %>
+    <div class="crumb-acts">
     <nav class="pn" id="sku-pn" aria-label="一覧の前後の商品" data-code="<%= c.code %>" hidden></nav>
+    <%# 🆕 2026-10-24 中原さん: 商品の画面からも新しい単品・セットを登録する。一覧の右上の「新しいセット」「新しい単品」と同じ先で、一覧と同じく誰にでも出す
+        (登録を開いていない・名簿の人でない = 登録の画面が理由を出す)。パンくずの帯 = どのタブでも見える。未保存のまま押した = me-shell.js の離れるときの確認 %>
+    <div class="sku-new" id="sku-new" role="group" aria-label="新しく登録する">
+      <a class="btn sm" id="sku-new-set" href="<%= base %>/new?kind=set"><svg class="ic" aria-hidden="true"><use href="#i-box"/></svg>新しいセット</a>
+      <a class="btn sm" id="sku-new-single" href="<%= base %>/new?kind=single"><svg class="ic" aria-hidden="true"><use href="#i-plus"/></svg>新しい単品</a>
+    </div>
+    </div>
     </div>
     <div class="ph" id="sku-ph">
       <div>
