@@ -357,9 +357,10 @@ await t('返品・補てん: 0 件の日も取得の記録 (sp_report_fetch_days
 await t('文字数の上限: 入らない feed は載せず「送った」にしない = 翌朝に送る (全部の表が止まった朝)', async () => {
   const db = new Database(':memory:');
   for (const tb of F.FRESHNESS_TABLES) {
-    db.exec(`CREATE TABLE IF NOT EXISTS ${tb.table} ("${tb.column}" TEXT${tb.where ? ', status TEXT, report_type TEXT' : ''})`);
-    db.prepare(`INSERT INTO ${tb.table} ("${tb.column}"${tb.where ? ', status, report_type' : ''}) VALUES (?${tb.where ? ', ?, ?' : ''})`)
-      .run(tb.kind === 'month' ? '2026-01' : '2026-01-05', ...(tb.where ? ['ok', (tb.where.match(/'([A-Z_]+)'/) || [])[1] || null] : []));
+    db.exec(`CREATE TABLE IF NOT EXISTS ${tb.table} ("${tb.column}" TEXT${tb.where ? ', status TEXT, report_type TEXT, mall TEXT' : ''})`);
+    const pick = (re) => ((tb.where || '').match(re) || [])[1] || null;
+    db.prepare(`INSERT INTO ${tb.table} ("${tb.column}"${tb.where ? ', status, report_type, mall' : ''}) VALUES (?${tb.where ? ', ?, ?, ?' : ''})`)
+      .run(tb.kind === 'month' ? '2026-01' : '2026-01-05', ...(tb.where ? ['ok', pick(/report_type = '([^']+)'/), pick(/mall = '([^']+)'/)] : []));
   }
   const s = sender();
   const all = (o = {}) => run(db, { send: s, tables: F.FRESHNESS_TABLES, ...o });
@@ -414,6 +415,74 @@ await t('念押しを送れなかった = 前に送れた日を残す → 翌朝
   await run2(db, { send: s, nowMs: NOW + 16 * DAY });
   assert.match(s.sent[s.sent.length - 1], /^✅ \*止まっていたデータが戻った\*[\s\S]*Qoo10分析/);
   assert.equal(db.prepare('SELECT COUNT(*) n FROM data_freshness_alert_state').get().n, 0);
+});
+
+console.log('Codex R2 の直し');
+await t('PM検索クエリ (週次): 0 件の週も取得の記録 (report_fetch_log の empty) で見る・失敗の記録だけ = 止まっている', () => {
+  const pm = F.FRESHNESS_TABLES.filter((x) => x.key === 'report_fetch_log:aupay_pm_query');
+  assert.equal(pm.length, 1);
+  const db = new Database(':memory:');
+  db.exec('CREATE TABLE report_fetch_log (fetched_at TEXT, mall TEXT, report_type TEXT, status TEXT)');
+  const ins = db.prepare('INSERT INTO report_fetch_log VALUES (?, ?, ?, ?)');
+  ins.run(new Date(NOW - 30 * DAY).toISOString(), 'aupay', 'adata_pm_query', 'ok');
+  ins.run(new Date(NOW - 1 * DAY).toISOString(), 'aupay', 'adata_pm_query', 'empty');
+  ins.run(new Date(NOW).toISOString(), 'rakuten', 'adata_pm_query', 'ok');
+  assert.equal(F.evaluateFreshness(db, { nowMs: NOW, tables: pm, registry: NO_PAUSE }).items[0].status, 'ok');
+  db.exec("UPDATE report_fetch_log SET status = 'error' WHERE status = 'empty'");
+  const r = F.evaluateFreshness(db, { nowMs: NOW, tables: pm, registry: NO_PAUSE });
+  assert.equal(r.items[0].status, 'stale');
+  assert.equal(r.items[0].latest, day(30), '別のモールの記録は数えない');
+});
+await t('止めているものの期限を延ばしただけ = 「戻った」と言わない (データは古いまま・記録は黙って消す) / 止めるのをやめて新しくなった = 「戻った」', async () => {
+  const two = [T('rakuten-rpp', 'fact_rakuten_ads_rpp_daily', 'date_jst', 4)];
+  const db = makeDb(RAKUTEN_OLD);
+  const s = sender();
+  await run(db, { send: s, tables: two, registry: REG_PAUSE('2026-09-30') });
+  assert.equal(s.sent.length, 1);
+  const r = await run(db, { send: s, tables: two, registry: REG_PAUSE('2026-12-31'), nowMs: NOW + DAY });
+  assert.equal(s.sent.length, 1, '期限を延ばしただけでは送らない');
+  assert.equal(statusOf(r, 'fact_rakuten_ads_rpp_daily'), 'paused');
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM data_freshness_alert_state').get().n, 0);
+  // もう一度期限切れ → 止めるのをやめて手で入れた (台帳から消え、データが新しい) = 戻った
+  await run(db, { send: s, tables: two, registry: REG_PAUSE('2026-09-30'), nowMs: NOW + 2 * DAY });
+  assert.equal(s.sent.length, 2);
+  db.exec(`INSERT INTO fact_rakuten_ads_rpp_daily (date_jst) VALUES ('${day(-2)}')`);
+  await run(db, { send: s, tables: two, registry: NO_PAUSE, nowMs: NOW + 3 * DAY });
+  assert.equal(s.sent.length, 3);
+  assert.match(s.sent[2], /^✅ \*止まっていたデータが戻った\*[\s\S]*戻った\*: 楽天RPP広告/);
+});
+await t('状態が変わった (止まっている → 読めない) 知らせを送れなかった = 前に送れた日を残す → 翌朝送る → 戻ったら「戻った」', async () => {
+  const run2 = runOnly('fact_qoo10_cvr_daily');
+  const db = makeDb({ ...FRESH, fact_qoo10_cvr_daily: ['2026-10-03'] });
+  const s = sender();
+  await run2(db, { send: s });
+  db.exec(`INSERT INTO fact_qoo10_cvr_daily (date_jst) VALUES ('bad-value-9')`);   // MAX が日付でない値 = 読めない
+  s.ok = false;
+  await run2(db, { send: s, nowMs: NOW + DAY });
+  const st = db.prepare('SELECT status, last_notified_on, notified_status FROM data_freshness_alert_state').get();
+  assert.deepEqual([st.status, st.last_notified_on, st.notified_status], ['unreadable', '2026-10-24', 'stale']);
+  s.ok = true;
+  await run2(db, { send: s, nowMs: NOW + 2 * DAY });
+  assert.match(s.sent[s.sent.length - 1], /❓ \*Qoo10分析\* — 読めない/);
+  assert.equal(db.prepare('SELECT notified_status FROM data_freshness_alert_state').get().notified_status, 'unreadable');
+  const n = s.sent.length;
+  await run2(db, { send: s, nowMs: NOW + 3 * DAY });
+  assert.equal(s.sent.length, n, '送れた後は念押しの日まで送らない');
+  db.exec(`DELETE FROM fact_qoo10_cvr_daily WHERE date_jst = 'bad-value-9'; INSERT INTO fact_qoo10_cvr_daily (date_jst) VALUES ('2026-10-27')`);
+  await run2(db, { send: s, nowMs: NOW + 4 * DAY });
+  assert.match(s.sent[s.sent.length - 1], /^✅ \*止まっていたデータが戻った\*/);
+  // 送れなかった新しい状態の知らせ → そのまま戻った: 前の状態 (stale) は送れていた = 「戻った」を送る
+  const db2 = makeDb({ ...FRESH, fact_qoo10_cvr_daily: ['2026-10-03'] });
+  await run2(db2, { send: s });
+  db2.exec(`INSERT INTO fact_qoo10_cvr_daily (date_jst) VALUES ('bad-value-9')`);
+  s.ok = false;
+  await run2(db2, { send: s, nowMs: NOW + DAY });
+  s.ok = true;
+  db2.exec(`DELETE FROM fact_qoo10_cvr_daily; INSERT INTO fact_qoo10_cvr_daily (date_jst) VALUES ('2026-10-26')`);
+  const before = s.sent.length;
+  await run2(db2, { send: s, nowMs: NOW + 2 * DAY });
+  assert.equal(s.sent.length, before + 1);
+  assert.match(s.sent[before], /戻った\*: Qoo10分析/);
 });
 
 console.log('今朝の自動取得 (fetch-all) の記録');

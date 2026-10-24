@@ -131,7 +131,9 @@ export const FRESHNESS_TABLES = Object.freeze([
   row('aupay-data', 'fact_aupay_search_daily', 'date_jst', 7, '検索分析 日次 (流入の無い日があり得る)'),
   row('aupay-data', 'fact_aupay_product_daily', 'date_jst', 7, '商品分析 日次 (流入の無い日があり得る)'),
   row('aupay-data', 'fact_aupay_pm_ad_daily', 'date_jst', 7, 'プラチナマッチ広告 日次'),
-  row('aupay-data', 'fact_aupay_pm_query_weekly', 'date_jst', 21, 'プラチナマッチ検索クエリ 週次 (date_jst = 対象週の月曜)'),
+  // プラチナマッチ検索クエリ (週次)。0 件の週は表に何も入らない (取得は report_fetch_log に 'empty' と残す) = 取得の記録 (成功・0 件) の時刻で見る (Codex R2 P2)。
+  //   月曜は取得しない・火〜日に毎朝。記録は WAREHOUSE_DATA_DIR がある取得だけ書く (無い = 行が無い = まだ始まっていない)
+  row('aupay-data', 'report_fetch_log', 'fetched_at', 7, 'プラチナマッチ検索クエリ 週次の取得 (成功・0 件の記録の時刻)', { where: "mall = 'aupay' AND report_type = 'adata_pm_query' AND status IN ('ok', 'empty')", key: 'report_fetch_log:aupay_pm_query' }),
   row('aupay-data', 'fact_aupay_sales_monthly', 'date_jst', 70, '売上分析 月次 (date_jst = 月の 1 日)'),
   // Qoo10 分析 (qoo10-data-lib.js)
   row('qoo10-data', 'fact_qoo10_cvr_daily', 'date_jst', 4, '転換率 日次'),
@@ -229,7 +231,7 @@ export function evaluateFreshness(db, { nowMs = Date.now(), tables = FRESHNESS_T
   const items = tables.map((t) => {
     const r = readLatest(db, t);
     const p = pauseOf(t, { registry, fetchOnly, today });
-    const base = { ...t, latest: r.latest, ageDays: r.latest ? daysBetween(r.latest, today) : null, error: r.error, pause: p };
+    const base = { ...t, pauseId: t.pause, latest: r.latest, ageDays: r.latest ? daysBetween(r.latest, today) : null, error: r.error, pause: p };   // pause = 判定 (台帳の項目つき)・pauseId = 一覧の台帳の id
     if (r.state === 'missing' || r.state === 'empty') return { ...base, status: 'not_started', note: r.state === 'missing' ? '表が無い' : '行が無い' };
     if (r.state === 'unreadable') return { ...base, status: 'unreadable' };
     const fresh = base.ageDays <= t.maxAgeDays;   // 未来の日 (ageDays < 0) もふつう
@@ -258,7 +260,8 @@ export function ensureFreshnessState(db) {
     feed             TEXT NOT NULL,
     since_on         TEXT NOT NULL,      -- この状態を最初に見た JST の日
     latest_date      TEXT,
-    last_notified_on TEXT,               -- GChat に送れた JST の日 (null = まだ)
+    last_notified_on TEXT,               -- GChat に最後に送れた JST の日 (どの状態でも。null = 一度も送れていない = 戻っても「戻った」は送らない)
+    notified_status  TEXT,               -- そのとき送った状態 (今の status と違う = 今の状態はまだ送れていない = 翌朝もう一度)
     updated_at       TEXT NOT NULL
   )`);
 }
@@ -294,11 +297,12 @@ export function planNotifications(problems, stateRows, today) {
   const due = [], quiet = [];
   for (const p of problems) {
     const s = prev.get(p.key);
-    if (!s || s.status !== p.status) due.push({ ...p, reason: 'new', since: today, lastNotified: null });
-    else if (!s.last_notified_on) due.push({ ...p, reason: 'retry', since: s.since_on, lastNotified: null });
-    // 念押し: 送れなかったら前に送れた日を残す (= 翌朝もまた念押しの日・戻ったときに「戻った」を送る。Codex R1 P2)
-    else if (daysBetween(s.last_notified_on, today) >= REMIND_EVERY_DAYS) due.push({ ...p, reason: 'remind', since: s.since_on, lastNotified: s.last_notified_on });
-    else quiet.push({ ...p, since: s.since_on, lastNotified: s.last_notified_on });
+    // 送れなかった・載せられなかった日に残す値 = 前に送れた日と状態 (どの状態でも残す = 戻ったときに「戻った」を送る。Codex R1 P2・R2 P2)
+    const keep = { lastNotified: s ? s.last_notified_on || null : null, notifiedStatus: s ? s.notified_status || null : null };
+    if (!s || s.status !== p.status) due.push({ ...p, reason: 'new', since: today, ...keep });
+    else if (!s.last_notified_on || s.notified_status !== p.status) due.push({ ...p, reason: 'retry', since: s.since_on, ...keep });
+    else if (daysBetween(s.last_notified_on, today) >= REMIND_EVERY_DAYS) due.push({ ...p, reason: 'remind', since: s.since_on, ...keep });
+    else quiet.push({ ...p, since: s.since_on, ...keep });
   }
   const now = new Set(problems.map((p) => p.key));
   const recovered = stateRows.filter((r) => !now.has(r.item_key));
@@ -458,27 +462,45 @@ async function sendGChat(webhook, text, fetchImpl = fetch) {
 }
 
 /**
- * 記録を今日の状態にそろえる。送れた + 文面に載せた = last_notified_on を今日に。
- * 送れなかった・載せられなかった = 新しく止まったものは null (翌朝もう一度) / 念押しは前に送れた日のまま (翌朝もまた念押しの日)
+ * 記録の行が問題でなくなったとき、データが本当に新しくなったか (= 「戻った」と言ってよいか)。Codex R2 P2:
+ *   止めているものの期限を延ばした・期限内の止めに戻った・表が無くなった = データは新しくない = 「戻った」と言わずに黙って消す
+ *   表 = その表が ok / 止めている (pause:<台帳の id か feed>) = その止めに入る表が全部 ok
  */
-function saveState(db, { problems, plan, today, sent, keys = new Set(), recoveredKeys = new Set(), nowIso }) {
+export function reallyFresh(row, items) {
+  const k = row.item_key;
+  if (k.startsWith('table:')) { const it = items.find((i) => `table:${i.key || i.table}` === k); return !!it && it.status === 'ok'; }
+  if (k.startsWith('pause:')) {
+    const id = k.slice('pause:'.length);
+    const its = items.filter((i) => i.pauseId === id || i.feed === id);   // pause:<台帳の id> (期限切れ) / pause:<feed> (台帳に無い)
+    return its.length > 0 && its.every((i) => i.status === 'ok');
+  }
+  return false;
+}
+
+/**
+ * 記録を今日の状態にそろえる。送れた + 文面に載せた = last_notified_on を今日・notified_status を今の状態に。
+ * 送れなかった・載せられなかった = 前に送れた日と状態のまま (今の状態と違えば翌朝もう一度 / 念押しは翌朝もまた念押しの日)
+ * 戻ったもの: 「戻った」を載せて送れた・一度も送れていない・データが新しくなっていない = 消す (最後のは黙って)
+ */
+function saveState(db, { problems, plan, today, sent, keys = new Set(), recoveredKeys = new Set(), announce = new Set(), nowIso }) {
   db.transaction(() => {
-    const upsert = db.prepare(`INSERT INTO data_freshness_alert_state (item_key, status, feed, since_on, latest_date, last_notified_on, updated_at)
-      VALUES (@key, @status, @feed, @since, @latest, @notified, @now)
+    const upsert = db.prepare(`INSERT INTO data_freshness_alert_state (item_key, status, feed, since_on, latest_date, last_notified_on, notified_status, updated_at)
+      VALUES (@key, @status, @feed, @since, @latest, @notified, @nstatus, @now)
       ON CONFLICT(item_key) DO UPDATE SET status = excluded.status, feed = excluded.feed, since_on = excluded.since_on, latest_date = excluded.latest_date,
-        last_notified_on = excluded.last_notified_on, updated_at = excluded.updated_at`);
+        last_notified_on = excluded.last_notified_on, notified_status = excluded.notified_status, updated_at = excluded.updated_at`);
     const dueKeys = new Map(plan.due.map((d) => [d.key, d]));
     const quietKeys = new Map(plan.quiet.map((q) => [q.key, q]));
     for (const p of problems) {
       const d = dueKeys.get(p.key);
       const q = quietKeys.get(p.key);
       const since = d ? d.since : q ? q.since : today;
-      const notified = d ? (sent && keys.has(p.key) ? today : d.lastNotified || null) : q ? q.lastNotified : null;
-      upsert.run({ key: p.key, status: p.status, feed: p.feed, since, latest: p.latest || null, notified, now: nowIso });
+      const delivered = !!d && sent && keys.has(p.key);
+      const src = d || q || {};
+      upsert.run({ key: p.key, status: p.status, feed: p.feed, since, latest: p.latest || null,
+        notified: delivered ? today : src.lastNotified || null, nstatus: delivered ? p.status : src.notifiedStatus || null, now: nowIso });
     }
-    // 戻ったもの: 知らせていた (last_notified_on あり) ものは「戻った」を送れたときだけ消す (送れなかった = 翌朝もう一度)。知らせていないものは黙って消す
     const del = db.prepare('DELETE FROM data_freshness_alert_state WHERE item_key = ?');
-    for (const r of plan.recovered) if ((sent && recoveredKeys.has(r.item_key)) || !r.last_notified_on) del.run(r.item_key);
+    for (const r of plan.recovered) if ((sent && recoveredKeys.has(r.item_key)) || !r.last_notified_on || !announce.has(r.item_key)) del.run(r.item_key);
   })();
 }
 
@@ -504,9 +526,10 @@ export async function runFreshness(db, {
     return { status: 'dry_run', items, message: built ? built.text : null, lastLine: buildSummaryLine({ items, fetch, notify: '--dry-run' }) };
   }
   ensureFreshnessState(db);
-  const stateRows = db.prepare('SELECT item_key, status, feed, since_on, latest_date, last_notified_on FROM data_freshness_alert_state').all();
+  const stateRows = db.prepare('SELECT item_key, status, feed, since_on, latest_date, last_notified_on, notified_status FROM data_freshness_alert_state').all();
   const plan = planNotifications(problems, stateRows, today);
-  const built = buildFreshnessMessage({ today, ...plan, recovered: plan.recovered.filter((r) => r.last_notified_on), fetch });
+  const announce = new Set(plan.recovered.filter((r) => r.last_notified_on && reallyFresh(r, items)).map((r) => r.item_key));
+  const built = buildFreshnessMessage({ today, ...plan, recovered: plan.recovered.filter((r) => announce.has(r.item_key)), fetch });
   let sent = false, notify = null, status = 'no_message';
   if (built) {
     log(`\n--- GChat の文面 ---\n${built.text}\n---`);
@@ -517,7 +540,7 @@ export async function runFreshness(db, {
       status = sent ? 'sent' : 'send_failed';
     }
   } else if (plan.quiet.length) notify = `GChat は ${REMIND_EVERY_DAYS} 日ごとの念押しの日まで送らない`;
-  saveState(db, { problems, plan, today, sent, keys: built ? built.keys : new Set(), recoveredKeys: built ? built.recoveredKeys : new Set(), nowIso: new Date(nowMs).toISOString() });
+  saveState(db, { problems, plan, today, sent, keys: built ? built.keys : new Set(), recoveredKeys: built ? built.recoveredKeys : new Set(), announce, nowIso: new Date(nowMs).toISOString() });
   return { status, items, message: built ? built.text : null, lastLine: buildSummaryLine({ items, fetch, notify }) };
 }
 
@@ -528,7 +551,7 @@ async function main() {
   const argv = process.argv.slice(2);
   const json = argv.includes('--json');
   const r = await runFreshness(getDB(), { dryRun: argv.includes('--dry-run') || json, log: json ? () => {} : console.log });
-  if (json) console.log(JSON.stringify({ status: r.status, items: r.items.map(({ action, ...x }) => x) }, null, 2));
+  if (json) console.log(JSON.stringify({ status: r.status, items: r.items.map(({ action, pause, ...x }) => ({ ...x, pause: { ...pause, entry: pause.entry ? { id: pause.entry.id, remove_by: pause.entry.remove_by } : null } })) }, null, 2));
   console.log(r.lastLine);
   process.exitCode = 0;   // GChat の fetch の直後に process.exit() しない (Windows の libuv assertion。monitor-fee-coverage.js と同じ)
 }
