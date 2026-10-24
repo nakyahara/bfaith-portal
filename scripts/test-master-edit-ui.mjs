@@ -59,6 +59,8 @@
  *     構成品の欄を名前で探す (本物の IME (CDP)・変換中は選ばない / 引き当てない・確定の Enter で数の欄へ移らない・↑↓ Enter Esc・単品だけ = セット / やめた / 要確認は出さない・名前の < > は字のまま)
  *  83 モールの商品ページへのリンク (10/20): 見出しの下の札 (楽天・Amazon・Yahoo!・Qoo10)・新しいタブ (noopener)・×N・組んだ出品は出さない・どのタブでも見える・
  *     出品が無い = 一言・スマホ 390 で 44px・はみ出さない
+ *  87 詳細検索の「名前で選ぶ」(10/24): 仕入先 = 本物の IME で変換中は絞らない・確定の Enter で選ばない / 送らない・選ぶ = コードの欄に足す・札の × で外す /
+ *     メーカー = 複数・URL に残る・開き直しても札・長い条件の印でも複数 / 88 = スマホ 390 ではみ出さない・44px
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -3972,6 +3974,116 @@ await ta('[86] 新商品の登録 (セット・10/21 中原さん): 構成品の
     await pg.query("update core.skus set name = $1 where code = 'k005'", [name5]);
   }
 });
+
+await ta('[87] 詳細検索の「名前で選ぶ」(2026-10-24 中原さん): 仕入先 = 本物の IME (CDP) で変換中は絞らない・確定の Enter で選ばない / 送らない・↓ Enter で選ぶ = コードの欄に足す・札の × で外す・押して選ぶ / メーカー = 名簿から複数・URL に残る (開き直しても札)・長い条件の印でも複数', async (p) => {
+  // 名簿: 仕入先 (取引中 + 取引なし)・メーカー (はちみつ本舗 = k001・k002 / ミカワ = k006 / 使っていない)。書くのは本来 ops.create_maker・set_product_maker だけ = 守りの印を付けて直接
+  await pg.query("insert into core.suppliers (company_id, code, name, active) values (1, '0002', 'ビーフリー', true), (1, '0099', '東和 (旧)', false) on conflict do nothing");
+  await pg.exec(`begin;
+    select set_config('ops.maker_protocol', '1', true);
+    insert into core.makers (name, name_norm, active, created_by_id, created_request_id) values
+      ('はちみつ本舗', core.maker_name_norm('はちみつ本舗'), true, 'naka@test', gen_random_uuid()), ('ミカワ', core.maker_name_norm('ミカワ'), true, 'naka@test', gen_random_uuid()),
+      ('古いメーカー', core.maker_name_norm('古いメーカー'), false, 'naka@test', gen_random_uuid()) on conflict do nothing;
+    insert into core.product_makers (product_id, maker_id, set_by, set_via, request_id)
+      select k.product_id, m.maker_id, 'naka@test', 'sku_page', gen_random_uuid() from core.skus k join core.makers m on (k.code, m.name) in (('k001', 'はちみつ本舗'), ('k002', 'はちみつ本舗'), ('k006', 'ミカワ'))
+      on conflict do nothing;
+    commit;`);
+  const MK = Object.fromEntries((await pg.query('select name, maker_id::text as id from core.makers')).rows.map((r) => [r.name, r.id]));
+  await p.goto(B + '/');
+  await p.click('#adv > summary');
+  const sIn = p.locator('#sup-pick input[role="combobox"]');
+  const mIn = p.locator('#mk-pick input[role="combobox"]');
+  assert.equal(await p.isVisible('#sup-pick'), true, 'JS があれば仕入先の選ぶ部品を出す');
+  assert.equal(await p.isHidden('#adv-makers'), true, 'メーカーの選ぶ欄は隠して名前で選ぶ欄にする');
+  const opts = (sel) => p.$$eval(sel + ' .csug .co', (xs) => xs.map((x) => [x.querySelector('.cn').textContent, x.getAttribute('aria-selected') === 'true', !!x.querySelector('.tg')]));
+  const chips = (sel) => p.$$eval(sel + ' .pk-chip .nm', (xs) => xs.map((x) => x.textContent));
+  // 仕入先: 欄に入る = 名簿の全部 (取引中が先・取引なしは印)
+  await sIn.focus();
+  assert.deepEqual(await opts('#sup-pick'), [['AMC', false, false], ['ビーフリー', false, false], ['東和 (旧)', false, true]]);
+  assert.equal(await sIn.getAttribute('aria-expanded'), 'true');
+  // 候補を開いている間は板ごと後ろの一覧の板より上 (候補の下の方も押せる・Codex R2 Medium)
+  assert.equal(await p.$eval('#sup-pick', (e) => e.closest('.panel').classList.contains('sug-on')), true);
+  assert.equal(await p.evaluate(() => { const r = document.querySelector('#sup-pick .csug .co:last-child').getBoundingClientRect(); const el = document.elementFromPoint(r.left + 10, r.top + r.height / 2); return !!(el && el.closest('#sup-pick .csug')); }), true, '一番下の候補が押せる');
+  // 本物の IME: 変換中は絞らない (候補は前のまま)
+  const cdp = await p.context().newCDPSession(p);
+  const key = (type, k, vk) => cdp.send('Input.dispatchKeyEvent', { type, key: k, code: k === 'Enter' ? 'Enter' : 'KeyA', windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
+  const compose = async (steps) => { for (const s of steps) { await key('rawKeyDown', 'Process', 229); await cdp.send('Input.imeSetComposition', { text: s, selectionStart: s.length, selectionEnd: s.length }); await key('keyUp', 'a', 65); } };
+  await compose(['び', 'びー', 'びーふ']);
+  assert.equal((await opts('#sup-pick')).length, 3, '変換中は絞らない');
+  // 確定 → 絞る (ひらがなでカタカナの名前)。確定の Enter (Windows の Chrome・Edge = 確定の後に keyCode 13) = 選ばない・検索を送らない
+  const url0 = p.url();
+  await cdp.send('Input.insertText', { text: 'びーふ' });
+  await key('rawKeyDown', 'Enter', 13);
+  await key('keyUp', 'Enter', 13);
+  await p.waitForTimeout(500);
+  assert.equal(p.url(), url0, '確定の Enter で詳細検索を送らない');
+  assert.deepEqual(await opts('#sup-pick'), [['ビーフリー', false, false]], '確定してから絞る');
+  assert.equal(await p.inputValue('#adv-sups'), '', '確定の Enter では選ばない');
+  // ↓ Enter で選ぶ = コードの欄に足す・札・箱は開いたまま (続けて選べる)
+  await sIn.press('ArrowDown');
+  assert.match(await sIn.getAttribute('aria-activedescendant'), /-o0$/);
+  await sIn.press('Enter');
+  assert.equal(p.url(), url0, '箱が開いている Enter は検索を送らない');
+  assert.equal(await p.inputValue('#adv-sups'), '0002');
+  assert.deepEqual(await chips('#sup-pick'), ['ビーフリー']);
+  assert.deepEqual(await opts('#sup-pick'), [['ビーフリー', true, false]]);
+  await sIn.press('Escape');
+  assert.equal(await p.isHidden('#sup-pick .csug'), true, 'Esc で閉じる');
+  assert.equal(await p.getAttribute('#adv', 'open'), '', 'Esc で詳細検索の板は閉じない');
+  // 札の × で外す (キーボードでも押せるボタン)・コードの欄に手で打った 1 (= 0001) も札に出る・押して選ぶ / 外す
+  await p.click('#sup-pick .pk-chip button[aria-label="0002 ビーフリー を外す"]');
+  assert.equal(await p.inputValue('#adv-sups'), '');
+  await p.fill('#adv-sups', '1');
+  assert.deepEqual(await chips('#sup-pick'), ['AMC'], '手で打ったコードも札に (0001 と 1 は同じ)');
+  await p.fill('#adv-sups', 'constructor\n０００２');
+  assert.deepEqual(await chips('#sup-pick'), ['ビーフリー'], '名簿に無いコードは札にしない・全角のコードもサーバーと同じに見る (Codex R1 Low)');
+  await p.fill('#adv-sups', '1');
+  await sIn.fill('');
+  await p.click('#sup-pick .csug .co:has-text("AMC")');
+  assert.equal(await p.inputValue('#adv-sups'), '', '選んでいる物を押す = 外す');
+  await p.click('#sup-pick .csug .co:has-text("AMC")');
+  assert.equal(await p.inputValue('#adv-sups'), '0001');
+  // メーカー: 名前で探して選ぶ (複数・メーカー未登録もある)
+  await mIn.fill('はちみつ');
+  assert.deepEqual(await opts('#mk-pick'), [['はちみつ本舗', false, false]]);
+  await mIn.press('ArrowDown');
+  await mIn.press('Enter');
+  assert.deepEqual(await p.$eval('#adv-makers', (s) => [...s.selectedOptions].map((o) => o.value)), [MK['はちみつ本舗']]);
+  await mIn.fill('');
+  assert.deepEqual((await opts('#mk-pick')).map((x) => x[0]), ['メーカー未登録', 'はちみつ本舗', 'ミカワ', '古いメーカー'], '未登録が先・使うメーカー・使っていない (印)');
+  await Promise.all([p.waitForNavigation(), p.click('#adv-form button[type="submit"]')]);
+  const u = new URL(p.url());
+  assert.deepEqual([u.searchParams.get('sups'), u.searchParams.getAll('makers')], ['0001', [MK['はちみつ本舗']]], '条件は URL に');
+  assert.deepEqual(await listCodes(p), ['k001', 'k002']);
+  await p.reload();
+  assert.deepEqual(await listCodes(p), ['k001', 'k002'], '開き直しても同じ');
+  assert.deepEqual([await chips('#sup-pick'), await chips('#mk-pick')], [['AMC'], ['はちみつ本舗']], '選んだ札も戻る');
+  // 長い条件 (印 ?s=) でも選ぶ欄の複数がそのまま (me-shell.js が改行でつないで送る)
+  await mIn.fill('ミカワ');
+  await mIn.press('ArrowDown');
+  await mIn.press('Enter');
+  await p.fill('#adv-sups', '');
+  await p.fill('#adv-codes', ['k001', 'k002', 'k006', 's001', ...Array.from({ length: 160 }, (_, i) => `nope-long-${i}`)].join('\n'));
+  await Promise.all([p.waitForNavigation(), p.click('#adv-form button[type="submit"]')]);
+  assert.match(p.url(), /[?&]s=[A-Za-z0-9_-]+/, '長い条件 = 印');
+  assert.deepEqual(await listCodes(p), ['k001', 'k002', 'k006']);
+  assert.deepEqual(await chips('#mk-pick'), ['はちみつ本舗', 'ミカワ']);
+});
+await ta('[88] 詳細検索の「名前で選ぶ」スマホ 390: 板を開いて選んでも横にはみ出さない・札の × と候補と欄は 44px・押して選ぶ', async (p) => {
+  const MK = Object.fromEntries((await pg.query('select name, maker_id::text as id from core.makers')).rows.map((r) => [r.name, r.id]));
+  await p.goto(B + '/?makers=' + MK['はちみつ本舗'] + '&sups=0001');
+  const wide = () => p.evaluate(() => [document.documentElement.scrollWidth, document.documentElement.clientWidth]);
+  const [w0, v0] = await wide();
+  await p.locator('#mk-pick input[role="combobox"]').click();
+  await p.locator('#mk-pick .csug .co:has-text("ミカワ")').click();
+  assert.deepEqual(await p.$$eval('#mk-pick .pk-chip .nm', (xs) => xs.map((x) => x.textContent)), ['はちみつ本舗', 'ミカワ']);
+  const [w1, v1] = await wide();
+  assert.ok(w0 <= v0 && w1 <= v1, `横にはみ出す 開いた時 ${w0} > ${v0} / 選んだ後 ${w1} > ${v1}`);
+  const m = await p.evaluate(() => ({ x: [...document.querySelectorAll('.pk-chip button')].map((b) => Math.round(b.getBoundingClientRect().height)),
+    co: Math.round(document.querySelector('#mk-pick .csug .co').getBoundingClientRect().height), inp: Math.round(document.querySelector('#mk-pick input').getBoundingClientRect().height),
+    list: (() => { const r = document.querySelector('#mk-pick .csug').getBoundingClientRect(); return [Math.round(r.left), Math.round(r.right)]; })() }));
+  assert.ok(m.x.length >= 3 && m.x.every((h) => h >= 44) && m.co >= 44 && m.inp >= 44, '押す所は 44px ' + JSON.stringify(m));
+  assert.ok(m.list[0] >= 0 && m.list[1] <= 390, '候補の箱は画面の中 ' + JSON.stringify(m.list));
+}, { width: 390, height: 844 });
 
 await browser.close();
 server.close();

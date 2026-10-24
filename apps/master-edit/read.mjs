@@ -24,7 +24,7 @@ import { hasRegisteredOn, parseNeCreationDate, REGISTERED_ON_SOURCES } from '../
 import { normalizeSort, sortColumnOf } from './list-columns.mjs';
 import { masterProfit } from '../../lib/profit-estimate.js';
 import { readNeSpellings, exportCode } from './ne-spelling.mjs';
-import { makerNamesOf } from '../../lib/master-maker.mjs';
+import { makerNamesOf, makerTablesExist, MAKER_LIST_MAX } from '../../lib/master-maker.mjs';
 import { packagesOf } from '../../lib/master-package.mjs';
 import { brandLifeOf, brandLifeTablesExist, LIFE_FILTERS, END_SOON_DAYS } from '../../lib/master-brand-life.mjs';
 
@@ -33,6 +33,21 @@ export async function selectableSuppliers(db) {
   const hasReg = await regclass(db, 'ops.supplier_registrations');
   return (await db.query(`select s.code, s.name from core.suppliers s where s.company_id = $1 and s.active
      ${hasReg ? "and not exists (select 1 from ops.supplier_registrations r where r.supplier_id = s.supplier_id and r.state <> 'ne_confirmed')" : ''} order by s.code`, [COMPANY_ID])).rows;
+}
+
+/**
+ * 🆕 詳細検索の「名前で選ぶ」の名簿 (一覧の画面に渡す)。仕入先 = core.suppliers の全部 (取引中が先・取引をやめた仕入先も印を付けて出す) =
+ * [[コード, 名前, 取引中か]]。メーカー = core.makers (使うメーカーが先・使わないメーカーも印を付けて) = [[番号, 名前, 使うか]]。
+ * メーカーの表が無い・読めない (0084 の前・ロールの流し直しの前) = makers は null (欄を出さない)。読めなくても一覧は出す (呼び手が null にする)
+ */
+export async function advPickChoices(db) {
+  const suppliers = (await db.query('select code, name, active from core.suppliers where company_id = $1 order by active desc, code', [COMPANY_ID])).rows
+    .map((r) => [r.code, r.name ?? '', r.active !== false]);
+  const makers = (await makerTablesExist(db))
+    ? (await db.query(`select maker_id::text as id, name, active from core.makers where company_id = $1 order by active desc, name_norm, maker_id limit ${MAKER_LIST_MAX}`, [COMPANY_ID])).rows
+      .map((r) => [r.id, r.name, r.active !== false])
+    : null;
+  return { suppliers, makers };
 }
 
 export const LIST_LIMIT = 100;
@@ -94,7 +109,7 @@ export const MULTI_MAX = 500;
 export const TAX_FILTERS = Object.freeze({ 8: '8%', 10: '10%' });
 export const SALES_FILTERS = Object.freeze({ 1: '1 自社', 2: '2 取引先限定', 3: '3 仕入', 4: '4 輸出' });
 /** 詳細検索の項目 (URL のクエリの名前)。これが 1 つでも入っていれば詳細検索の板を開いておく */
-export const ADV_KEYS = Object.freeze(['codes', 'jans', 'sups', 'parents', 'name', 'cost_min', 'cost_max', 'price_min', 'price_max', 'stock_min', 'stock_max', 'tax', 'sales', 'po', 'reg_from', 'reg_to']);
+export const ADV_KEYS = Object.freeze(['codes', 'jans', 'sups', 'parents', 'name', 'makers', 'cost_min', 'cost_max', 'price_min', 'price_max', 'stock_min', 'stock_max', 'tax', 'sales', 'po', 'reg_from', 'reg_to']);
 /**
  * 改行・カンマ・空白・タブ・読点で区切った値 (前後の空白を除く・重複は 1 つ・空は捨てる)。
  * limit = 取り出す数の上限 (そこで走査を止める = 巨大な入力でも長く止まらない。#1620 Codex R2)。重複は Set で O(n)
@@ -113,6 +128,18 @@ export function splitMulti(s, limit = Infinity) {
 }
 /** 複数の欄 = 1 行 1 つ。MULTI_MAX + 1 件まで (1 件多く取って「500 件まで」を知らせる) */
 const multiText = (v) => { const xs = splitMulti(v, MULTI_MAX + 1); return xs.length ? xs.join('\n') : ''; };
+/** 🆕 詳細検索のメーカー (0084) の「メーカー未登録」の値 (makers=none)。ほかの値は名簿の番号 */
+export const MAKER_NONE = 'none';
+const MAKER_ID_RE = /^[1-9][0-9]{0,17}$/;
+/**
+ * 🆕 メーカー (詳細検索・複数): 名簿の番号 (1〜18 桁) と none (メーカー未登録) だけ。決まった形 = none が先・番号は小さい順・カンマで区切る。
+ * 知らない値 (字・0 始まり・長すぎる・SQL のような字) は捨てる = SQL には $番号の bigint[] でだけ渡す。
+ * 受けるのは文字と文字の配列だけ (?makers[toString]=1 などのオブジェクトは文字にする前に捨てる = 500 にしない・Codex R1 Medium)。
+ * MULTI_MAX + 1 件まで残す (listSkus が MULTI_MAX で切って「500 件まで」を知らせる = 黙って落とさない・Codex R1 Medium)
+ */
+const makerText = (v) => splitMulti(typeof v === 'string' ? v : Array.isArray(v) ? v.filter((x) => typeof x === 'string').join('\n') : '', 4 * MULTI_MAX)
+  .filter((x) => x === MAKER_NONE || MAKER_ID_RE.test(x)).slice(0, MULTI_MAX + 1)
+  .sort((a, b) => (a === MAKER_NONE ? -1 : b === MAKER_NONE ? 1 : a.length - b.length || (a < b ? -1 : a > b ? 1 : 0))).join(',');
 const dateText = (v) => parseNeCreationDate(String(v ?? '').trim().slice(0, 20)) || '';
 const intText = (v) => { const t = String(v ?? '').replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).replace(/[,，\s円]/g, ''); return /^\d{1,9}$/.test(t) ? String(Number(t)) : ''; };
 
@@ -133,6 +160,7 @@ export function normalizeFilters(q = {}) {
     // 詳細検索 (10/5 中原さん「NE の商品詳細検索のような」)。複数の欄は 1 行 1 つの文字に (URL に載る形)
     codes: multiText(q.codes), jans: multiText(q.jans), sups: multiText(q.sups), parents: multiText(q.parents),
     name: String(q.name ?? '').trim().slice(0, 200),   // POST の入口の上限 (SEARCH_VALUE_MAX.name = 200) と同じ (#1620 Codex R3 Low)
+    makers: makerText(q.makers),   // 🆕 メーカー (名簿から選ぶ・複数)。?makers=12&makers=34 (選ぶ欄のまま) でも ?makers=12,34 でも同じ
     cost_min: intText(q.cost_min), cost_max: intText(q.cost_max), price_min: intText(q.price_min), price_max: intText(q.price_max),
     stock_min: intText(q.stock_min), stock_max: intText(q.stock_max),
     tax: pick(String(q.tax ?? ''), TAX_FILTERS),
@@ -247,6 +275,21 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
     params.push(multi(f.parents).map((x) => normSku(x)));
     where.push(`(s.code_norm = any($${params.length}::text[])
       or exists (select 1 from core.skus ps where ps.company_id = s.company_id and ps.sku_kind = 'single' and ps.product_id = p.parent_product_id and ps.code_norm = any($${params.length}::text[])))`);
+  }
+  if (f.makers) {
+    // 🆕 メーカー (0084・単品の商品の行ごと = 一覧の「メーカー」の列と同じ)。選んだメーカーのどれか / メーカー未登録 (単品でメーカーが無い)。
+    //   セット・例外はメーカーを持たない (構成品から) = 当てない。表が無い・読めない DB = 選んだメーカーは当てない・未登録 = 単品の全部 (一覧の列も空)
+    //   速さ: 商品ごとに core.product_makers の主キー (product_id) を 1 回引くだけ (EXPLAIN は test-master-list の [8])
+    //   501 件以上 = 先頭の MULTI_MAX 件 (未登録も 1 件に数える) だけ使って知らせる (Codex R2 Low)
+    const all = f.makers.split(',');
+    if (all.length > MULTI_MAX) multiCut = true;
+    const picks = all.slice(0, MULTI_MAX);
+    const ids = picks.filter((x) => x !== MAKER_NONE);
+    const on = await makerTablesExist(db);
+    const any = [];
+    if (ids.length && on) { params.push(ids); any.push(`exists (select 1 from core.product_makers x where x.product_id = s.product_id and x.maker_id = any($${params.length}::bigint[]))`); }
+    if (picks.includes(MAKER_NONE)) any.push(on ? 'not exists (select 1 from core.product_makers x where x.product_id = s.product_id)' : 'true');
+    where.push(any.length ? `(s.sku_kind = 'single' and (${any.join(' or ')}))` : 'false');
   }
   if (f.name) {
     const fold = foldSql(params);

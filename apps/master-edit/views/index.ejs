@@ -112,9 +112,14 @@
         <%
           const advOn = ADV_KEYS.some((k) => filters[k]);
           const sel = (name, opts, cur, blank) => '<select class="in" name="' + name + '" id="adv-' + name + '"><option value="">' + blank + '</option>' + Object.entries(opts).map(([k, v]) => '<option value="' + k + '"' + (String(cur) === String(k) ? ' selected' : '') + '>' + v + '</option>').join('') + '</select>';
+          // 🆕 名前で選ぶ (仕入先・メーカー。動き = public/me-pick.js)。AP = { suppliers: [[コード, 名前, 取引中]], makers: [[番号, 名前, 使う]] | null } (読めない = null)
+          const AP = locals.advPick || null;
+          const mkPicked = new Set(String(filters.makers || '').split(',').filter(Boolean));
+          // 選んでいるのに名簿に無い番号 (名簿の上限より後など) も選んだまま残す (条件を黙って落とさない)
+          const mkKnown = new Set(((AP && AP.makers) || []).map((m) => m[0]));
         %>
         <details class="more adv"<%= advOn ? ' open' : '' %> id="adv">
-          <summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>詳細検索 (商品コードを複数・JAN・仕入先・代表・名前・原価・売価・登録日・在庫・注文残)<% if (advOn) { %> <span class="b info">使っている</span><% } %></summary>
+          <summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>詳細検索 (商品コードを複数・JAN・仕入先・メーカー・代表・名前・原価・売価・登録日・在庫・注文残)<% if (advOn) { %> <span class="b info">使っている</span><% } %></summary>
           <%# 長い条件 (商品コード 500 件など) は画面の JS が POST api/search で印にして ?s=<印> で開く (GET の URL は HTTP 431 になる)。JS が無いときは今までどおり GET %>
           <form method="get" action="" class="adv-grid" id="adv-form" data-api="api/search">
             <% for (const k of ['q', 'missing', 'reg', 'card', 'diff', 'sort', 'dir', 'life']) { if (filters[k]) { %><input type="hidden" name="<%= k %>" value="<%= filters[k] %>"><% } } %>
@@ -124,10 +129,28 @@
             <div class="adv-col">
               <label><span class="lab">JAN (複数)</span><textarea class="in" name="jans" id="adv-jans" rows="2" spellcheck="false"><%= filters.jans %></textarea></label>
               <label><span class="lab">仕入先コード (複数・代表の仕入先)</span><textarea class="in" name="sups" id="adv-sups" rows="2" spellcheck="false" placeholder="例: 0001 (1 でも同じ)"><%= filters.sups %></textarea></label>
+              <% if (AP && AP.suppliers && AP.suppliers.length) { %>
+              <%# 名前で選ぶ = 上のコードの欄に足す (外す = 欄から消す)。JS が無いときは出さない (コードの欄はそのまま使える) %>
+              <div class="pick" id="sup-pick" data-pick="into" data-into="adv-sups" data-noun="仕入先" data-off-word="取引なし" hidden>
+                <span class="lab" id="sup-pick-lab">仕入先を名前で選ぶ</span>
+                <select multiple id="sup-pick-src" hidden aria-hidden="true" tabindex="-1"><% for (const [code, name, act] of AP.suppliers) { %><option value="<%= code %>" data-code="<%= code %>" data-name="<%= name %>"<%= act ? '' : ' data-off' %>><%= code %> <%= name %></option><% } %></select>
+              </div>
+              <% } %>
             </div>
             <div class="adv-col">
               <label><span class="lab">代表 (親) の商品コード (複数)</span><textarea class="in" name="parents" id="adv-parents" rows="2" spellcheck="false" placeholder="その代表の商品と代表そのもの"><%= filters.parents %></textarea></label>
               <label><span class="lab">商品名 (含む)</span><input class="in" name="name" id="adv-name" value="<%= filters.name %>" autocomplete="off" placeholder="ひらがな・カタカナ・半角カナは同じ"></label>
+              <% if (AP && AP.makers) { %>
+              <%# 🆕 メーカー (0084・単品)。送る値 = 下の選ぶ欄 (name=makers・複数)。JS があれば名前で探して選ぶ欄にする (選ぶ欄は隠す) %>
+              <div class="pick" id="mk-pick" data-pick="select" data-noun="メーカー" data-off-word="使っていない">
+                <label class="lab" id="mk-pick-lab" for="adv-makers">メーカー (複数・単品)</label>
+                <select multiple class="in pk-native" name="makers" id="adv-makers" size="5">
+                  <option value="none" data-none data-name="メーカー未登録"<%= mkPicked.has('none') ? ' selected' : '' %>>メーカー未登録</option>
+                  <% for (const [id, name, act] of AP.makers) { %><option value="<%= id %>" data-name="<%= name %>"<%= act ? '' : ' data-off' %><%= mkPicked.has(id) ? ' selected' : '' %>><%= name %><%= act ? '' : ' (使っていない)' %></option><% } %>
+                  <% for (const id of mkPicked) { if (id !== 'none' && !mkKnown.has(id)) { %><option value="<%= id %>" data-name="メーカー #<%= id %>" data-off selected>メーカー #<%= id %></option><% } } %>
+                </select>
+              </div>
+              <% } else if (filters.makers) { %><input type="hidden" name="makers" value="<%= filters.makers %>"><% } %>
             </div>
             <div class="adv-col adv-ranges">
               <div class="rng"><span class="lab">原価</span><input class="in" name="cost_min" inputmode="numeric" value="<%= filters.cost_min %>" aria-label="原価 から (円)"><span>〜</span><input class="in" name="cost_max" inputmode="numeric" value="<%= filters.cost_max %>" aria-label="原価 まで (円)"><span class="unit">円</span></div>
@@ -322,5 +345,6 @@
     fkey: JSON.stringify(Object.entries(keep).filter(([k]) => k !== 'sort' && k !== 'dir').sort(([a], [b]) => (a < b ? -1 : 1))) } }) %><% } %>
   <%- include('_footer') %>
   <script src="<%= base %>/public/me-list.js?v=<%= assetV %>" defer></script>
+  <% if (AP) { %><script src="<%= base %>/public/me-pick.js?v=<%= assetV %>" defer></script><% } %>
 </body>
 </html>
