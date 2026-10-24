@@ -1547,6 +1547,11 @@ async function main() {
   const monitorFeeResult = runScript('apps/warehouse/monitor-fee-coverage.js', '手数料カバー率監視', 60000);
   results.push({ name: '手数料カバー率監視', ...monitorFeeResult });
 
+  // FBA の長期在庫 (181 日以上) を週 1 回 (月曜)・1 通で GChat へ (材料 = FBA在庫スナップショットが残す在庫計画の履歴。API は呼ばない)。
+  // 曜日でない・今週は送った = 何もしない。送れない・履歴が古いも exit 0 (朝を赤くしない)。再試行に載せない
+  const agedAlertResult = runScript('apps/warehouse/alert-fba-aged-inventory.js', 'FBA長期在庫アラート', 60000);
+  results.push({ name: 'FBA長期在庫アラート', ...agedAlertResult, warn: agedAlertResult.success && isWarnSummary(agedAlertResult.summary) });
+
   // 売上分類別粗利集計 (mgmt-accounting) の売上自動同期は Render 完結（server.js の常駐
   // スケジューラが in-process で実行）に移行したため、daily-sync(miniPC)からの起動は撤去。
 
@@ -1739,6 +1744,72 @@ async function main() {
   // 業務の異常を見つけたら exit 0 (⚠️ = warn) = 異常のたびに再実行させない。見張り自身の失敗 (評価できない・DB に届かない) だけ ❌ (retry の対象)。env が無ければ ⏭️ (Dark Launch)
   const watchResult = runScript('apps/company-db/watch/run.mjs', 'Company DB 見張り', 300000);
   results.push({ name: 'CompanyDB見張り', ...watchResult, warn: watchResult.success && isWarnSummary(watchResult.summary) });
+
+  // ── Amazon AI 分析用の出品・カート・BSR (2026-10-22) ──────────────────────────
+  // 見張りの後・DBバックアップの前 (2026-10-22 の見直し: 「Amazonカート価格」の直後だと FBA在庫スナップショット・Render同期 などの今ある工程が毎朝 5〜10 分遅れる)。
+  // retry には載せない (翌朝また取れば足りる・アラートを二重に鳴らさない)。m_products・上書き表は読まない = 写しの反映の門で止めない (publish-gate.js の PUBLISH_UNGATED_SCRIPTS)
+  //   ① 出品の状態と問題 (Listings Items searchListingsItems・作成日時の窓で全部 + 売れている SKU の引き直し。5 回/秒の枠を 4 回/秒で) → 写し amazon_listing_status_daily / amazon_listing_issue_daily
+  //   ② 出品アラート (①が取れた朝だけ・30 日に売れた or FBA 在庫の SKU が BUYABLE でなくなった / 新しい ERROR。初回は鳴らさない)
+  //   ③ カートを取られたアラート (「Amazonカート価格」が取れた朝だけ・API を呼ばない)
+  //   ④ BSR の履歴 (Catalog Items searchCatalogItems・20 ASIN ずつ・2 回/秒の枠) → amazon_catalog_rank_daily
+  //   ①④ は SP-API の注文の取込が失敗した朝は見送る (カート価格と同じ)
+  if (spResult.success) {
+    const listingResult = runScript('apps/warehouse/fetch-amazon-listing-issues.js', 'Amazon出品の状態', 1800000);
+    results.push({ name: 'Amazon出品の状態', ...listingResult, warn: listingResult.success && isWarnSummary(listingResult.summary) });
+    if (listingResult.success) {
+      const listingAlert = runScript('apps/warehouse/alert-amazon-listing.js --kind listing', 'Amazon出品アラート', 300000);
+      results.push({ name: 'Amazon出品アラート', ...listingAlert, warn: listingAlert.success && isWarnSummary(listingAlert.summary) });
+    } else {
+      console.log('[DailySync] Amazon出品の状態 失敗のため Amazon出品アラートをスキップ');
+    }
+  } else {
+    console.log('[DailySync] SP-API 失敗のため Amazon出品の状態の取得をスキップ');
+    results.push({ name: 'Amazon出品の状態', success: false, summary: '⏭️ skipped (SP-API失敗のため)' });
+  }
+  if (results.some(r => r.name === 'Amazonカート価格' && r.success)) {
+    const buyboxAlert = runScript('apps/warehouse/alert-amazon-listing.js --kind buybox', 'Amazonカートアラート', 300000);
+    results.push({ name: 'Amazonカートアラート', ...buyboxAlert, warn: buyboxAlert.success && isWarnSummary(buyboxAlert.summary) });
+  } else {
+    console.log('[DailySync] Amazonカート価格 失敗のため Amazonカートアラートをスキップ');
+  }
+  if (spResult.success) {
+    const bsrResult = runScript('apps/warehouse/fetch-amazon-bsr.js', 'Amazon BSR', 1200000);
+    results.push({ name: 'Amazon BSR', ...bsrResult, warn: bsrResult.success && isWarnSummary(bsrResult.summary) });
+  } else {
+    console.log('[DailySync] SP-API 失敗のため Amazon BSR の取得をスキップ');
+    results.push({ name: 'Amazon BSR', success: false, summary: '⏭️ skipped (SP-API失敗のため)' });
+  }
+  // ── Amazon AI 分析用の出品・カート・BSR ここまで ──────────────────────────────
+  // ── Amazon AI 分析用のレポート (設計 28 の外・2026-10-22) ──────────────────────────────
+  // sp-api-report.js の共通の部品で createReport → polling → 文書。毎朝 10〜25 分かかる = 今ある工程 (FBA在庫スナップショット・Render同期・照合など) を
+  // 遅らせないように、見張りの後・DBバックアップの前に置く (バックアップに新しい表が入る)。publish-gate.js では「止めない工程」(m_products を読まない)
+  //   アクセス・転換率 = GET_SALES_AND_TRAFFIC_REPORT (1 日 = 1 レポート・直近 5 日を毎朝取り直す・日ごとに置き換え)
+  //   返品 = GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA (直近 60 日を UPSERT) → 取れた朝だけ返品のアラート (控えめ・GCHAT_WEBHOOK が無ければ送らない・exit 0)
+  //   補てん = GET_FBA_REIMBURSEMENTS_DATA (直近 60 日を UPSERT)・在庫の台帳 = GET_LEDGER_DETAIL_VIEW_DATA (直近 30 日を日ごとに置き換え) = 保存まで
+  //   SP-API の主取得が失敗した朝は全部スキップ (カート価格と同じ)。どれかが失敗しても後ろは続ける。🚨 引数を必ず渡す (runScript は引数なしだと '7' を足す)
+  //   createReport / getReportDocument は 1 分に 1 回 (burst 15)。アクセスのレポートだけは別に「5 分に 3 回」= 直近 5 日は 3 つ → 5 分待って 2 つ (約 10 分)。timeout は polling の上限 (15〜25 分) より長く
+  if (spResult.success) {
+    const salesTrafficResult = runScript('apps/warehouse/fetch-amazon-sales-traffic.js --days 5', 'Amazonアクセス・転換率', 2700000);
+    results.push({ name: 'Amazonアクセス・転換率', ...salesTrafficResult, warn: salesTrafficResult.success && isWarnSummary(salesTrafficResult.summary) });
+    const returnsResult = runScript('apps/warehouse/fetch-amazon-returns.js --days 60', 'Amazon返品', 1800000);
+    results.push({ name: 'Amazon返品', ...returnsResult, warn: returnsResult.success && isWarnSummary(returnsResult.summary) });
+    if (returnsResult.success) {
+      const returnsAlertResult = runScript('apps/warehouse/monitor-amazon-returns.js --daily', 'Amazon返品アラート', 120000);
+      results.push({ name: 'Amazon返品アラート', ...returnsAlertResult, warn: returnsAlertResult.success && isWarnSummary(returnsAlertResult.summary) });
+    } else {
+      console.log('[DailySync] Amazon返品 の取得が失敗したため 返品アラートをスキップ (古い明細で判定しない)');
+    }
+    const reimbResult = runScript('apps/warehouse/fetch-amazon-reimbursements.js --days 60', 'Amazon補てん', 1800000);
+    results.push({ name: 'Amazon補てん', ...reimbResult, warn: reimbResult.success && isWarnSummary(reimbResult.summary) });
+    const ledgerResult = runScript('apps/warehouse/fetch-amazon-ledger.js --days 30', 'Amazon在庫台帳', 2100000);
+    results.push({ name: 'Amazon在庫台帳', ...ledgerResult, warn: ledgerResult.success && isWarnSummary(ledgerResult.summary) });
+  } else {
+    console.log('[DailySync] SP-API 失敗のため Amazon のアクセス・返品・補てん・在庫台帳の取得をスキップ');
+    for (const name of ['Amazonアクセス・転換率', 'Amazon返品', 'Amazon補てん', 'Amazon在庫台帳']) {
+      results.push({ name, success: false, summary: '⏭️ skipped (SP-API失敗のため)' });
+    }
+  }
+  // ── ここまで Amazon AI 分析用のレポート ──────────────────────────────────────────
 
   // ─── warehouse.db 日次バックアップ (VACUUM INTO → gzip → rclone offsite → 世代管理) ───
   // 一番最後の段 (2026-10-11 中原さん Q1 = a。前は見張り・照合の前 = 照合 ② と新商品の許可がバックアップ (約 93 分) を待っていた)。中身は変えない。

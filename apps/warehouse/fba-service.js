@@ -17,6 +17,7 @@ import { createJob } from './job-manager.js';
 import { fetchAllReports, normalizePlanningRow, normalizeRestockRow } from '../fba-replenishment/sp-api-reports.js';
 import { acquireFbaFetchLock, releaseFbaFetchLock } from './fba-fetch-lock.js';
 import { runFbaReportSnapshot, isBusinessDate, toJstDate } from './fba-report-snapshot.js';
+import { makePlanningHistorySaver } from './fba-planning-history.js';
 import { readLatestUsReports } from './fba-us-reports-store.js';
 import {
   createInboundPlan as spCreateInboundPlan,
@@ -215,7 +216,9 @@ router.post('/snapshot-reports', rateLimitMiddleware('sp-api'), async (req, res)
         const snapshotOpts = phase === 'S0' ? { deadlineMs: 240000, budgetMs: 150000 } : { deadlineMs: 180000, budgetMs: 60000 };
         return captureInboundPhase(phase, { ...ctx, call: callInboundApi, snapshotOpts });
       };
-      return await runFbaReportSnapshot({ db, businessDate, log, inboundCapture });
+      // 在庫計画の日 × SKU の履歴 (warehouse.db。同じ取得の行から作る = 追加の API 呼び出しなし。失敗しても日次処理は止めない)
+      const planningHistory = makePlanningHistorySaver(getWarehouseDB, { log: (...a) => console.log(...a) });
+      return await runFbaReportSnapshot({ db, businessDate, log, inboundCapture, planningHistory });
     } finally {
       snapshotReportsJobId = null; snapshotReportsDate = null;
       releaseFbaFetchLock(lock);
