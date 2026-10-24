@@ -103,14 +103,14 @@ function seedNormal(db, { skipReturnsRows = false } = {}) {
       units_ordered: cur ? 48 : 50, ordered_product_sales: 100000, buy_box_percentage: cur ? 90 : 95, ...T,
     });
   }
-  // SKU: 前週と今週
+  // SKU: 09-21〜10-18 (売れ筋を決める 28 日がそろう)。比べるのは前週と今週
   const SKUS = {
     'SKU-A': { asin: 'B0AAAAAAAA', prev: [100, 10, 30000, 95], cur: [100, 4, 12000, 95] },   // 転換率 10% → 4%
     'SKU-B': { asin: 'B0BBBBBBBB', prev: [50, 2, 50000, 95], cur: [50, 2, 50000, 70] },     // カート 95 → 70
     'SKU-C': { asin: 'B0CCCCCCCC', prev: [80, 4, 8000, 95], cur: [80, 4, 8000, 95] },       // 変化なし
     'SKU-D': { asin: 'B0DDDDDDDD', prev: [2, 1, 1000, 95], cur: [2, 0, 0, 95] },            // セッションが少ない → 対象外
   };
-  for (const d of range('2026-10-05', REF)) {
+  for (const d of range('2026-09-21', REF)) {
     for (const [sku, s] of Object.entries(SKUS)) {
       const [sess, units, sales, bb] = d >= PS ? s.cur : s.prev;
       ins(db, 'amazon_sales_traffic_sku_daily', {
@@ -257,13 +257,13 @@ let normal;
   const lp = o.listing_problems;
   ok(lp.as_of === REF && lp.snapshot === 'complete' && lp.problem_skus_total === 2 && lp.not_buyable_skus === 1 && lp.selling_problem_skus === 1,
     '出品: 問題 2 SKU (うち売れ筋 1)・買えない 1', lp);
-  ok(lp.items.length === 1 && lp.items[0].sku === 'SKU-A' && lp.items[0].sales_28d_yen === 294000 && lp.items[0].top_error?.code === '90220' && lp.items[0].suppressed === true,
-    '売れ筋の SKU-A (28 日 29.4 万・ERROR 90220・停止)', lp.items[0]);
+  ok(lp.items.length === 1 && lp.items[0].sku === 'SKU-A' && lp.items[0].sales_28d_yen === 714000 && lp.items[0].top_error?.code === '90220' && lp.items[0].suppressed === true,
+    '売れ筋の SKU-A (28 日 71.4 万・ERROR 90220・停止)', lp.items[0]);
 
   const bb = o.buybox_lost;
   ok(bb.as_of === REF && bb.lost_now_skus === 1 && bb.items[0].sku === 'SKU-B' && bb.items[0].lost_days === 3 && bb.items[0].seen_days === 7
-    && bb.items[0].buybox_price_yen === 2780 && bb.items[0].sales_28d_yen === 700000,
-  'カート: SKU-B が他社 (今週 3/7 日・カート価格 2,780 円・28 日 70 万)', bb);
+    && bb.items[0].buybox_price_yen === 2780 && bb.items[0].sales_28d_yen === 1400000,
+  'カート: SKU-B が他社 (今週 3/7 日・カート価格 2,780 円・28 日 140 万)', bb);
 
   const rt = o.returns;
   ok(rt.returned_units === 4 && rt.prev_week_returned_units === 1, '返品: 今週 4 個・前週 1 個', rt);
@@ -313,6 +313,8 @@ console.log('\n■ 4b. 分からない値・取れていない日');
   db.prepare("DELETE FROM fact_amazon_ads_sku_attrib WHERE date_jst = '2026-09-30'").run();
   const o = buildAmazonHealthFacts(db, weekly());
   ok(o.store_traffic.this_week.cvr_pct === 4, '店全体: units が NULL の日を除いて 4.0%', o.store_traffic.this_week);
+  ok(o.store_traffic.this_week.units_ordered === null && o.store_traffic.this_week.sessions === 8400 && o.store_traffic.this_week.ordered_sales_yen === 700000,
+    '店全体: 欠けた日がある指標 (units) の合計は null・そろった指標は合計 (Codex R2)', o.store_traffic.this_week);
   ok(o.sku_conversion_drops.items.every((i) => i.sku !== 'SKU-A') && o.sku_conversion_drops.matched_skus === 1, 'SKU-A は転換率が分からない → 低下に出さない', o.sku_conversion_drops);
   const b = o.buybox_lost.items.find((i) => i.sku === 'SKU-B');
   ok(b && b.sales_28d_yen === null, 'カート: 売上が分からない SKU-B も外さない (sales_28d_yen = null)', o.buybox_lost);
@@ -329,6 +331,28 @@ console.log('\n■ 4b. 分からない値・取れていない日');
   ok(o2.store_traffic.this_week.cvr_pct === null, '店全体: units のそろった日が 5/7 → 転換率 null', o2.store_traffic.this_week);
   ok(o2.returns.status === 'no_data' && /取れた日数が足りない \(1\/7/.test(o2.returns.reason), '返品: 取得の記録 1/7 日 → no_data', o2.returns);
   ok(o2.reimbursements.status === 'no_data' && /取れた日数が足りない/.test(o2.reimbursements.reason), '補てん: 同じく no_data', o2.reimbursements);
+  db.close();
+}
+
+// ═══ 4c. 期間のそろい・新しさを項目の中でも確かめる (Codex R2) ═══
+console.log('\n■ 4c. 売上の出どころ・広告の帰属の出そろい・BSR の ASIN ごと');
+{
+  const db = new Database(':memory:');
+  createAll(db);
+  seedNormal(db);
+  // アクセスのレポートが 10-05 から (28 日のうち 14 日) → 行の無い SKU-Z は「売れていない」ではなく「分からない」
+  db.prepare("DELETE FROM amazon_sales_traffic_sku_daily WHERE date_jst < '2026-10-05'").run();
+  // 広告: 窓 (09-28〜10-04) の日の最後の取得が 10-08 (帰属が出そろう 14 日後より前) のまま止まった
+  db.prepare("UPDATE ads_attrib_fetch_days SET fetched_at = '2026-10-08T00:00:00Z' WHERE date_jst < '2026-10-05'").run();
+  // BSR: B0AAAAAAAA だけ 10-05 と 10-12 しか順位が無い (他の ASIN は毎日取れている)
+  db.prepare("DELETE FROM amazon_catalog_rank_daily WHERE asin = 'B0AAAAAAAA' AND date_jst NOT IN ('2026-10-05', '2026-10-12')").run();
+  const o = buildAmazonHealthFacts(db, weekly());
+  const lp = o.listing_problems;
+  ok(lp.selling_problem_skus === 2 && lp.items.some((i) => i.sku === 'SKU-Z' && i.sales_28d_yen === null) && /14\/28 日だけ/.test(lp.sales_basis),
+    '売上の出どころが 14/28 日 → 行の無い SKU-Z も外さない (売上 null)', lp);
+  ok(o.ads_poor_roas.status === 'no_data' && /出そろう前の取得/.test(o.ads_poor_roas.reason), '広告: 帰属が出そろう前の取得のまま → no_data', o.ads_poor_roas);
+  ok(o.bsr_drops.status === 'ok' && o.bsr_drops.matched_asins === 0 && o.bsr_drops.skipped_asins === 1,
+    'BSR: 順位が 1 日ずつしか無い ASIN は比べない (skipped 1)', o.bsr_drops);
   db.close();
 }
 
@@ -442,7 +466,7 @@ console.log('\n■ 10. プロンプト');
     facts: { amazon_health: JSON.parse(JSON.stringify(normal)) },
   };
   enrichFactsDisplay(input);
-  ok(input.facts.amazon_health.listing_problems.items[0].sales_28d_disp === '29.4万円', '金額に *_disp (万円) が付く', input.facts.amazon_health.listing_problems.items[0]);
+  ok(input.facts.amazon_health.listing_problems.items[0].sales_28d_disp === '71.4万円', '金額に *_disp (万円) が付く', input.facts.amazon_health.listing_problems.items[0]);
   const p = buildPrompt(input);
   ok(PROMPT_VERSION === 'wk-v2' && /facts\.amazon_health/.test(p) && /no_data の項目は論点にも根拠にも使わず、推測で埋めない/.test(p), '週次: 新しいルール 11 (wk-v2)');
   const mp = buildMonthlyPrompt({ ...input, meta: { month_ym: '2026-09' } });

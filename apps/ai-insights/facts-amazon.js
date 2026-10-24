@@ -140,6 +140,8 @@ function inList(arr) { return arr.map(() => '?').join(','); }
  * SKU (小文字) / ASIN (大文字) → { sales, units }。注文ベース (アクセスのレポート) があればそれ・無ければ決済ベース (finance の統合 view)。
  * どちらも無ければ null。memo は同じ期間の呼び出しを 1 回にする。
  * 🚨 アクセスのレポートの行はあっても売上の列が全部 NULL なら使わない (次の候補へ)。SKU ごとの売上が NULL = 分からない (0 にしない)。Codex R1
+ * 🚨 アクセスのレポートが期間の日数そろっていない (取り始めたばかり等) なら決済ベースを先に使う。決済ベースも無ければ
+ *    そろっていないアクセスのレポートを complete = false で返す (行の無い SKU = 0 ではなく「分からない」)。Codex R2
  */
 function salesMap(db, by, from, to, memo) {
   const key = `${by}|${from}|${to}`;
@@ -148,21 +150,32 @@ function salesMap(db, by, from, to, memo) {
   const financeKey = by === 'sku' ? 'sku_key' : 'UPPER(TRIM(asin_norm))';
   const financeWhere = by === 'sku' ? '' : "AND asin_norm IS NOT NULL AND asin_norm <> ''";
   let out = null;
+  let partialTraffic = null;
   try {
     const t = resolveTable(db, TABLES.trafficSku);
     if (t) {
-      const rows = db.prepare(`SELECT ${trafficKey} AS k, SUM(ordered_product_sales) AS sales, SUM(units_ordered) AS units
+      // SKU ごとの売上: 1 行でも売上が NULL なら合計は分からない (null)
+      const rows = db.prepare(`SELECT ${trafficKey} AS k,
+          CASE WHEN COUNT(ordered_product_sales) = COUNT(*) THEN SUM(ordered_product_sales) END AS sales,
+          CASE WHEN COUNT(units_ordered) = COUNT(*) THEN SUM(units_ordered) END AS units
         FROM ${t} WHERE date_jst >= ? AND date_jst < ? GROUP BY ${trafficKey}`).all(from, to);
-      if (rows.some((r) => r.sales != null)) out = { source: 'amazon_sales_traffic (注文ベース)', map: new Map(rows.map((r) => [r.k, r])) };
+      const days = db.prepare(`SELECT COUNT(DISTINCT date_jst) AS n FROM ${t} WHERE date_jst >= ? AND date_jst < ? AND ordered_product_sales IS NOT NULL`)
+        .get(from, to)?.n || 0;
+      if (rows.some((r) => r.sales != null)) {
+        const cand = { source: 'amazon_sales_traffic (注文ベース)', map: new Map(rows.map((r) => [r.k, r])), complete: true };
+        if (days >= minDaysFor(daysBetween(from, to))) out = cand;
+        else partialTraffic = { ...cand, complete: false, source: `amazon_sales_traffic (注文ベース・${days}/${daysBetween(from, to)} 日だけ)` };
+      }
     }
   } catch { out = null; }
   if (!out) {
     try {
       const rows = db.prepare(`SELECT ${financeKey} AS k, SUM(sales_gross_jpy_incl) AS sales, SUM(units_net_sold) AS units
         FROM v_mall_finance_daily_unified WHERE mall = 'amazon' AND date_jst >= ? AND date_jst < ? ${financeWhere} GROUP BY ${financeKey}`).all(from, to);
-      if (rows.length > 0) out = { source: 'v_mall_finance_daily_unified (決済ベース)', map: new Map(rows.map((r) => [r.k, r])) };
+      if (rows.length > 0) out = { source: 'v_mall_finance_daily_unified (決済ベース)', map: new Map(rows.map((r) => [r.k, r])), complete: true };
     } catch { out = null; }
   }
+  if (!out) out = partialTraffic;
   memo.set(key, out);
   return out;
 }
@@ -170,13 +183,13 @@ const salesBySku = (db, from, to, memo) => salesMap(db, 'sku', from, to, memo);
 const salesByAsin = (db, from, to, memo) => salesMap(db, 'asin', from, to, memo);
 
 /**
- * 売上の表から 1 つの値: 売上の出どころが無い → null / その SKU の行が無い → 0 (売れていない) / 行はあるが売上が NULL → null (分からない)
- * field = 'sales' | 'units'
+ * 売上の表から 1 つの値: 売上の出どころが無い → null / その SKU の行が無い → 0 (売れていない。出どころが期間そろっていなければ null) /
+ * 行はあるが売上が NULL → null (分からない)。field = 'sales' | 'units'
  */
 function salesValue(sales, k, field = 'sales') {
   if (!sales) return null;
   const r = sales.map.get(k);
-  if (!r) return 0;
+  if (!r) return sales.complete ? 0 : null;
   return r[field] == null ? null : r[field];
 }
 /** 売れ筋か: 売上が正 / 分からない (null) も外さない (分からないことを「売れていない」にしない) */
@@ -216,19 +229,23 @@ function storeTraffic(db, ctx) {
   const agg = ([from, to]) => {
     const r = db.prepare(`SELECT COUNT(sessions) AS days, SUM(sessions) AS sessions, SUM(page_views) AS pv,
         SUM(units_ordered) AS units, SUM(ordered_product_sales) AS sales,
+        COUNT(page_views) AS pv_n, COUNT(units_ordered) AS units_n, COUNT(ordered_product_sales) AS sales_n,
         COUNT(CASE WHEN units_ordered IS NOT NULL THEN sessions END) AS cvr_days,
         SUM(CASE WHEN units_ordered IS NOT NULL THEN sessions END) AS s_pair, SUM(CASE WHEN sessions IS NOT NULL THEN units_ordered END) AS u_pair,
         SUM(buy_box_percentage * page_views) AS bb_w, SUM(CASE WHEN buy_box_percentage IS NOT NULL THEN page_views END) AS bb_pv,
         AVG(buy_box_percentage) AS bb_avg
       FROM ${chk.table} WHERE date_jst >= ? AND date_jst < ?`).get(from, to);
     const days = r?.days || 0;
+    const expected = daysBetween(from, to);
+    // 合計は期間の全部の日に値があるときだけ (欠けた日がある合計を期間の値として出さない)。比率 (転換率・カート) は下で別に決める。Codex R2
+    const full = (sum, n) => (n === expected ? sum ?? null : null);
     return {
       days,
-      expected_days: daysBetween(from, to),
-      sessions: r?.sessions ?? null,
-      page_views: r?.pv ?? null,
-      units_ordered: r?.units ?? null,
-      ordered_sales_yen: yen(r?.sales),
+      expected_days: expected,
+      sessions: full(r?.sessions, days),
+      page_views: full(r?.pv, r?.pv_n),
+      units_ordered: full(r?.units, r?.units_n),
+      ordered_sales_yen: yen(full(r?.sales, r?.sales_n)),
       // 転換率は sessions と units の両方がある日だけで割る (片方が NULL の日を混ぜない)。そろった日が足りなければ null。Codex R1
       cvr_pct: (r?.cvr_days || 0) >= minDaysFor(daysBetween(from, to)) ? pctOf(r.u_pair, r.s_pair) : null,
       // カート獲得率は PV の重み付き平均 (PV が無い日だけなら単純平均)
@@ -276,7 +293,10 @@ function skuConversionDrops(db, ctx) {
       SUM(CASE WHEN date_jst < @cs AND units_ordered IS NOT NULL THEN sessions END) AS sp_prev,
       SUM(CASE WHEN date_jst >= @cs AND sessions IS NOT NULL THEN units_ordered END) AS up_cur,
       SUM(CASE WHEN date_jst < @cs AND sessions IS NOT NULL THEN units_ordered END) AS up_prev,
-      SUM(CASE WHEN date_jst >= @cs THEN ordered_product_sales END) AS y_cur, SUM(CASE WHEN date_jst < @cs THEN ordered_product_sales END) AS y_prev,
+      CASE WHEN COUNT(CASE WHEN date_jst >= @cs THEN 1 END) = COUNT(CASE WHEN date_jst >= @cs THEN ordered_product_sales END)
+        THEN SUM(CASE WHEN date_jst >= @cs THEN ordered_product_sales END) END AS y_cur,
+      CASE WHEN COUNT(CASE WHEN date_jst < @cs THEN 1 END) = COUNT(CASE WHEN date_jst < @cs THEN ordered_product_sales END)
+        THEN SUM(CASE WHEN date_jst < @cs THEN ordered_product_sales END) END AS y_prev,
       SUM(CASE WHEN date_jst >= @cs THEN buy_box_percentage * page_views END) AS bbw_cur,
       SUM(CASE WHEN date_jst >= @cs AND buy_box_percentage IS NOT NULL THEN page_views END) AS bbpv_cur,
       SUM(CASE WHEN date_jst < @cs THEN buy_box_percentage * page_views END) AS bbw_prev,
@@ -308,7 +328,7 @@ function skuConversionDrops(db, ctx) {
       buy_box_pct: bbCur, [`${ctx.labels.prevShort}_buy_box_pct`]: bbPrev, buy_box_change_pt: changePt(bbCur, bbPrev),
     });
   }
-  hits.sort((a, b) => (b[`${ctx.labels.prevShort}_sales_yen`] || 0) - (a[`${ctx.labels.prevShort}_sales_yen`] || 0) || (a.k < b.k ? -1 : 1));
+  hits.sort((a, b) => (b[`${ctx.labels.prevShort}_sales_yen`] ?? -1) - (a[`${ctx.labels.prevShort}_sales_yen`] ?? -1) || (a.k < b.k ? -1 : 1));
   const top = hits.slice(0, TOP_N);
   const names = productNames(db, top.map((h) => h.k));
   return {
@@ -508,20 +528,29 @@ function bsrDrops(db, ctx) {
   const prevDays = dayCount(ctx.prev);
   if (curDays < need(ctx.cur)) return noData(`この期間の日数が足りない (${curDays}/${daysBetween(...ctx.cur)} 日)`);
   if (prevDays < need(ctx.prev)) return noData(`前の期間の日数が足りない (${prevDays}/${daysBetween(...ctx.prev)} 日・取り始めたばかり)`);
+  // ASIN × 分類ごとに: 両方の期間で半分以上の日に順位がある・最新の順位が古くない ものだけ比べる (表全体の日数だけでは見ない)。Codex R2
   const rows = db.prepare(`SELECT asin, rank_type, category_id, MAX(category_title) AS title,
-      AVG(CASE WHEN date_jst >= ? THEN rank END) AS r_cur, AVG(CASE WHEN date_jst < ? THEN rank END) AS r_prev
-    FROM ${chk.table} WHERE date_jst >= ? AND date_jst < ?
-    GROUP BY asin, rank_type, category_id`).all(ctx.cur[0], ctx.cur[0], ctx.prev[0], ctx.cur[1]);
+      AVG(CASE WHEN date_jst >= @cs THEN rank END) AS r_cur, AVG(CASE WHEN date_jst < @cs THEN rank END) AS r_prev,
+      COUNT(DISTINCT CASE WHEN date_jst >= @cs THEN date_jst END) AS n_cur, COUNT(DISTINCT CASE WHEN date_jst < @cs THEN date_jst END) AS n_prev,
+      MAX(date_jst) AS last_day
+    FROM ${chk.table} WHERE date_jst >= @ps AND date_jst < @ce
+    GROUP BY asin, rank_type, category_id`).all({ cs: ctx.cur[0], ps: ctx.prev[0], ce: ctx.cur[1] });
+  const staleBefore = addDays(ctx.refDay, -STALE_AFTER_DAYS);
+  let skippedAsins = 0;
   // ASIN ごとに 1 つの分類: 両方の期間に順位がある中で、大分類 (display_group) → 無ければ前の期間で順位のいちばん良い分類
   const byAsin = new Map();
+  const skipped = new Set();
   for (const r of rows) {
     if (r.r_cur == null || r.r_prev == null) continue;
+    if (r.n_cur < need(ctx.cur) || r.n_prev < need(ctx.prev) || r.last_day < staleBefore) { skipped.add(r.asin); continue; }
     const curBest = byAsin.get(r.asin);
     const better = !curBest
       || (r.rank_type === 'display_group' && curBest.rank_type !== 'display_group')
       || (r.rank_type === curBest.rank_type && r.r_prev < curBest.r_prev);
     if (better) byAsin.set(r.asin, r);
   }
+  for (const a of byAsin.keys()) skipped.delete(a);
+  skippedAsins = skipped.size;
   const sales = salesByAsin(db, ...ctx.prev, ctx.memo);
   const hits = [];
   for (const r of byAsin.values()) {
@@ -539,6 +568,7 @@ function bsrDrops(db, ctx) {
     status: 'ok',
     as_of: chk.latest,
     checked_asins: byAsin.size,
+    skipped_asins: skippedAsins,   // 順位の日数が足りない・最新が古いため比べなかった ASIN
     matched_asins: hits.length,
     rule: `期間の平均順位が前の期間の ${BSR_WORSE_RATIO} 倍以上かつ ${BSR_WORSE_MIN_RANKS} 位以上悪化 (数が大きいほど悪い)`,
     sales_basis: sales ? sales.source : '売上が分からないため悪化の大きい順',
@@ -626,6 +656,18 @@ function adsPoorRoas(db, ctx) {
   const daysT = chk.src;
   const n = db.prepare(`SELECT COUNT(DISTINCT date_jst) AS n FROM ${daysT} WHERE date_jst >= ? AND date_jst < ?`).get(from, to)?.n || 0;
   if (n < minDaysFor(days)) return noData(`見る期間 (${from}〜${addDays(to, -1)}) の取れた日数が足りない (${n}/${days} 日)`);
+  // 週次 (出そろった週) は、各日の値が「その日の 14 日後以降 (JST) に取った値」かを確かめる。
+  // 取得が途中で止まると、帰属が伸びきる前の値が残ったまま窓に入る (ROAS が低く出る)。Codex R2
+  let settledDays = null;
+  if (ctx.adsRequireSettled) {
+    const tsCol = daysT === chk.table ? 'ingested_at' : 'fetched_at';
+    settledDays = db.prepare(`SELECT COUNT(*) AS n FROM (
+        SELECT date_jst, MIN(date(${tsCol}, '+9 hours')) AS fetched_jst FROM ${daysT} WHERE date_jst >= ? AND date_jst < ? GROUP BY date_jst
+      ) WHERE fetched_jst >= date(date_jst, '+${ADS_ATTRIB_SETTLE_DAYS} days')`).get(from, to)?.n || 0;
+    if (settledDays < minDaysFor(days)) {
+      return noData(`見る期間 (${from}〜${addDays(to, -1)}) の値が 14 日の帰属が出そろう前の取得のまま (出そろった日 ${settledDays}/${days} 日)`);
+    }
+  }
   const tot = db.prepare(`SELECT SUM(cost) AS cost, SUM(sales_14d) AS s14, SUM(CASE WHEN sales_14d IS NULL THEN 1 ELSE 0 END) AS nulls, COUNT(*) AS rows
     FROM ${chk.table} WHERE date_jst >= ? AND date_jst < ?`).get(from, to);
   if (tot.rows > 0 && tot.nulls === tot.rows) return noData('14 日の帰属売上 (sales_14d) が全部空 (レポートが列を返していない)');
@@ -643,6 +685,7 @@ function adsPoorRoas(db, ctx) {
     as_of: chk.latest,
     window: { from, to: addDays(to, -1) },
     window_note: ctx.adsWindowNote,
+    settled_days: settledDays,
     spend_yen: yen(tot.cost ?? 0),
     // 14 日の帰属売上が NULL の行が 1 つでもあれば、全体の売上と ROAS は分からない (費用だけ全部入って低く出るため)。Codex R1
     sales_14d_yen: tot.nulls > 0 ? null : yen(tot.s14 ?? 0),
@@ -710,6 +753,7 @@ export function buildAmazonHealthFacts(db, p) {
     labels,
     memo: new Map(),
     adsWindow,
+    adsRequireSettled: !isMonth,
     adsWindowNote: isMonth
       ? 'その月の広告。月末の数日の 14 日の帰属売上はまだ伸びる途中 (ROAS が低めに出る)'
       : `14 日の帰属売上が出そろった週 (今週の ${ADS_ATTRIB_SETTLE_DAYS} 日前の 7 日)。今週の広告そのものではない`,
