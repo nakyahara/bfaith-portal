@@ -1552,6 +1552,14 @@ async function main() {
   const agedAlertResult = runScript('apps/warehouse/alert-fba-aged-inventory.js', 'FBA長期在庫アラート', 60000);
   results.push({ name: 'FBA長期在庫アラート', ...agedAlertResult, warn: agedAlertResult.success && isWarnSummary(agedAlertResult.summary) });
 
+  // データの新しさ (2026-10-24・2026-10-23 にモールのログイン切れで Yahoo統計・au PAY・Qoo10 の分析が何週間も止まっていたのが朝のまとめに出ていなかった)。
+  // モールの取込 (楽天・Yahoo・au PAY・Qoo10 の分析・レビュー)・注文の取得の後。決まった一覧の表の最新の日付を読み、しきい値を超えたら止まっている。
+  // 今朝の自動取得 (fetch-all) の exit 3 = ログイン切れも出す。止まっている・ログイン切れ・止めているものの台帳の期限切れ = ⚠️ (exit 0)。
+  // GChat は 1 通にまとめ、新しく止まった日と 7 日ごとの念押しだけ。読むだけ (自分の記録の表 data_freshness_alert_state だけ書く)・再試行に載せない
+  // 🚨 Amazon AI 分析用の表は、この後 (見張りの後) に今朝の分を取る = ここでは前の朝までの分で見る (しきい値は 3 日以上)
+  const freshnessResult = runScript('apps/warehouse/monitor-data-freshness.js', 'データの新しさ', 120000);
+  results.push({ name: 'データの新しさ', ...freshnessResult, warn: freshnessResult.success && isWarnSummary(freshnessResult.summary) });
+
   // 売上分類別粗利集計 (mgmt-accounting) の売上自動同期は Render 完結（server.js の常駐
   // スケジューラが in-process で実行）に移行したため、daily-sync(miniPC)からの起動は撤去。
 
@@ -1785,7 +1793,8 @@ async function main() {
   // 遅らせないように、見張りの後・DBバックアップの前に置く (バックアップに新しい表が入る)。publish-gate.js では「止めない工程」(m_products を読まない)
   //   アクセス・転換率 = GET_SALES_AND_TRAFFIC_REPORT (1 日 = 1 レポート・直近 5 日を毎朝取り直す・日ごとに置き換え)
   //   返品 = GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA (直近 60 日を UPSERT) → 取れた朝だけ返品のアラート (控えめ・GCHAT_WEBHOOK が無ければ送らない・exit 0)
-  //   補てん = GET_FBA_REIMBURSEMENTS_DATA (直近 60 日を UPSERT)・在庫の台帳 = GET_LEDGER_DETAIL_VIEW_DATA (直近 30 日を日ごとに置き換え) = 保存まで
+  //   補てん = GET_FBA_REIMBURSEMENTS_DATA (直近 60 日を UPSERT)・在庫の台帳 = GET_LEDGER_DETAIL_VIEW_DATA (直近 30 日を日ごとに置き換え)
+  //     → 両方が取れた朝だけ補てん漏れのアラート (monitor-amazon-reimb-gap.js。週 1 回・火曜・1 通・GCHAT_WEBHOOK が無ければ送らない・exit 0)
   //   SP-API の主取得が失敗した朝は全部スキップ (カート価格と同じ)。どれかが失敗しても後ろは続ける。🚨 引数を必ず渡す (runScript は引数なしだと '7' を足す)
   //   createReport / getReportDocument は 1 分に 1 回 (burst 15)。アクセスのレポートだけは別に「5 分に 3 回」= 直近 5 日は 3 つ → 5 分待って 2 つ (約 10 分)。timeout は polling の上限 (15〜25 分) より長く
   if (spResult.success) {
@@ -1803,6 +1812,14 @@ async function main() {
     results.push({ name: 'Amazon補てん', ...reimbResult, warn: reimbResult.success && isWarnSummary(reimbResult.summary) });
     const ledgerResult = runScript('apps/warehouse/fetch-amazon-ledger.js --days 30', 'Amazon在庫台帳', 2100000);
     results.push({ name: 'Amazon在庫台帳', ...ledgerResult, warn: ledgerResult.success && isWarnSummary(ledgerResult.summary) });
+    // 補てん漏れ (紛失・破損したのに補てんされていない在庫) を週 1 回 (火曜)・1 通で GChat へ。API は呼ばない (台帳と補てんの表を突き合わせるだけ)。
+    // 台帳と補てんの取得が両方成功した朝だけ (古い明細で判定しない)。曜日でない・今週は送った = 何もしない。送れなくても exit 0
+    if (reimbResult.success && ledgerResult.success) {
+      const reimbGapResult = runScript('apps/warehouse/monitor-amazon-reimb-gap.js --daily', 'Amazon補てん漏れアラート', 120000);
+      results.push({ name: 'Amazon補てん漏れアラート', ...reimbGapResult, warn: reimbGapResult.success && isWarnSummary(reimbGapResult.summary) });
+    } else {
+      console.log('[DailySync] Amazon補てん / 在庫台帳 の取得が失敗したため 補てん漏れアラートをスキップ (古い明細で判定しない)');
+    }
   } else {
     console.log('[DailySync] SP-API 失敗のため Amazon のアクセス・返品・補てん・在庫台帳の取得をスキップ');
     for (const name of ['Amazonアクセス・転換率', 'Amazon返品', 'Amazon補てん', 'Amazon在庫台帳']) {
@@ -1810,6 +1827,14 @@ async function main() {
     }
   }
   // ── ここまで Amazon AI 分析用のレポート ──────────────────────────────────────────
+  // ── Amazon AI 分析用の表を Render の mirror へ (2026-10-24・ai-insights の facts-amazon.js が mirror_<表名> を読む) ──
+  // 上の取得 (出品・BSR・アクセス・返品・補てん) と、前の段の在庫計画の履歴・広告の帰属売上の後 = 今朝の分まで送る (Render同期 の段は取得より前なので 1 日遅れる)。
+  // 表・列・日数は lib/amazon-ai-mirror.js。表ごとに直近を日ごとに置き換え・止まっていた日は埋め直す・初回は残す日数ぶん全部 (run を小分け)。
+  // 表が無い・まだ空 = ⏭️ (失敗にしない)。SP-API が失敗した朝も送る (元の表の今の中身を写すだけ)。retry には載せない (翌朝の回が続きから送る)。
+  //   🚨 引数を必ず渡す (runScript は引数なしだと '7' を足す)。DATA_DIR は env (runScript が子へ渡す)
+  const amazonAiMirrorResult = runScript('apps/warehouse/sync-amazon-ai-mirror.js --daily', 'Amazon AI mirror sync', 2400000);
+  results.push({ name: 'Amazon AI mirror sync', ...amazonAiMirrorResult });
+  // ── Amazon AI 分析用の表を Render の mirror へ ここまで ──────────────────────────────
 
   // ─── warehouse.db 日次バックアップ (VACUUM INTO → gzip → rclone offsite → 世代管理) ───
   // 一番最後の段 (2026-10-11 中原さん Q1 = a。前は見張り・照合の前 = 照合 ② と新商品の許可がバックアップ (約 93 分) を待っていた)。中身は変えない。

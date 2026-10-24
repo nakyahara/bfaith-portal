@@ -13,7 +13,8 @@
  */
 import { Router } from 'express';
 import crypto from 'crypto';
-import { initMirrorDB, getMirrorDB, yahooInitError, aupayDataInitError, qoo10DataInitError, rakutenReviewInitError, logizardStockInitError, skuMapInitError, skuMapGenerationInitError } from './db.js';
+import { initMirrorDB, getMirrorDB, yahooInitError, aupayDataInitError, qoo10DataInitError, rakutenReviewInitError, logizardStockInitError, skuMapInitError, skuMapGenerationInitError, amazonAiInitError } from './db.js';
+import { AMAZON_AI_MIRROR_ENTITIES, AMAZON_AI_ENTITY_NAMES, AMAZON_AI_CONTRACT_VERSION, retentionBounds, retentionDeleteSql, addDaysYmd } from '../../lib/amazon-ai-mirror.js';
 import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 import {
   STORE_BENCH_COLS, STORE_DEVICE_BASE_COLS, STORE_DEVICE_OPT_COLS, CATEGORY_DEMO_COLS,
@@ -1389,8 +1390,21 @@ const SKU_MAP_ENTITY_NAMES = new Set(Object.keys(SKU_MAP_TABLE_SPECS));
 // 0件だけを弾いても「本来500件が3件」の欠損 snapshot は通ってしまう (Codex R1 High #2)
 const FULL_SNAPSHOT_MAX_SHRINK_RATIO = 0.2;
 
-// 楽天dd + Yahoo + au PAY分析 + Qoo10 + 楽天レビュー を1つのレジストリに統合 (getRakutenDdInsert/normalizeRakutenDdRow が参照)
-const DD_ALL_TABLE_SPECS = { ...RAKUTEN_DD_TABLE_SPECS, ...YAHOO_DATA_TABLE_SPECS, ...AUPAY_DATA_TABLE_SPECS, ...QOO10_DATA_TABLE_SPECS, ...RAKUTEN_REVIEW_TABLE_SPECS, ...SKU_MAP_TABLE_SPECS };
+// Amazon AI の分析 (ai-insights の facts-amazon.js) が読む表 13 種 (2026-10-24)。定義は lib/amazon-ai-mirror.js (送り手と共有)。
+// 日付の列が date_jst でない表 (返品 = return_date_jst・補てん = approval_date_jst・在庫計画 = snapshot_date) がある → 日付の形はここで見る
+const AMAZON_AI_TABLE_SPECS = Object.fromEntries(AMAZON_AI_MIRROR_ENTITIES.map((spec) => [spec.entity, {
+  table: spec.table,
+  required: [spec.dateCol, ...(spec.rowKey ? ['row_key'] : [])],
+  cols: spec.cols.map(([c]) => c),
+  validate: (r, HttpErrorCls) => {
+    if (!DATE_RE.test(String(r[spec.dateCol]))) {
+      throw new HttpErrorCls(400, { error: 'bad_row', message: `bad ${spec.dateCol}: ${r[spec.dateCol]}` });
+    }
+  },
+}]));
+
+// 楽天dd + Yahoo + au PAY分析 + Qoo10 + 楽天レビュー + Amazon AI を1つのレジストリに統合 (getRakutenDdInsert/normalizeRakutenDdRow が参照)
+const DD_ALL_TABLE_SPECS = { ...RAKUTEN_DD_TABLE_SPECS, ...YAHOO_DATA_TABLE_SPECS, ...AUPAY_DATA_TABLE_SPECS, ...QOO10_DATA_TABLE_SPECS, ...RAKUTEN_REVIEW_TABLE_SPECS, ...SKU_MAP_TABLE_SPECS, ...AMAZON_AI_TABLE_SPECS };
 
 function getRakutenDdInsert(db, entityKey) {
   const b = getStmtBundle(db);
@@ -2149,6 +2163,18 @@ const ENTITY_REGISTRY = {
     getInsertStmt: getFSalesByListingInsert,
     normalizeRow: (r) => normalizeFSalesByListingRow(r),
   },
+  // Amazon AI の分析が読む表 13 entity (2026-10-24・送り手 = apps/warehouse/sync-amazon-ai-mirror.js)。
+  // 日ごとに置き換え (clear_date_col の日付で clear)・retention = 残す日数より古い行をこの run の最後の日を基準に消す
+  ...Object.fromEntries(AMAZON_AI_MIRROR_ENTITIES.map((spec) => [spec.entity, {
+    contract_version: AMAZON_AI_CONTRACT_VERSION,
+    mirror_table: spec.table,
+    clear_strategy: 'date_range',
+    clear_meta_key: spec.clearMetaKey,
+    clear_date_col: spec.dateCol,
+    retention: spec,
+    getInsertStmt: (db) => getRakutenDdInsert(db, spec.entity),
+    normalizeRow: (r) => normalizeRakutenDdRow(spec.entity, r),
+  }])),
 
   // ─── MF Phase 1a (Codex 5ラウンド確定設計) ─────────────────────────
   // 受信順序契約 (sync-to-render.js 側で保証):
@@ -2320,6 +2346,13 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
   if (SKU_MAP_ENTITY_NAMES.has(entity) && skuMapInitError) {
     return res.status(503).json({ error: 'sku map tables init failed', init_error: skuMapInitError });
   }
+  if (AMAZON_AI_ENTITY_NAMES.has(entity) && amazonAiInitError) {
+    return res.status(503).json({ error: 'amazon ai tables init failed', init_error: amazonAiInitError });
+  }
+  // retention の基準は scope_to。未来の日付 (送り手の時計の狂い) で残すべき行を消さない (JST の明日まで)
+  if (entityCfg.retention && scope_to > addDaysYmd(new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10), 1)) {
+    return res.status(400).json({ error: 'scope_to_in_future', message: `entity=${entity} の scope_to=${scope_to} が未来 (古い行を消す基準にするため断る)` });
+  }
   if (contract_version !== entityCfg.contract_version) {
     return res.status(400).json({
       error: 'contract_version_mismatch',
@@ -2439,6 +2472,17 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
   // no_clear (MF 等) は独自の finalize 契約があるため対象外。
   const useStaging = clearStrategy === 'date_range' && chunk_count > 1;
 
+  // 日ごとの置き換えの日付の列 (既定 date_jst。Amazon AI の返品 = return_date_jst など)。名前はレジストリの定数だけ (送り手の値を SQL に入れない)
+  const clearDateCol = entityCfg.clear_date_col || 'date_jst';
+  // retention (Amazon AI の表): 残す日数より古い行を、この run の最後の日 (scope_to) を基準に消す。clear と同じ取引の中で呼ぶ。
+  //   決まりは lib/amazon-ai-mirror.js の isKeptDate と同じ (送り手は残らない日の行を送らない)
+  const pruneRetention = () => {
+    if (!entityCfg.retention) return 0;
+    const spec = entityCfg.retention;
+    const { keepFrom, recentFrom } = retentionBounds(spec, scope_to);
+    return db.prepare(retentionDeleteSql(spec)).run(spec.keepRecentDays ? { keepFrom, recentFrom } : { keepFrom }).changes;
+  };
+
   // 全 chunk 到着時に呼ぶ: scope DELETE → stage 全行 INSERT → stage 掃除 → applied マーカー。
   // 呼び出し元 tx 内で実行される (単一 tx で「clear済+部分データ」を外部に見せない)。
   // 既 applied なら null (chunk 再送 replay での二重 apply 防止)。
@@ -2463,18 +2507,19 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
     }
     const dates = JSON.parse(metaRow.clear_dates_json);
     const placeholders = dates.map(() => '?').join(',');
-    const clearedRows = db.prepare(`DELETE FROM ${entityCfg.mirror_table} WHERE date_jst IN (${placeholders})`).run(...dates).changes;
+    const clearedRows = db.prepare(`DELETE FROM ${entityCfg.mirror_table} WHERE ${clearDateCol} IN (${placeholders})`).run(...dates).changes;
     const stageRows = db.prepare(`SELECT row_json FROM sync_stage_rows WHERE run_id = ? AND entity = ? ORDER BY chunk_index, row_idx`).all(sync_run_id, entity);
     for (const s of stageRows) {
       insertStmt.run(entityCfg.normalizeRow(JSON.parse(s.row_json)));
     }
+    const prunedRows = pruneRetention();
     db.prepare(`DELETE FROM sync_stage_rows WHERE run_id = ? AND entity = ?`).run(sync_run_id, entity);
     db.prepare(`DELETE FROM sync_stage_meta WHERE run_id = ? AND entity = ?`).run(sync_run_id, entity);
     db.prepare(`INSERT INTO sync_run_applied (run_id, entity, applied_at, cleared_rows, applied_rows) VALUES (?,?,?,?,?)`)
       .run(sync_run_id, entity, now, clearedRows, stageRows.length);
     // ledger: staged 中は applied_at=NULL で受信記録のみ。live 反映が確定したここで一括更新
     db.prepare(`UPDATE sync_run_chunks SET applied_at = ? WHERE run_id = ? AND entity = ?`).run(now, sync_run_id, entity);
-    return { clearedRows, appliedRows: stageRows.length };
+    return { clearedRows, appliedRows: stageRows.length, ...(entityCfg.retention ? { prunedRows } : {}) };
   };
 
   let result;
@@ -2558,7 +2603,7 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
           } else {
             const placeholders = clearDates.map(() => '?').join(',');
             clearedRows = db.prepare(`
-              DELETE FROM ${entityCfg.mirror_table} WHERE date_jst IN (${placeholders})
+              DELETE FROM ${entityCfg.mirror_table} WHERE ${clearDateCol} IN (${placeholders})
             `).run(...clearDates).changes;
             didClear = true;
           }
@@ -2676,6 +2721,8 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
           insertStmt.run(entityCfg.normalizeRow(r));
         }
       }
+      // retention (Amazon AI の表): single-chunk run は clear と同じ取引でここで消す (staged run は applyStagedRun の中)
+      const prunedRows = didClear && entityCfg.retention ? pruneRetention() : null;
       // full_snapshot の世代を確定 (この tx が commit されて初めて「適用済み」になる)
       if (is_first && clearStrategy === 'full_snapshot') {
         db.prepare(`INSERT INTO mirror_snapshot_generations (entity, generation, run_id, row_count, applied_at)
@@ -2704,7 +2751,7 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
         if (received === chunk_count) appliedNow = applyStagedRun();
       }
 
-      result = { applied: true, didClear, clearedRows, staged: useStaging, appliedNow };
+      result = { applied: true, didClear, clearedRows, staged: useStaging, appliedNow, prunedRows };
     }).immediate();  // BEGIN IMMEDIATE で write 直列化 (cross-process 安全)
   } catch (e) {
     if (e instanceof HttpError) {
@@ -2723,7 +2770,9 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
   const stagedInfo = result.staged
     ? (result.appliedNow ? ` staged_apply=${result.appliedNow.appliedRows}rows/cleared=${result.appliedNow.clearedRows}` : ' staged')
     : ` cleared=${result.didClear ? result.clearedRows : 'no'}`;
-  console.log(`[Mirror] sync chunk applied req=${requestId} entity=${entity} run=${sync_run_id} chunk=${chunk_index}/${chunk_count} rows=${rows.length}${stagedInfo}`);
+  const prunedCount = result.prunedRows ?? result.appliedNow?.prunedRows ?? null;
+  const prunedInfo = prunedCount === null ? '' : ` pruned=${prunedCount}`;
+  console.log(`[Mirror] sync chunk applied req=${requestId} entity=${entity} run=${sync_run_id} chunk=${chunk_index}/${chunk_count} rows=${rows.length}${stagedInfo}${prunedInfo}`);
 
   // ────────── 5. is_last なら欠番チェック ──────────
   if (is_last) {
@@ -2748,6 +2797,7 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
       ok: true, request_id: requestId, sync_run_id, entity, status: 'completed',
       chunks_received: present.length, expected: chunk_count, rows_received: totalRows,
       staged_apply: result.appliedNow || undefined,
+      ...(prunedCount === null ? {} : { pruned_rows: prunedCount }),
     });
   }
 

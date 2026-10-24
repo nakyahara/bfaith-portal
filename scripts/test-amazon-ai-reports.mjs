@@ -400,7 +400,7 @@ await t('再通知の間隔: 送った記録から 7 日のあいだは外す・
 });
 
 console.log('daily-sync への組み込み (見張りの後・DBバックアップの前)');
-const AI_FILES = ['fetch-amazon-sales-traffic.js', 'fetch-amazon-returns.js', 'fetch-amazon-reimbursements.js', 'fetch-amazon-ledger.js', 'monitor-amazon-returns.js'];
+const AI_FILES = ['fetch-amazon-sales-traffic.js', 'fetch-amazon-returns.js', 'fetch-amazon-reimbursements.js', 'fetch-amazon-ledger.js', 'monitor-amazon-returns.js', 'monitor-amazon-reimb-gap.js'];
 await t('1 つの塊 (見出しのコメントで囲む) で 見張りの後・DBバックアップの前 (あいだに別の段なし)・前の置き場所 (カート価格の後) に残っていない・spResult はその位置で見える', () => {
   const ds = fs.readFileSync(path.join(ROOT, 'apps/warehouse/daily-sync.js'), 'utf8').replace(/\r\n/g, '\n');
   const iHead = ds.indexOf('  // ── Amazon AI 分析用のレポート (設計 28 の外・2026-10-22)');
@@ -412,7 +412,10 @@ await t('1 つの塊 (見出しのコメントで囲む) で 見張りの後・D
   const between = ds.slice(iWatch, iHead).split('\n').slice(1).join('\n')
     .replace(/  \/\/ ── Amazon AI 分析用の出品・カート・BSR \(2026-10-22\)[\s\S]*?  \/\/ ── Amazon AI 分析用の出品・カート・BSR ここまで[^\n]*\n?/, '');
   assert.doesNotMatch(between, /runScript\(|results\.push\(/);
-  assert.doesNotMatch(ds.slice(iTail, iBackup), /runScript\(|results\.push\(/);
+  // この塊と DBバックアップのあいだに置いてよいのは、この塊の表を Render へ送る段 (2026-10-24・sync-amazon-ai-mirror.js) だけ
+  const afterTail = ds.slice(iTail, iBackup).split('\n').slice(1).join('\n')
+    .replace(/  \/\/ ── Amazon AI 分析用の表を Render の mirror へ \(2026-10-24[\s\S]*?  \/\/ ── Amazon AI 分析用の表を Render の mirror へ ここまで[^\n]*\n?/, '');
+  assert.doesNotMatch(afterTail, /runScript\(|results\.push\(/);
   for (const f of AI_FILES) assert.equal(ds.split(`'apps/warehouse/${f}`).length - 1, 1, `${f} が塊の外にもある / 無い`);
   // spResult は main の同じ深さ (塊の位置まで括弧が閉じない) で宣言されている
   const iSp = ds.indexOf("const spResult = runScript('apps/warehouse/sp-api-orders.js'");
@@ -422,17 +425,21 @@ await t('1 つの塊 (見出しのコメントで囲む) で 見張りの後・D
   for (const c of code) { if (c === '{') depth++; else if (c === '}') { depth--; min = Math.min(min, depth); } }
   assert.deepEqual([depth, min], [0, 0]);
 });
-await t('SP-API の主取得が成功した朝だけ・引数つき・返品のアラートは返品の取得が成功した朝だけ・失敗の朝は ⏭️・写しの反映が違う朝も止めない工程 (publish-gate)', async () => {
+await t('SP-API の主取得が成功した朝だけ・引数つき・返品のアラートは返品の取得が成功した朝だけ・補てん漏れのアラートは補てんと台帳の両方が取れた朝だけ・失敗の朝は ⏭️・写しの反映が違う朝も止めない工程 (publish-gate)', async () => {
   const ds = fs.readFileSync(path.join(ROOT, 'apps/warehouse/daily-sync.js'), 'utf8').replace(/\r\n/g, '\n');
   const all = ds.slice(ds.indexOf('  // ── Amazon AI 分析用のレポート'), ds.indexOf('  // ── ここまで Amazon AI 分析用のレポート'));
   const iBlock = all.indexOf('if (spResult.success) {');
   const iElse = all.indexOf("} else {\n    console.log('[DailySync] SP-API 失敗のため Amazon のアクセス");
   assert.ok(iBlock > 0 && iElse > iBlock);
   const block = all.slice(iBlock, iElse);
-  for (const s of ['fetch-amazon-sales-traffic.js --days 5', 'fetch-amazon-returns.js --days 60', 'fetch-amazon-reimbursements.js --days 60', 'fetch-amazon-ledger.js --days 30', 'monitor-amazon-returns.js --daily']) {
+  for (const s of ['fetch-amazon-sales-traffic.js --days 5', 'fetch-amazon-returns.js --days 60', 'fetch-amazon-reimbursements.js --days 60', 'fetch-amazon-ledger.js --days 30', 'monitor-amazon-returns.js --daily', 'monitor-amazon-reimb-gap.js --daily']) {
     assert.ok(block.includes(`'apps/warehouse/${s}'`), s);
   }
   assert.ok(block.indexOf('if (returnsResult.success)') < block.indexOf('monitor-amazon-returns.js'));
+  // 補てん漏れのアラートは 補てんと台帳の取得の後・両方が成功した朝だけ (2026-10-24)
+  const iGap = block.indexOf("'apps/warehouse/monitor-amazon-reimb-gap.js --daily'");
+  assert.ok(block.indexOf('fetch-amazon-reimbursements.js') < iGap && block.indexOf('fetch-amazon-ledger.js') < iGap);
+  assert.ok(block.lastIndexOf('if (reimbResult.success && ledgerResult.success) {', iGap) > block.indexOf('fetch-amazon-ledger.js'));
   assert.match(all.slice(iElse), /'Amazonアクセス・転換率', 'Amazon返品', 'Amazon補てん', 'Amazon在庫台帳'/);
   const G = await import('../apps/warehouse/publish-gate.js');
   for (const f of AI_FILES) {

@@ -11,6 +11,7 @@
 //   (business_date, category) 行の存在自体を完了マーカーとみなす (行は同期時に必ず書かれる)
 
 import { jstDateStr } from '../../lib/jst-date.js';
+import { buildAmazonHealthFacts, amazonHealthSuppressReason } from './facts-amazon.js';
 
 export const INPUT_SCHEMA_VERSION = '1.0';
 
@@ -656,6 +657,13 @@ export function buildWeeklyReportInput(db, opts = {}) {
     inventory: buildInventoryFacts(db, periodStart, periodEnd),
     po: buildPoFacts(db),
     mf: buildMfFacts(db, periodStart, periodEnd),
+    // Amazon の健康状態 (アクセス・出品・カート・返品・補てん・BSR・長期保管料・広告)。項目ごとに ok / no_data (facts-amazon.js)
+    amazon_health: buildAmazonHealthFacts(db, {
+      periodStart, periodEnd, granularity: 'week',
+      prevStart: addDaysYmd(periodStart, -7),
+      baseline: [1, 2, 3, 4].map((w) => [addDaysYmd(periodStart, -7 * w), addDaysYmd(periodStart, -7 * (w - 1))]),
+      suppressReason: amazonHealthSuppressReason(constraints),
+    }),
   };
   input.events = buildEventFacts(db, periodStart, periodEnd);
   input.budget = buildBudgetFacts(db, periodStart, periodEnd);
