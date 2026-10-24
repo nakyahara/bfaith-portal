@@ -23,6 +23,10 @@
  *   env: MALL_FETCH_ONLY=rakuten でモール絞り込み (カンマ区切り)
  *        MALL_FETCH_RETRY_DELAY_MS リトライまでの待ち (既定25分。0でリトライ無効)
  *
+ * 最後の回の結果 (モールごとの終了コード) は logs/fetch-all-last.json に残す (lib-fetch-status.mjs)。
+ *   daily-sync の「データの新しさ」(apps/warehouse/monitor-data-freshness.js) が読み、exit 3 を毎朝の要約に ⚠️ で出す
+ *   (2026-10-23: ログイン切れの exit 3 が何週間も朝のまとめに出ていなかった)。終了コードの意味・再試行・通知は変えていない
+ *
  * exit code: 0=全モール成功 / 1=いずれか失敗 (全モール実行は完了)
  * 子スクリプトの exit code 契約: 0=成功 / 1=業務エラー(リトライ可) / 2=env不備 /
  *   3=手動対応必須 (2FA_REQUIRED等。リトライしても直らない)
@@ -33,6 +37,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import './lib-env.mjs'; // 設定はリポジトリ直下の .env だけ (lib-env.mjs)
 import { initRunLog, sendGChat, buildErrorReport, LOG_DIR } from './lib-notify.mjs';
+import { buildFetchStatus, writeFetchStatus } from './lib-fetch-status.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, '..', '..');
@@ -226,6 +231,11 @@ async function main() {
 
   const failed = results.filter((r) => r.code !== 0);
   console.log(`\n=== summary: ${results.map((r) => `${r.mall}=${fmtStatus(r)}`).join(' / ')} ===`);
+
+  // 最後の回の結果をファイルに残す (daily-sync の「データの新しさ」が exit 3 = ログイン切れを毎朝の要約に出す。lib-fetch-status.mjs)。
+  // 🚨 書けなくても終了コード・通知は変えない
+  const st = writeFetchStatus(buildFetchStatus(results, { only }));
+  if (!st.ok) console.warn(`[status] 最後の回の結果を書けない (${st.file}): ${st.error}`);
 
   // 子が自力通知できないケースだけランナーが通知 (exit 1=業務エラー / 2=env不備 / 3=blocked は
   // 子が詳細通知済み → 二重通知しない。実機 2026-07-09 で exit2 の二重通知を確認して除外追加)
