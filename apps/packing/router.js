@@ -48,6 +48,9 @@ import { listNouhinCsvFiles, downloadNouhinCsv, driveCall } from './drive.js';
 // 商品画像は picking の楽天白抜きキャッシュ (pk_product_images) を共通部品として流用 (要件§7.1)
 import { getImageMap, queueEnsureImages } from '../picking/images.js';
 import { neNamesFor } from './ne-names.js';
+// 🆕 梱包指示の写し (入れ方の写真と注意点・正 = Render の Company DB の 0101・中原さん 2026-10-23)
+import { guidesFor, guideSyncStatus, guidePhotoFile, guideSyncEnabled, enqueueGuidePhoto, sendGuideUploads, guideUploadsFor } from './guide-sync.js';
+import { normSku } from '../../lib/sku-norm.js';
 // 梱包資材の表示・現場登録 (要件 = AI_reference『梱包資材表示_要件定義_20260823.md』v1.7)
 import {
   materialsForState, materialOptions, registerMaterial, undoMaterial,
@@ -416,6 +419,15 @@ async function decorateSlips(state) {
       l.ne_set_unresolved = !!info?.isSet;   // セットだが展開失敗 → CSV名 (セット名の可能性) を出さない
     }
   }
+  // 🆕 梱包指示 (入れ方の写真・注意点)。明細の商品と、セットを展開した構成品の両方で引く (写しが読めない = 出さない・梱包は止めない)
+  const compSkus = state.slips.flatMap((s) => s.lines.flatMap((l) => (l.ne_comps || []).map((c) => c.sku)));
+  const guides = guidesFor([...skus, ...compSkus]);
+  state.guides = Object.fromEntries(guides);
+  for (const s of state.slips) {
+    for (const l of s.lines) {
+      l.guide_keys = [...new Set([l.sku, ...(l.ne_comps || []).map((c) => c.sku)].map(normSku))].filter((k) => guides.has(k));
+    }
+  }
   return state;
 }
 
@@ -462,6 +474,9 @@ router.get('/work/:id(\\d+)', async (req, res, next) => {
       materials,                       // seq → 資材判定 (null = fail-soft)
       materialOpts,                    // { materials: [...], candidateCodes: [...] }
       materialUndoSec: MATERIAL_UNDO_SEC,
+      guideSync: guideSyncStatus(),    // 🆕 梱包指示の写しの取得の様子 (古いかも = 画面に小さく出す)
+      // 🆕 撮った写真の送り待ち・断られたもの (商品ごと)
+      guideUploads: guideUploadsFor(state.slips.flatMap((s) => s.lines.flatMap((l) => [l.sku, ...(l.ne_comps || []).map((c) => c.sku)]))),
     });
   } catch (e) { next(e); }
 });
@@ -858,6 +873,16 @@ router.get('/materials/:file([a-z0-9_-]+\\.(?:jpg|jpeg|png|webp))', (req, res) =
   res.sendFile(file);
 });
 
+/** 🆕 梱包指示の写真の配信 (端末認証の内側・名前 = 中身の sha256 = immutable)。写しは apps/packing/guide-sync.js */
+router.get('/guide-photos/:sha([0-9a-f]{64})\\.jpg', (req, res) => {
+  const file = guidePhotoFile(req.params.sha);
+  if (!file || !fs.existsSync(file)) return res.status(404).send('not found');
+  res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.type('image/jpeg');
+  res.sendFile(file);
+});
+
 /** 登録・変更グリッド用の資材一覧 (active・分類候補コード付き)。 */
 router.get('/api/batches/:id(\\d+)/material-options', api(async (req, res) => {
   const batch = getPackBatch(Number(req.params.id));
@@ -993,6 +1018,58 @@ router.get('/api/batches/:id(\\d+)/images', api(async (req, res) => {
     if (hit?.url) bySku[sku] = hit.url;
   }
   res.json({ ok: true, images: bySku });
+}));
+
+// ─── 🆕 梱包指示 (2 段目: 梱包の画面のカメラで撮って登録・中原さん 2026-10-23「責任者の確認は要らない」) ───
+//   iPad → ここ (すぐ送り待ちに残す) → Render の Company DB (guide-sync.js sendGuideUploads)。iPad は Render の鍵を持たない
+const uploadGuidePhoto = multer({ storage: multer.memoryStorage(), limits: { fileSize: 12 * 1024 * 1024, files: 1, fields: 10 } });
+
+/** バッチの梱包指示の今 (撮った後の取り直し): { guides, sync, uploads } (鍵 = 商品コードの小文字) */
+router.get('/api/batches/:id(\\d+)/guides', api(async (req, res) => {
+  const state = await decorateSlips(getWorkState(Number(req.params.id)));
+  const codes = [...new Set(state.slips.flatMap((s) => s.lines.flatMap((l) => [l.sku, ...(l.ne_comps || []).map((c) => c.sku)])))];
+  // 明細の商品コード → 指示のある鍵 (撮って新しく指示ができた商品も、画面の明細に印が付くように)
+  const keysBySku = {};
+  for (const s of state.slips) for (const l of s.lines) keysBySku[l.sku] = l.guide_keys || [];
+  res.json({ ok: true, guides: state.guides || {}, keysBySku, sync: guideSyncStatus(), uploads: guideUploadsFor(codes) });
+}));
+
+/**
+ * 撮った写真を登録する。multipart: photo (JPEG・画面が長辺 1600px に縮めたもの) + op_id・sku・caption?・worker_name・batch_id
+ *   すぐ送り待ちに残して、その場で 1 回送る (20 秒まで待つ)。答え = { ok, status: sent | pending | failed, position?, error? }
+ *   pending = 通信できない (後で送る)・failed = 断られた (3 枚ある・単品でない・Company DB に無い …)
+ */
+router.post('/api/guide-photos', checkOrigin, (req, res, next) => {
+  uploadGuidePhoto.single('photo')(req, res, (err) => {
+    if (err) return res.status(400).json({ error: `写真を受け取れませんでした: ${err.message}`, code: 'bad_upload' });
+    next();
+  });
+}, api(async (req, res) => {
+  if (!guideSyncEnabled()) throw new PackError(503, 'guide_disabled', '梱包指示の登録はまだ設定されていません (PACKING_GUIDE_KEY)');
+  const name = String(req.body.worker_name || '').trim();
+  if (!name || !listWorkers().some((w) => w.name === name)) throw new PackError(400, 'bad_worker', '作業者が無効です。選び直してください');
+  const opId = String(req.body.op_id || '');
+  if (!/^[A-Za-z0-9_-]{8,80}$/.test(opId)) throw new PackError(400, 'bad_op_id', 'op_id が不正です');
+  const sku = String(req.body.sku || '').trim();
+  if (!sku || sku.length > 80 || /[\u0000-\u001F\u007F]/.test(sku)) throw new PackError(400, 'bad_sku', '商品コードが不正です');
+  const caption = String(req.body.caption || '').replace(/[\r\n\t]+/g, ' ').replace(/[\u0000-\u001F\u007F]/g, '').trim();
+  if (caption.length > 100) throw new PackError(400, 'bad_caption', '一言は 100 字までにしてください');
+  const batchId = /^\d{1,12}$/.test(String(req.body.batch_id || '')) ? Number(req.body.batch_id) : null;
+  if (sniffImage(req.file?.buffer) !== 'jpg') throw new PackError(400, 'bad_image', '写真 (JPEG) を受け取れませんでした。撮り直してください');
+  try {
+    enqueueGuidePhoto({ opId, sku, caption, worker: name, batchId, jpeg: req.file.buffer });
+  } catch (e) {
+    if (e?.code === 'request_reused') throw new PackError(409, 'request_reused', e.message);
+    throw e;
+  }
+  // その場で 1 回送る (遅い = 送り待ちのまま返す。送り待ちは数分ごとに送る)
+  let timer;
+  const v = await Promise.race([
+    sendGuideUploads({ opId }),
+    new Promise((ok) => { timer = setTimeout(() => ok(null), 20_000); }),
+  ]).finally(() => clearTimeout(timer));
+  const st = v || { status: 'pending' };
+  res.json({ ok: st.status !== 'failed', status: st.status, sku: st.sku ?? sku, position: st.position ?? null, error: st.error || null });
 }));
 
 // ─── 日次サマリ (管理者) ───

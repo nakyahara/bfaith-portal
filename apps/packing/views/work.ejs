@@ -163,6 +163,39 @@
     .toast.show { opacity: 0.95; }
     .offline-dot { width: 10px; height: 10px; border-radius: 50%; background: #2b8a3e; }
     .offline-dot.ng { background: #e03131; }
+
+    /* ── 🆕 梱包指示 (入れ方の写真・注意点。正 = Company DB・写し = apps/packing/guide-sync.js) ── */
+    .guide-box { border: 3px solid #f08c00; background: #fff9db; border-radius: 12px; padding: 10px 12px; margin-bottom: 10px; }
+    .guide-box + .guide-box { margin-top: -2px; }
+    .guide-h { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; font-size: 18px; font-weight: 800; color: #e8590c; margin-bottom: 6px; }
+    .guide-h small { font-size: 14px; font-weight: 600; color: #495057; }
+    .guide-note { white-space: pre-wrap; font-size: 19px; font-weight: 700; line-height: 1.45; color: #212529; margin: 2px 0 8px; }
+    .guide-photos { display: flex; gap: 10px; overflow-x: auto; }
+    .guide-ph { flex: 0 0 auto; width: 150px; border: 1px solid #ced4da; border-radius: 10px; background: #fff; padding: 4px; cursor: pointer; text-align: left; font: inherit; }
+    .guide-ph img { display: block; width: 100%; height: 120px; object-fit: contain; background: #f1f3f5; border-radius: 6px; }
+    .guide-ph .gcap { display: flex; gap: 6px; align-items: flex-start; font-size: 14px; font-weight: 600; margin-top: 4px; line-height: 1.3; }
+    .guide-no { flex: 0 0 auto; min-width: 22px; height: 22px; border-radius: 11px; background: #e8590c; color: #fff; font-size: 13px; font-weight: 800;
+      display: inline-flex; align-items: center; justify-content: center; }
+    .guide-stale { font-size: 13px; color: #868e96; margin-top: 4px; }
+    .guide-tag { display: inline-block; margin-left: 6px; padding: 1px 8px; border-radius: 10px; background: #fff3bf; border: 1px solid #f08c00; color: #e8590c; font-size: 13px; font-weight: 700; vertical-align: 2px; }
+    #guideOverlay .gbig { background: #fff; border-radius: 14px; padding: 12px; width: min(960px, 96vw); max-height: 94vh; display: flex; flex-direction: column; gap: 8px; }
+    #guideOverlay .gbig img { width: 100%; max-height: 74vh; object-fit: contain; background: #000; border-radius: 8px; }
+    #guideOverlay .gbig-cap { font-size: 20px; font-weight: 700; display: flex; gap: 8px; align-items: center; }
+    #guideOverlay .gbig-nav { display: flex; gap: 10px; justify-content: space-between; }
+    #guideOverlay .gbig-nav button { flex: 1; padding: 14px 8px; font-size: 18px; font-weight: 700; border: 1px solid #ced4da; border-radius: 12px; background: #f8f9fa; cursor: pointer; }
+    #guideOverlay .gbig-nav button:disabled { opacity: 0.35; }
+    /* 撮って登録 (2 段目) */
+    .guide-cam { margin-left: 8px; padding: 4px 10px; min-height: 34px; border: 1px solid #adb5bd; border-radius: 10px; background: #fff; color: #495057; font-size: 14px; font-weight: 700; cursor: pointer; vertical-align: 1px; }
+    .guide-wait { display: inline-block; margin-left: 6px; font-size: 13px; color: #1971c2; font-weight: 700; }
+    .guide-fail { font-size: 14px; color: #c92a2a; font-weight: 700; margin-top: 4px; }
+    #guideCamOverlay .box, #guidePickOverlay .box { text-align: left; }
+    #guideCamPreview { display: block; width: 100%; max-height: 52vh; object-fit: contain; background: #000; border-radius: 8px; margin: 8px 0; }
+    #guideCamCaption { width: 100%; font-size: 18px; padding: 10px; border: 1px solid #ced4da; border-radius: 10px; box-sizing: border-box; }
+    .gcam-btns { display: flex; gap: 10px; margin-top: 12px; }
+    .gcam-btns button { flex: 1; padding: 14px 8px; font-size: 18px; font-weight: 700; border: 1px solid #ced4da; border-radius: 12px; background: #f8f9fa; cursor: pointer; }
+    .gcam-btns button.pri { background: #e8590c; border-color: #e8590c; color: #fff; }
+    .gcam-btns button:disabled { opacity: 0.5; }
+    .gpick-opt { display: block; width: 100%; text-align: left; padding: 14px 12px; margin-bottom: 8px; font-size: 18px; font-weight: 700; border: 1px solid #ced4da; border-radius: 12px; background: #f8f9fa; cursor: pointer; }
   </style>
 </head>
 <body>
@@ -221,6 +254,43 @@
       <button class="btn-prev" id="prevBtn" type="button">◂ 前へ</button>
     </div>
     <button class="btn-next" id="nextBtn" type="button">次へ ▸</button>
+  </div>
+
+  <%# 🆕 梱包指示の写真を大きく見る (押すと開く・閉じる / 前 / 次) %>
+  <div class="overlay" id="guideOverlay" role="dialog" aria-modal="true" aria-label="梱包指示の写真">
+    <div class="gbig">
+      <div class="gbig-cap"><span class="guide-no" id="guideBigNo">1</span><span id="guideBigCap"></span></div>
+      <img id="guideBigImg" alt="">
+      <div class="gbig-nav">
+        <button type="button" id="guideBigPrev">◀ 前の写真</button>
+        <button type="button" id="guideBigClose">閉じる</button>
+        <button type="button" id="guideBigNext">次の写真 ▶</button>
+      </div>
+    </div>
+  </div>
+
+  <%# 🆕 撮って登録 (2 段目): 相手の商品を選ぶ (セットを展開した明細) → 撮る → 確かめて登録 %>
+  <input type="file" id="guideCamInput" accept="image/*" capture="environment" hidden>
+  <div class="overlay" id="guidePickOverlay" role="dialog" aria-modal="true" aria-labelledby="guidePickTitle">
+    <div class="box">
+      <h2 id="guidePickTitle">どの商品の梱包写真ですか？</h2>
+      <div id="guidePickList"></div>
+      <div class="gcam-btns"><button type="button" id="guidePickCancel">やめる</button></div>
+    </div>
+  </div>
+  <div class="overlay" id="guideCamOverlay" role="dialog" aria-modal="true" aria-labelledby="guideCamTitle">
+    <div class="box">
+      <h2 id="guideCamTitle" style="text-align:left">梱包写真を登録</h2>
+      <div id="guideCamTarget" style="font-size:16px; font-weight:700;"></div>
+      <img id="guideCamPreview" alt="撮った写真">
+      <input type="text" id="guideCamCaption" maxlength="100" placeholder="一言 (例: 底に緩衝材) — なくてもよい">
+      <div style="font-size:13px; color:#868e96; margin-top:6px;">写真は「入れ方の例」として、この商品の梱包指示に足されます (3 枚まで)。すぐに使われます。</div>
+      <div class="gcam-btns">
+        <button type="button" id="guideCamCancel">やめる</button>
+        <button type="button" id="guideCamRetake">撮り直す</button>
+        <button type="button" class="pri" id="guideCamOk">登録する</button>
+      </div>
+    </div>
   </div>
 
   <div class="overlay" id="workerOverlay">
@@ -391,6 +461,10 @@
       materials: typeof materials === 'undefined' ? null : materials,
       materialOpts: typeof materialOpts === 'undefined' ? null : materialOpts,
       materialUndoSec: typeof materialUndoSec === 'undefined' ? 15 : materialUndoSec,
+      // 🆕 梱包指示 (このバッチの商品の分だけ・鍵 = 商品コードの小文字) と、写しの取得の様子
+      guides: state.guides || {},
+      guideSync: typeof guideSync === 'undefined' ? null : guideSync,
+      guideUploads: typeof guideUploads === 'undefined' ? {} : guideUploads,
       shipChangeReasons: typeof shipChangeReasons === 'undefined' ? [] : shipChangeReasons,
       lastDoneSeq: state.slips.filter((x) => x.status === 'done')
         .sort((a, b) => (a.done_at || '').localeCompare(b.done_at || '') || a.seq - b.seq)
@@ -408,6 +482,10 @@
           // CSV名へ戻さず未解決表示。API不達/未登録はCSVの「商品名」列 (=NE単品名) へ。
           // 印字商品名 (モール名・セットSEO長文) は表示に一切使わない
           sku: l.sku, qty: l.qty, imageUrl: l.imageUrl,
+          guideKeys: l.guide_keys || [],   // 🆕 梱包指示がある商品 (この商品・セットを展開した構成品) の鍵 = GUIDES の鍵
+          // 🆕 写真を撮って登録する相手 (セットを展開した = 構成品から選ぶ / ふつう = この商品)
+          guideTargets: (l.ne_comps && l.ne_comps.length ? l.ne_comps.map((c) => ({ sku: c.sku, name: c.name }))
+            : [{ sku: l.sku, name: l.ne_name || l.product_name || l.sku }]),
           name: l.ne_name || (l.ne_set_unresolved ? '⚠ 商品名未解決 (セット構成を確認)' : (l.product_name || '(商品名なし)')),
           shortName: l.short_name,   // 送り状備考1 = 読み上げ短縮名の第一候補 (要件§5.3)
         })),
@@ -507,6 +585,206 @@
       showToast._t = setTimeout(() => $('toast').classList.remove('show'), 2500);
     }
 
+    // ── 🆕 梱包指示 (入れ方の写真・注意点) ──
+    //   伝票の商品 (セットは構成品) に指示があれば、宛先の上に橙の枠で出す。写真を押すと大きく見る (前 / 次)
+    //   写真は「入れ方の例」(使う資材は上の資材カードが正)。写しが古いかも = 枠の下に小さく出す
+    const GUIDES = STATE.guides || {};
+    let guideView = null;   // 大きく見ている写真 { photos, i }
+    // 写しの古さは「今」から数え直す (開いたときの値のままにしない = 開きっぱなしの画面でも古いと分かる・Codex 第 1 段階レビュー 中)
+    const GUIDE_STALE_MIN = 30;
+    /** 最後に取れてから何分 (取りに行かない設定 = undefined・一度も取れていない = null) */
+    function guideAgeMin() {
+      const sync = STATE.guideSync;
+      if (!sync || !sync.enabled) return undefined;
+      const t = Date.parse(sync.okAt || '');
+      return Number.isFinite(t) ? Math.max(0, Math.floor((Date.now() - t) / 60000)) : null;
+    }
+    /** 古さの一言 (古くない・取りに行かない = 空) */
+    function guideStaleText() {
+      const age = guideAgeMin();
+      if (age === undefined || (age !== null && age <= GUIDE_STALE_MIN)) return '';
+      return `⚠ 梱包指示の写しは ${age == null ? 'まだ一度も取れていません' : `${age} 分前に取ったものです`} (新しい指示が出ていないかもしれません)`;
+    }
+    /** 古さの一言だけを今の時刻で書き直す (通信できなくても・画面全体は描き直さない = スクロールも保つ・Codex 第 2 段階レビュー 中) */
+    function updateGuideStale() {
+      const t = guideStaleText();
+      for (const el of document.querySelectorAll('[data-guide-stale]')) { el.textContent = t; el.hidden = !t; }
+    }
+    function guideKeysOf(s) { return [...new Set(s.lines.flatMap((l) => l.guideKeys || []))].filter((k) => GUIDES[k]); }
+    function guideHtml(s) {
+      const keys = guideKeysOf(s);
+      if (!keys.length) return '';
+      const t = guideStaleText();
+      const stale = `<div class="guide-stale" data-guide-stale${t ? '' : ' hidden'}>${esc(t)}</div>`;
+      return keys.map((k) => {
+        const g = GUIDES[k];
+        const photos = (g.photos || []).map((p, i) => `
+          <button type="button" class="guide-ph" data-guide="${esc(k)}" data-i="${i}" aria-label="写真 ${i + 1} を大きく見る">
+            <img src="${esc(p.url)}" alt="入れ方の写真 ${i + 1}" loading="lazy">
+            <div class="gcap"><span class="guide-no">${i + 1}</span><span>${esc(p.caption || '')}</span></div>
+          </button>`).join('');
+        return `<div class="guide-box">
+          <div class="guide-h">📷 梱包指示 <small>${esc(g.name || g.code)} · ${esc(g.code)}</small></div>
+          ${g.note ? `<div class="guide-note">${esc(g.note)}</div>` : ''}
+          ${photos ? `<div class="guide-photos">${photos}</div>` : ''}
+          ${stale}
+        </div>`;
+      }).join('');
+    }
+    function showGuidePhoto() {
+      const { photos, i } = guideView;
+      const p = photos[i];
+      $('guideBigImg').src = p.url;
+      $('guideBigImg').alt = `入れ方の写真 ${i + 1}`;
+      $('guideBigNo').textContent = i + 1;
+      $('guideBigCap').textContent = p.caption || '';
+      $('guideBigPrev').disabled = i === 0;
+      $('guideBigNext').disabled = i === photos.length - 1;
+    }
+    document.addEventListener('click', (e) => {
+      const b = e.target && e.target.closest && e.target.closest('.guide-ph');
+      if (!b) return;
+      const g = GUIDES[b.dataset.guide];
+      if (!g || !g.photos || !g.photos.length) return;
+      guideView = { photos: g.photos, i: Math.min(Number(b.dataset.i) || 0, g.photos.length - 1) };
+      showGuidePhoto();
+      $('guideOverlay').style.display = 'flex';
+    });
+    $('guideBigClose').addEventListener('click', () => { $('guideOverlay').style.display = 'none'; guideView = null; });
+    $('guideOverlay').addEventListener('click', (e) => { if (e.target === $('guideOverlay')) { $('guideOverlay').style.display = 'none'; guideView = null; } });
+    $('guideBigPrev').addEventListener('click', () => { if (guideView && guideView.i > 0) { guideView.i--; showGuidePhoto(); } });
+    $('guideBigNext').addEventListener('click', () => { if (guideView && guideView.i < guideView.photos.length - 1) { guideView.i++; showGuidePhoto(); } });
+
+    // ── 🆕 撮って登録 (2 段目・中原さん 2026-10-23「梱包システムからもカメラでそのまま登録」「責任者の確認は要らない」) ──
+    //   明細の「📷 梱包写真を登録」→ (セットを展開した明細 = 構成品を選ぶ) → カメラ → 縮める (長辺 1600px の JPEG) → 確かめて登録 →
+    //   このサーバーに送る (すぐ送り待ちに残る = 通信が切れても消えない) → Render の Company DB へ。登録の後は指示を取り直して出し直す
+    const GUIDE_UPLOADS = STATE.guideUploads || {};
+    const guideOn = !!(STATE.guideSync && STATE.guideSync.enabled);
+    const gkey = (sku) => String(sku ?? '').trim().toLowerCase();
+    let camTarget = null;   // { sku, name }
+    let camBlob = null;
+    let camOpId = null;   // 撮った 1 枚の番号 (登録の押し直しでも同じ = サーバーで 2 枚にならない)
+    let camBusy = false;
+    function camHtml(l, seq, li) {
+      if (!guideOn) return '';
+      const st = (l.guideTargets || []).map((t) => GUIDE_UPLOADS[gkey(t.sku)]).filter(Boolean);
+      const wait = st.reduce((n, x) => n + (x.pending || 0), 0);
+      const fails = st.flatMap((x) => x.failed || []);
+      const lastFail = fails.length ? fails[fails.length - 1] : null;
+      return `<button type="button" class="guide-cam" data-seq="${seq}" data-li="${li}">📷 梱包写真を登録</button>`
+        + (wait ? `<span class="guide-wait">⏳ 送信待ち ${wait} 枚 (自動で送ります)</span>` : '')
+        + (lastFail ? `<div class="guide-fail">⚠ 登録できなかった写真: ${esc(lastFail.error || '')}</div>` : '');
+    }
+    function closeCam() { $('guideCamOverlay').style.display = 'none'; $('guidePickOverlay').style.display = 'none'; camBlob = null; camTarget = null; camOpId = null; }
+    function startCam(t) {
+      camTarget = t;
+      $('guidePickOverlay').style.display = 'none';
+      $('guideCamInput').value = '';
+      $('guideCamInput').click();
+    }
+    document.addEventListener('click', (e) => {
+      const b = e.target && e.target.closest && e.target.closest('.guide-cam');
+      if (!b) return;
+      if (!worker) { showToast('先に作業者を選んでください'); return; }
+      const s = bySeq.get(Number(b.dataset.seq));
+      const l = s && s.lines[Number(b.dataset.li)];
+      const targets = (l && l.guideTargets) || [];
+      if (!targets.length) return;
+      if (targets.length === 1) { startCam(targets[0]); return; }
+      $('guidePickList').innerHTML = targets.map((t, i) => `<button type="button" class="gpick-opt" data-i="${i}">${esc(t.name || t.sku)}<div style="font-size:13px; color:#868e96; font-weight:400">${esc(t.sku)}</div></button>`).join('');
+      $('guidePickList').onclick = (ev) => { const o = ev.target.closest('.gpick-opt'); if (o) startCam(targets[Number(o.dataset.i)]); };
+      $('guidePickOverlay').style.display = 'flex';
+    });
+    $('guidePickCancel').addEventListener('click', closeCam);
+    /** 縮める (長辺 1600px の JPEG の Blob)。ブラウザが EXIF の向きを直して描く */
+    function shrinkPhoto(file) {
+      return new Promise((ok, ng) => {
+        const url = URL.createObjectURL(file);
+        const img = new Image();
+        img.onload = () => {
+          try {
+            const k = Math.min(1, 1600 / Math.max(img.naturalWidth, img.naturalHeight));
+            const c = document.createElement('canvas');
+            c.width = Math.round(img.naturalWidth * k); c.height = Math.round(img.naturalHeight * k);
+            c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+            URL.revokeObjectURL(url);
+            c.toBlob((b) => (b ? ok(b) : ng(new Error('写真を縮められませんでした'))), 'image/jpeg', 0.85);
+          } catch (err) { URL.revokeObjectURL(url); ng(err); }
+        };
+        img.onerror = () => { URL.revokeObjectURL(url); ng(new Error('写真を読めませんでした')); };
+        img.src = url;
+      });
+    }
+    $('guideCamInput').addEventListener('change', async () => {
+      const f = $('guideCamInput').files && $('guideCamInput').files[0];
+      if (!f || !camTarget) return;
+      camOpId = `g${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+      try { camBlob = await shrinkPhoto(f); } catch (err) { showToast(err.message || '写真を読めませんでした'); closeCam(); return; }
+      if ($('guideCamPreview').src.startsWith('blob:')) URL.revokeObjectURL($('guideCamPreview').src);
+      $('guideCamPreview').src = URL.createObjectURL(camBlob);
+      $('guideCamTarget').textContent = `${camTarget.name || ''} (${camTarget.sku})`;
+      $('guideCamCaption').value = '';
+      $('guideCamOk').disabled = false;
+      $('guideCamOverlay').style.display = 'flex';
+    });
+    // 送っている間は やめる・撮り直す・一言 を止める (返事が前の写真の画面を閉じて、撮り直した写真を消さない・Codex 第 2 段階レビュー 中)
+    $('guideCamCancel').addEventListener('click', () => { if (!camBusy) closeCam(); });
+    $('guideCamRetake').addEventListener('click', () => { if (camBusy) return; $('guideCamOverlay').style.display = 'none'; startCam(camTarget); });
+    function setCamBusy(b) {
+      camBusy = b;
+      for (const id of ['guideCamOk', 'guideCamCancel', 'guideCamRetake', 'guideCamCaption']) $(id).disabled = b;
+      $('guideCamOk').textContent = b ? '送っています…' : '登録する';
+    }
+    let guideSig = null;   // 前に出した指示・送り待ち (変わったときだけ描き直す = 作業中の画面をむやみに作り直さない。古さの一言は updateGuideStale)
+    async function refreshGuides({ force = true } = {}) {
+      try {
+        const r = await fetch(`/apps/packing/api/batches/${STATE.batchId}/guides`);
+        if (!r.ok) return;
+        const j = await r.json();
+        if (j.sync) STATE.guideSync = j.sync;
+        updateGuideStale();
+        const sig = JSON.stringify([j.guides, j.keysBySku, j.uploads]);
+        if (!force && sig === guideSig) return;
+        guideSig = sig;
+        for (const k of Object.keys(GUIDES)) delete GUIDES[k];
+        Object.assign(GUIDES, j.guides || {});
+        for (const k of Object.keys(GUIDE_UPLOADS)) delete GUIDE_UPLOADS[k];
+        Object.assign(GUIDE_UPLOADS, j.uploads || {});
+        for (const s of STATE.slips) for (const l of s.lines) if (j.keysBySku && j.keysBySku[l.sku]) l.guideKeys = j.keysBySku[l.sku];
+        render();
+      } catch { /* 取り直せなくても梱包は続ける (古さは「今」から数えて出す) */ }
+    }
+    // 開きっぱなしの画面も数分ごとに指示を取り直す (商品の画面で直した・ほかの iPad で撮った指示が出る)
+    if (guideOn) setInterval(() => refreshGuides({ force: false }), 3 * 60 * 1000);
+    // 古さの一言は通信と関係なく 1 分ごとに今の時刻で書き直す
+    if (guideOn) setInterval(updateGuideStale, 60 * 1000);
+    $('guideCamOk').addEventListener('click', async () => {
+      if (!camBlob || !camTarget || camBusy) return;
+      setCamBusy(true);
+      const sentOp = camOpId;   // 返事は、送った写真の画面のときだけ閉じる
+      const fd = new FormData();
+      fd.append('op_id', camOpId);
+      fd.append('sku', camTarget.sku);
+      fd.append('caption', $('guideCamCaption').value.trim());
+      fd.append('worker_name', worker || '');
+      fd.append('batch_id', String(STATE.batchId));
+      fd.append('photo', camBlob, 'guide.jpg');
+      try {
+        const r = await fetch('/apps/packing/api/guide-photos', { method: 'POST', body: fd });
+        const j = await r.json().catch(() => ({}));
+        if (r.ok && j.status === 'sent') showToast(`梱包写真を登録しました${j.position ? ` (${j.position} 枚目)` : ''}`);
+        else if (r.ok && j.status === 'pending') showToast('いまは送れないので、あとで自動で送ります');
+        else showToast(`登録できませんでした: ${j.error || `HTTP ${r.status}`}`);
+        setCamBusy(false);
+        if (camOpId === sentOp) closeCam();
+        refreshGuides();
+      } catch {
+        // 届いたか分からない = 写真は手元に残したまま、もう一度押せるようにする (同じ op_id = 届いていても 2 枚にならない)
+        showToast('通信できませんでした。電波を確かめて、もう一度「登録する」を押してください');
+        setCamBusy(false);
+      }
+    });
+
     // ── 描画 ──
     function render() {
       const s = bySeq.get(viewSeq);
@@ -531,10 +809,10 @@
         : `<span class="warn-badge" style="background:#fff3bf; border-color:#f08c00; color:#e8590c;">🕒 ピッキング欠品: 3階が後で取りに行きます — ${pname(p)} × ${pqty(p)}</span>`).join('');
       // 明細数に応じた表示密度 (スクロールなしで全明細が見えるように)
       $('paper').dataset.density = s.lines.length <= 1 ? '1' : s.lines.length <= 3 ? '2' : '3';
-      const lines = s.lines.map((l) => `
+      const lines = s.lines.map((l, li) => `
         <div class="line">
           <div class="img" data-sku="${esc(l.sku)}" style="${l.imageUrl ? `background-image:url('${esc(l.imageUrl)}')` : ''}">${l.imageUrl ? '' : '📦'}</div>
-          <div class="pname">${esc(l.name)}<div class="pmeta">${esc(l.sku)}</div></div>
+          <div class="pname">${esc(l.name)}<div class="pmeta">${esc(l.sku)}${(l.guideKeys || []).length ? '<span class="guide-tag">📷 梱包指示あり</span>' : ''}${camHtml(l, s.seq, li)}</div></div>
           <div class="qty ${l.qty >= 2 ? 'multi' : ''}">${l.qty}<small> 個</small></div>
         </div>`).join('');
 
@@ -560,6 +838,7 @@
         </div>
         ${matCardHtml(s.seq)}
         ${(warns || pshort) ? `<div class="warns">${pshort}${warns}</div>` : ''}
+        ${guideHtml(s)}
         <div class="recipient">
           <div class="name">${esc(s.recipientName || '(送り先なし)')} 様</div>
           <div class="addr">〒${esc(s.recipientZip || '')} ${esc(s.recipientPref || '')}${esc(s.recipientAddr || '')}</div>

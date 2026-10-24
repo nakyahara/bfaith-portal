@@ -1423,3 +1423,22 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
 .mall:hover .ic { color: var(--accent); }
 .mall-more, .malls-none { display: inline-flex; align-items: center; color: var(--faint); font-size: 12.5px; }
 @media (max-width: 760px) { .mall { min-height: 44px; padding: 0 14px; } .malls-list { gap: 8px; } }
+
+/* 🆕 0101 梱包指示 (入れ方の写真 3 枚・順番と一言・注意点。_packing-guide.ejs・me-packing-guide.js) */
+#p-pgd.po-dirty { border-color: rgba(255, 200, 87, 0.55); }
+.pgd-photos { list-style: none; margin: 10px 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
+.pgd-ph { display: flex; flex-direction: column; gap: 6px; padding: 8px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-deep); }
+.pgd-ph img { display: block; width: 100%; height: 180px; object-fit: contain; border-radius: 6px; background: #000; }
+.pgd-ph.removed img { opacity: 0.3; }
+.pgd-ph.removed { border-style: dashed; }
+.pgd-cap { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.pgd-cap .in { flex: 1; min-width: 0; }
+.pgd-no { flex: none; min-width: 24px; height: 24px; padding: 0 6px; border-radius: 12px; display: inline-flex; align-items: center; justify-content: center; background: var(--accent-bg); color: var(--accent); font-weight: 700; font-size: 13px; }
+.pgd-ph.removed .pgd-no { background: var(--err-bg); color: var(--err); }
+.pgd-ops { display: flex; gap: 6px; flex-wrap: wrap; }
+.pgd-add { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 4px 0 12px; }
+.pgd-add .btn { cursor: pointer; }
+.pgd-add .btn.off { opacity: 0.45; pointer-events: none; }
+.pgd-foot { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 10px; }
+#pgd-note { width: 100%; min-height: 96px; resize: vertical; }
+@media (max-width: 760px) { .pgd-photos { grid-template-columns: 1fr; } .pgd-ops .btn { min-height: 44px; } }

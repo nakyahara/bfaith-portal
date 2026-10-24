@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 21;
+const SCHEMA_VERSION = 23;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -603,6 +603,55 @@ const MIGRATIONS = {
       if (!cols.includes(name)) db.exec(`ALTER TABLE pk_pack_tasks ADD COLUMN ${name} ${type}`);
     }
     db.exec("CREATE INDEX IF NOT EXISTS idx_pk_pack_tasks_returned_notify ON pk_pack_tasks(status, returned_notified_at)");
+  },
+  // v22: 梱包指示の写し (中原さん 2026-10-23・正 = Render の Company DB の 0101。apps/packing/guide-sync.js)。
+  //   SKU ごとに 1 行 (写真の並び・一言・大きさ = photos_json・写真の中身は DATA_DIR/packing-guides/<sha256>.jpg)。
+  //   丸ごと入れ替える (写真が全部そろった版だけ)。取れなくても前の写しで出し続ける (取れた時刻を画面に出す)
+  22: () => {
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_guides (
+      sku_norm    TEXT PRIMARY KEY,        -- 商品コードの小文字・前後の空白なし (lib/sku-norm の normSku と同じ)
+      code        TEXT NOT NULL,           -- 商品コード (Company DB の表記)
+      name        TEXT,
+      note        TEXT NOT NULL DEFAULT '',
+      photos_json TEXT NOT NULL DEFAULT '[]',   -- [{ sha256, position, caption, width, height }] (並び順)
+      event_id    TEXT,                    -- Company DB の最後の記録の番号 (版)
+      updated_at  TEXT,
+      updated_by  TEXT
+    )`);
+  },
+  // v23: 梱包の画面のカメラで撮った写真の送り待ち (梱包指示の 2 段目・2026-10-23)。v22 とは別の版 = v22 を当てた DB にも作る (Codex 第 2 段階レビュー 高)。
+  //   iPad → このサーバー → Render。撮ったらすぐここに残す = 通信が切れても消えない。
+  //   request_id = Render に送る 1 枚の番号 (送り直しても 2 枚にならない)・op_id = iPad の押した 1 回 (押し直しは同じ行・中身が違えば断る)
+  //   status: pending (送る) / sent (Render の Company DB に入った) / failed (断られた = 送り直さない・理由を画面に)
+  23: () => {
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_guide_uploads (
+      op_id       TEXT PRIMARY KEY,
+      request_id  TEXT NOT NULL UNIQUE,
+      sku         TEXT NOT NULL,           -- 撮った商品のコード (梱包の明細・セットを展開した構成品)
+      caption     TEXT NOT NULL DEFAULT '',
+      worker      TEXT NOT NULL,
+      batch_id    INTEGER,
+      jpeg_sha256 TEXT NOT NULL,           -- 撮った写真の中身 (同じ op_id の押し直しが同じ写真か確かめる)
+      file        TEXT NOT NULL,           -- DATA_DIR/packing-guide-uploads/<request_id>.jpg
+      status      TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'sent', 'failed')),
+      attempts    INTEGER NOT NULL DEFAULT 0,
+      next_at     TEXT,                    -- 次に送ってよい時刻 (失敗の後は間をあける)
+      last_error  TEXT,
+      position    INTEGER,                 -- 入った位置 (何枚目)
+      created_at  TEXT NOT NULL,
+      sent_at     TEXT
+    )`);
+    // 表が先にあった (2 段目の途中のコミットが v22 で作った・jpeg_sha256 なし) = 列を足して、ファイルから埋める (Codex 第 2 段階の確かめ 高)
+    const upCols = db.prepare('PRAGMA table_info(pk_pack_guide_uploads)').all().map((c) => c.name);
+    if (!upCols.includes('jpeg_sha256')) {
+      db.exec("ALTER TABLE pk_pack_guide_uploads ADD COLUMN jpeg_sha256 TEXT NOT NULL DEFAULT ''");
+      const dir = path.join(DATA_DIR, 'packing-guide-uploads');
+      const upd = db.prepare('UPDATE pk_pack_guide_uploads SET jpeg_sha256 = ? WHERE op_id = ?');
+      for (const r of db.prepare('SELECT op_id, file FROM pk_pack_guide_uploads').all()) {
+        try { upd.run(crypto.createHash('sha256').update(fs.readFileSync(path.join(dir, path.basename(r.file)))).digest('hex'), r.op_id); } catch { /* 無い・読めない = 空のまま (押し直しは別の中身として断る) */ }
+      }
+    }
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_guide_uploads_status ON pk_pack_guide_uploads(status, next_at)');
   },
 };
 

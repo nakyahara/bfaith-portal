@@ -169,6 +169,8 @@ import { readNeUpdate, readSkuNeDiff, requestNeSendNow, makeNeUpdateCsv, downloa
 import { amcLabelScreen, amcInputOf, saveAmcLabel, amcErrorBody, AmcLabelError, AMC_STATUSES, AMC_STATUS_WORDS, AMC_STATUS_HINTS } from './amc-label.mjs';
 import { lzBarcodeView, lzBarcodeIn, lzBarcodeReady, setLzBarcodeInTx, lzHolderInDb, lzValueShape, lzCopyNote, LZ_COPY_STATE_WORDS, LZ_KIND_WORDS, LZ_BARCODE_VIA } from '../../lib/logizard-barcode.mjs';
 import { readPackageView, packageReady } from '../../lib/master-package.mjs';
+// 🆕 0101 (梱包指示 = 入れ方の写真 3 枚と注意点・中原さん 2026-10-23): 商品の画面で見る・写真を足す・保存する (梱包アプリへは apps/packing-guide の配りの口)
+import * as PGD from '../../lib/packing-guide.mjs';
 import { readLzMirror, lzCopyCheck, lzMirrorOwners } from '../../lib/lz-mirror.mjs';
 // 🆕 0084 (メーカー・中原さん 2026-10-17): 名簿・名簿に足す・欄を出すか (0084 があってロールの流し直しの後)
 import { makerReady, readMakers, createMaker, MAKER_NAME_MAX } from '../../lib/master-maker.mjs';
@@ -648,6 +650,8 @@ router.use('/api/', (req, res, next) => {
 const bulkEditorOnly = (req, res, next) => { const g = editorGate(req); if (!g.ok) return res.status(403).json({ ok: false, error: g.message, reason: 'not_editor' }); next(); };
 router.use('/api/amazon/bulk/preview', bulkEditorOnly, express.json({ limit: '4mb' }));
 router.use('/api/amazon/bulk/apply', bulkEditorOnly);   // 保存の本文 (256kb) も名簿の人でなければ読む前に断る (#Codex A R1 M)
+// 🆕 0101 梱包指示の写真 = 画面が縮めた JPEG の base64 (作り直す前 12 MB まで → 約 16 MB)。名簿の人でなければ本文を読む前に断る (ほかの道は今までどおり 256kb)
+router.use('/api/sku/:code/packing-guide/photo', bulkEditorOnly, express.json({ limit: '17mb' }));
 router.use(express.json({ limit: '256kb' }));
 
 /** 書ける人か。env MASTER_EDITORS にメールをカンマ区切りで。名簿がすべて (admin でも名簿に無ければ不可・空なら誰も書けない) */
@@ -1409,6 +1413,16 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
     pkg: page && page.cur.sku_kind === 'single' && page.cur.product_id
       ? await (async () => ({ ...(await readPackageView(db, page.cur.product_id)), ready: await packageReady(db) }))().catch((e) => { console.error(`[master-edit] 大きさ・重さを読めない: ${e && e.message}`); return null; })
       : null,
+    // 🆕 0101: 梱包指示 (単品だけ・写真 3 枚と注意点・右の「保存する」とは別のボタン)。0101 の前・ロールの流し直しの前・読めない = null (出さない・画面は止めない)
+    packingGuide: page && page.cur.sku_kind === 'single'
+      ? await (async () => {
+        if (!(await PGD.packingGuideReady(db))) return null;
+        const gate = editorGate(req);
+        return { guide: packingGuideJson(page.cur.code, await PGD.readPackingGuide(db, page.cur.sku_id)), canWrite: gate.ok && writeConfigured(),
+          why: !gate.ok ? gate.message : !writeConfigured() ? '書き込み用の接続 (COMPANY_DB_MASTER_EDIT_URL) が無いので、見るだけです' : '',
+          max: PGD.MAX_PHOTOS, noteMax: PGD.NOTE_MAX, captionMax: PGD.CAPTION_MAX };
+      })().catch((e) => { console.error(`[master-edit] 梱包指示を読めない: ${e && e.message}`); return null; })
+      : null,
     // 🆕 0072: NE から消す (箱 = 依頼の途中の様子・「NE から消す」の画面へ)。0072 の前・読めない = null (出さない)
     nedel: nedel ? { live: nedelLive, canApprove: approverGate(req).ok, STATUS_WORDS: NE_DEL_STATUS_WORDS } : null,
     // AMC 商品ラベルのバーコード印字 (Company DB構想 21 A1・発注アプリに保存・単品で AMC × 自社商品だけ欄を出す)
@@ -1567,6 +1581,74 @@ router.post('/api/brands/own', (req, res) => {
   const b = req.body || {};
   return withPgApi(res, async (db) => {
     res.json(await setBrandOwn(db, { requestId: b.request_id, actor: String(req.session.email).trim().toLowerCase(), brandId: b.brand_id, own: b.own, seenOwn: b.seen_own }));
+  }, 'write');
+});
+
+// ─── 🆕 0101 梱包指示 (入れ方の写真 3 枚まで・順番と一言・注意点の文。lib/packing-guide.mjs) ───
+//   見る = アプリの利用権がある人 / 書く = 名簿 MASTER_EDITORS の人 (切替の門は見ない = NE に送らない社内だけの値)。単品だけ。
+//   写真を足す = すぐ保存 (版は見ない) / 注意点・並び・一言・外す = 「梱包指示を保存」(開いたときの版 seen_event_id と違えば 409)
+/** 梱包指示の誤り → 応答 (PackingGuideError 以外は withPgApi に任せる) */
+async function packingGuideApi(res, fn, kind) {
+  return withPgApi(res, async (db) => {
+    try { await fn(db); } catch (e) {
+      if (e instanceof PGD.PackingGuideError) return res.status(e.status).json({ ok: false, error: e.message, reason: e.reason });
+      throw e;
+    }
+  }, kind);
+}
+/** 商品コード → 梱包指示を持てる SKU (単品・DB の準備済み)。だめなら応答して null */
+async function packingGuideSku(db, res, code) {
+  if (!(await PGD.packingGuideReady(db))) { res.status(503).json({ ok: false, error: 'Company DB の準備 (0101・ロールの流し直し) がまだなので、梱包指示は使えません', reason: 'db_not_ready' }); return null; }
+  const sku = await PGD.skuForGuide(db, code);
+  if (!sku) { res.status(404).json({ ok: false, error: `商品コード ${code} は Company DB にありません`, reason: 'not_found' }); return null; }
+  if (sku.sku_kind !== 'single') { res.status(400).json({ ok: false, error: '梱包指示は単品の商品だけです', reason: 'not_single' }); return null; }
+  return sku;
+}
+const packingGuideJson = (code, g) => ({ ...g, photos: g.photos.map((p) => ({ ...p, url: `/sku/${encodeURIComponent(code)}/packing-photo/${p.photo_id}` })) });
+router.get('/api/sku/:code/packing-guide', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  return packingGuideApi(res, async (db) => {
+    const sku = await packingGuideSku(db, res, req.params.code);
+    if (!sku) return;
+    res.json({ ok: true, guide: packingGuideJson(sku.code, await PGD.readPackingGuide(db, sku.sku_id)) });
+  });
+});
+/** 写真の中身 (この商品の写真だけ・外した写真も = 前の版)。写真の番号ごとに中身は変わらない = 長く持ってよい (ログインの後だけ = private) */
+router.get('/sku/:code/packing-photo/:id', (req, res) => withPgPage(req, res, async (db) => {
+  if (!db) return res.status(503).type('text/plain').send('Company DB につながりません');
+  if (!(await PGD.packingGuideReady(db))) return res.status(404).type('text/plain').send('not found');
+  const sku = await PGD.skuForGuide(db, req.params.code);
+  const p = sku ? await PGD.readPackingPhoto(db, req.params.id, { skuId: sku.sku_id }) : null;
+  if (!p) return res.status(404).type('text/plain').send('not found');
+  res.set('Cache-Control', 'private, max-age=31536000, immutable');
+  res.set('ETag', `"${p.sha256}"`);
+  res.type('image/jpeg').send(p.image);
+}));
+/** 写真を 1 枚足す { request_id, image (base64・data URL の頭があってもよい), caption? }。作り直してから DB へ (後ろへ・3 枚まで) */
+router.post('/api/sku/:code/packing-guide/photo', (req, res) => {
+  const gate = editorGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
+  const b = req.body || {};
+  return packingGuideApi(res, async (db) => {
+    const requestId = PGD.requestIdIn(b.request_id);
+    const caption = PGD.captionIn(b.caption);
+    const photo = await PGD.normalizePhoto(PGD.decodeImageBase64(b.image));
+    const sku = await packingGuideSku(db, res, req.params.code);
+    if (!sku) return;
+    const r = await PGD.addPackingPhoto(db, { requestId, actor: String(req.session.email).trim().toLowerCase(), via: 'sku_page', skuId: sku.sku_id, photo, caption });
+    res.json({ ...r, guide: packingGuideJson(sku.code, await PGD.readPackingGuide(db, sku.sku_id)) });
+  }, 'write');
+});
+/** 注意点と写真の並び・一言を保存する { request_id, seen_event_id, note, photos: [{ photo_id, caption }] } (並びに無い今の写真は外す) */
+router.post('/api/sku/:code/packing-guide', (req, res) => {
+  const gate = editorGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
+  return packingGuideApi(res, async (db) => {
+    const x = PGD.guideSaveIn(req.body);
+    const sku = await packingGuideSku(db, res, req.params.code);
+    if (!sku) return;
+    const r = await PGD.savePackingGuide(db, { ...x, actor: String(req.session.email).trim().toLowerCase(), via: 'sku_page', skuId: sku.sku_id });
+    res.json({ ...r, guide: packingGuideJson(sku.code, await PGD.readPackingGuide(db, sku.sku_id)) });
   }, 'write');
 });
 
