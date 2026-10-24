@@ -140,8 +140,8 @@ function inList(arr) { return arr.map(() => '?').join(','); }
  * SKU (小文字) / ASIN (大文字) → { sales, units }。注文ベース (アクセスのレポート) があればそれ・無ければ決済ベース (finance の統合 view)。
  * どちらも無ければ null。memo は同じ期間の呼び出しを 1 回にする。
  * 🚨 アクセスのレポートの行はあっても売上の列が全部 NULL なら使わない (次の候補へ)。SKU ごとの売上が NULL = 分からない (0 にしない)。Codex R1
- * 🚨 アクセスのレポートが期間の日数そろっていない (取り始めたばかり等) なら決済ベースを先に使う。決済ベースも無ければ
- *    そろっていないアクセスのレポートを complete = false で返す (行の無い SKU = 0 ではなく「分からない」)。Codex R2
+ * 🚨 期間の全部の日がそろった出どころ (アクセス → 決済の順) を使う。どれも欠けていれば最初の候補を complete = false で返す
+ *    (行の無い SKU = 0 ではなく「分からない」)。Codex R2 / R3
  */
 function salesMap(db, by, from, to, memo) {
   const key = `${by}|${from}|${to}`;
@@ -149,8 +149,8 @@ function salesMap(db, by, from, to, memo) {
   const trafficKey = by === 'sku' ? 'LOWER(TRIM(seller_sku))' : 'UPPER(TRIM(child_asin))';
   const financeKey = by === 'sku' ? 'sku_key' : 'UPPER(TRIM(asin_norm))';
   const financeWhere = by === 'sku' ? '' : "AND asin_norm IS NOT NULL AND asin_norm <> ''";
-  let out = null;
-  let partialTraffic = null;
+  const expected = daysBetween(from, to);
+  const cands = [];   // { source, map, complete } を アクセス → 決済 の順に
   try {
     const t = resolveTable(db, TABLES.trafficSku);
     if (t) {
@@ -162,20 +162,28 @@ function salesMap(db, by, from, to, memo) {
       const days = db.prepare(`SELECT COUNT(DISTINCT date_jst) AS n FROM ${t} WHERE date_jst >= ? AND date_jst < ? AND ordered_product_sales IS NOT NULL`)
         .get(from, to)?.n || 0;
       if (rows.some((r) => r.sales != null)) {
-        const cand = { source: 'amazon_sales_traffic (注文ベース)', map: new Map(rows.map((r) => [r.k, r])), complete: true };
-        if (days >= minDaysFor(daysBetween(from, to))) out = cand;
-        else partialTraffic = { ...cand, complete: false, source: `amazon_sales_traffic (注文ベース・${days}/${daysBetween(from, to)} 日だけ)` };
+        cands.push({
+          source: days === expected ? 'amazon_sales_traffic (注文ベース)' : `amazon_sales_traffic (注文ベース・${days}/${expected} 日だけ)`,
+          map: new Map(rows.map((r) => [r.k, r])), complete: days === expected,
+        });
       }
     }
-  } catch { out = null; }
-  if (!out) {
-    try {
-      const rows = db.prepare(`SELECT ${financeKey} AS k, SUM(sales_gross_jpy_incl) AS sales, SUM(units_net_sold) AS units
-        FROM v_mall_finance_daily_unified WHERE mall = 'amazon' AND date_jst >= ? AND date_jst < ? ${financeWhere} GROUP BY ${financeKey}`).all(from, to);
-      if (rows.length > 0) out = { source: 'v_mall_finance_daily_unified (決済ベース)', map: new Map(rows.map((r) => [r.k, r])), complete: true };
-    } catch { out = null; }
-  }
-  if (!out) out = partialTraffic;
+  } catch { /* 次の候補へ */ }
+  try {
+    const rows = db.prepare(`SELECT ${financeKey} AS k, SUM(sales_gross_jpy_incl) AS sales, SUM(units_net_sold) AS units
+      FROM v_mall_finance_daily_unified WHERE mall = 'amazon' AND date_jst >= ? AND date_jst < ? ${financeWhere} GROUP BY ${financeKey}`).all(from, to);
+    if (rows.length > 0) {
+      // 決済ベースは Amazon の売上がある日 = 行のある日。全部の日に行があるときだけ「行の無い SKU = 0」とみなす
+      const days = db.prepare(`SELECT COUNT(DISTINCT date_jst) AS n FROM v_mall_finance_daily_unified WHERE mall = 'amazon' AND date_jst >= ? AND date_jst < ?`)
+        .get(from, to)?.n || 0;
+      cands.push({
+        source: days === expected ? 'v_mall_finance_daily_unified (決済ベース)' : `v_mall_finance_daily_unified (決済ベース・${days}/${expected} 日だけ)`,
+        map: new Map(rows.map((r) => [r.k, r])), complete: days === expected,
+      });
+    }
+  } catch { /* 無くてよい */ }
+  // 🚨 全部の日がそろった出どころを先に。どれも欠けていれば最初の候補を complete = false で (行の無い SKU = 分からない)。Codex R3
+  const out = cands.find((c) => c.complete) || cands[0] || null;
   memo.set(key, out);
   return out;
 }
@@ -233,7 +241,7 @@ function storeTraffic(db, ctx) {
         COUNT(CASE WHEN units_ordered IS NOT NULL THEN sessions END) AS cvr_days,
         SUM(CASE WHEN units_ordered IS NOT NULL THEN sessions END) AS s_pair, SUM(CASE WHEN sessions IS NOT NULL THEN units_ordered END) AS u_pair,
         SUM(buy_box_percentage * page_views) AS bb_w, SUM(CASE WHEN buy_box_percentage IS NOT NULL THEN page_views END) AS bb_pv,
-        AVG(buy_box_percentage) AS bb_avg
+        AVG(buy_box_percentage) AS bb_avg, COUNT(buy_box_percentage) AS bb_n, SUM(page_views) AS pv_all
       FROM ${chk.table} WHERE date_jst >= ? AND date_jst < ?`).get(from, to);
     const days = r?.days || 0;
     const expected = daysBetween(from, to);
@@ -249,7 +257,10 @@ function storeTraffic(db, ctx) {
       // 転換率は sessions と units の両方がある日だけで割る (片方が NULL の日を混ぜない)。そろった日が足りなければ null。Codex R1
       cvr_pct: (r?.cvr_days || 0) >= minDaysFor(daysBetween(from, to)) ? pctOf(r.u_pair, r.s_pair) : null,
       // カート獲得率は PV の重み付き平均 (PV が無い日だけなら単純平均)
-      buy_box_pct: r?.bb_pv > 0 ? r1(r.bb_w / r.bb_pv) : r1(r?.bb_avg),
+      // 値のある日が足りない・値のある日の PV が全体の MIN_COVERAGE_RATIO 未満なら null (1 日の値を期間の値にしない)。Codex R3
+      buy_box_pct: (r?.bb_n || 0) < minDaysFor(expected) ? null
+        : r.bb_pv > 0 ? (r.bb_pv >= (r.pv_all || 0) * MIN_COVERAGE_RATIO ? r1(r.bb_w / r.bb_pv) : null)
+          : r1(r.bb_avg),
     };
   };
   const cur = agg(ctx.cur);
@@ -300,7 +311,8 @@ function skuConversionDrops(db, ctx) {
       SUM(CASE WHEN date_jst >= @cs THEN buy_box_percentage * page_views END) AS bbw_cur,
       SUM(CASE WHEN date_jst >= @cs AND buy_box_percentage IS NOT NULL THEN page_views END) AS bbpv_cur,
       SUM(CASE WHEN date_jst < @cs THEN buy_box_percentage * page_views END) AS bbw_prev,
-      SUM(CASE WHEN date_jst < @cs AND buy_box_percentage IS NOT NULL THEN page_views END) AS bbpv_prev
+      SUM(CASE WHEN date_jst < @cs AND buy_box_percentage IS NOT NULL THEN page_views END) AS bbpv_prev,
+      SUM(CASE WHEN date_jst >= @cs THEN page_views END) AS pv_cur, SUM(CASE WHEN date_jst < @cs THEN page_views END) AS pv_prev
     FROM ${chk.table} WHERE date_jst >= @ps AND date_jst < @ce
     GROUP BY LOWER(TRIM(seller_sku))`).all({ cs: ctx.cur[0], ps: ctx.prev[0], ce: ctx.cur[1] });
   const minPrev = MIN_SESSIONS_PER_DAY * daysBetween(...ctx.prev);
@@ -313,8 +325,9 @@ function skuConversionDrops(db, ctx) {
     // 両方ある行のセッションが全体の MIN_COVERAGE_RATIO 未満なら、その期間の転換率は分からない (null)
     const cvrCur = r.sp_cur >= r.s_cur * MIN_COVERAGE_RATIO ? pctOf(r.up_cur, r.sp_cur) : null;
     const cvrPrev = r.sp_prev >= r.s_prev * MIN_COVERAGE_RATIO ? pctOf(r.up_prev, r.sp_prev) : null;
-    const bbCur = r.bbpv_cur > 0 ? r1(r.bbw_cur / r.bbpv_cur) : null;
-    const bbPrev = r.bbpv_prev > 0 ? r1(r.bbw_prev / r.bbpv_prev) : null;
+    // カート獲得率も値のある行の PV が全体の MIN_COVERAGE_RATIO 以上のときだけ (Codex R3)
+    const bbCur = r.bbpv_cur > 0 && r.bbpv_cur >= r.pv_cur * MIN_COVERAGE_RATIO ? r1(r.bbw_cur / r.bbpv_cur) : null;
+    const bbPrev = r.bbpv_prev > 0 && r.bbpv_prev >= r.pv_prev * MIN_COVERAGE_RATIO ? r1(r.bbw_prev / r.bbpv_prev) : null;
     const cvrDrop = cvrCur != null && cvrPrev != null && cvrCur <= cvrPrev * CVR_DROP_RATIO && cvrPrev - cvrCur >= CVR_DROP_MIN_PT;
     const bbDrop = bbCur != null && bbPrev != null && bbPrev - bbCur >= BUYBOX_DROP_MIN_PT;
     if (!cvrDrop && !bbDrop) continue;
@@ -659,22 +672,28 @@ function adsPoorRoas(db, ctx) {
   // 週次 (出そろった週) は、各日の値が「その日の 14 日後以降 (JST) に取った値」かを確かめる。
   // 取得が途中で止まると、帰属が伸びきる前の値が残ったまま窓に入る (ROAS が低く出る)。Codex R2
   let settledDays = null;
+  // 集計に入れる日: 月次 = 窓の全部 / 週次 = 出そろった日だけ (出そろっていない日の費用と伸びる前の売上を混ぜない。Codex R3)
+  let dateWhere = 'date_jst >= ? AND date_jst < ?';
+  let dateParams = [from, to];
   if (ctx.adsRequireSettled) {
     const tsCol = daysT === chk.table ? 'ingested_at' : 'fetched_at';
-    settledDays = db.prepare(`SELECT COUNT(*) AS n FROM (
+    const settled = db.prepare(`SELECT date_jst FROM (
         SELECT date_jst, MIN(date(${tsCol}, '+9 hours')) AS fetched_jst FROM ${daysT} WHERE date_jst >= ? AND date_jst < ? GROUP BY date_jst
-      ) WHERE fetched_jst >= date(date_jst, '+${ADS_ATTRIB_SETTLE_DAYS} days')`).get(from, to)?.n || 0;
+      ) WHERE fetched_jst >= date(date_jst, '+${ADS_ATTRIB_SETTLE_DAYS} days') ORDER BY date_jst`).all(from, to).map((r) => r.date_jst);
+    settledDays = settled.length;
     if (settledDays < minDaysFor(days)) {
       return noData(`見る期間 (${from}〜${addDays(to, -1)}) の値が 14 日の帰属が出そろう前の取得のまま (出そろった日 ${settledDays}/${days} 日)`);
     }
+    dateWhere = `date_jst IN (${inList(settled)})`;
+    dateParams = settled;
   }
   const tot = db.prepare(`SELECT SUM(cost) AS cost, SUM(sales_14d) AS s14, SUM(CASE WHEN sales_14d IS NULL THEN 1 ELSE 0 END) AS nulls, COUNT(*) AS rows
-    FROM ${chk.table} WHERE date_jst >= ? AND date_jst < ?`).get(from, to);
+    FROM ${chk.table} WHERE ${dateWhere}`).get(...dateParams);
   if (tot.rows > 0 && tot.nulls === tot.rows) return noData('14 日の帰属売上 (sales_14d) が全部空 (レポートが列を返していない)');
   const rows = db.prepare(`SELECT target_granularity AS g, target, MAX(advertised_sku) AS sku, MAX(advertised_asin) AS asin,
       SUM(cost) AS cost, SUM(clicks) AS clicks, SUM(sales_14d) AS s14, SUM(CASE WHEN sales_14d IS NULL THEN 1 ELSE 0 END) AS nulls
-    FROM ${chk.table} WHERE date_jst >= ? AND date_jst < ? AND target_granularity IN ('sku', 'asin')
-    GROUP BY target_granularity, target`).all(from, to);
+    FROM ${chk.table} WHERE ${dateWhere} AND target_granularity IN ('sku', 'asin')
+    GROUP BY target_granularity, target`).all(...dateParams);
   const minSpend = ADS_MIN_SPEND_PER_DAY * days;
   const hits = rows.filter((r) => r.nulls === 0 && r.cost >= minSpend && (r.s14 || 0) / r.cost < ADS_POOR_ROAS)
     .sort((a, b) => b.cost - a.cost || (a.target < b.target ? -1 : 1));

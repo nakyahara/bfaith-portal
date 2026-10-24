@@ -355,6 +355,23 @@ console.log('\n■ 4c. 売上の出どころ・広告の帰属の出そろい・
     'BSR: 順位が 1 日ずつしか無い ASIN は比べない (skipped 1)', o.bsr_drops);
   db.close();
 }
+{
+  // Codex R3: カート獲得率が 1 日しか無い週 / 広告の 1 日だけ出そろっていない日にだけ費用がある SKU
+  const db = new Database(':memory:');
+  createAll(db);
+  seedNormal(db);
+  db.prepare(`UPDATE amazon_sales_traffic_daily SET buy_box_percentage = NULL WHERE date_jst >= '${PS}' AND date_jst <> '2026-10-12'`).run();
+  db.prepare(`UPDATE amazon_sales_traffic_sku_daily SET buy_box_percentage = NULL WHERE seller_sku = 'SKU-B' AND date_jst >= '${PS}' AND date_jst <> '2026-10-12'`).run();
+  db.prepare("UPDATE ads_attrib_fetch_days SET fetched_at = '2026-10-10T00:00:00Z' WHERE date_jst = '2026-10-04'").run();   // 10-04 は 10-18 より前に取ったまま
+  ins(db, 'fact_amazon_ads_sku_attrib', { date_jst: '2026-10-04', campaign_id: 'c9', ad_group_id: 'g9', target: 'sku-x', target_granularity: 'sku', advertised_sku: 'SKU-X',
+    impressions: 100, clicks: 50, cost: 7000, sales_14d: 0, source_rows: 1, generation: 1, report_id: 'r1', ingested_at: T.fetched_at });
+  const o = buildAmazonHealthFacts(db, weekly());
+  ok(o.store_traffic.this_week.buy_box_pct === null && o.store_traffic.buy_box_change_pt === null, '店全体: カート獲得率が 1/7 日 → null (比較もしない)', o.store_traffic);
+  ok(!o.sku_conversion_drops.items.some((i) => i.sku === 'SKU-B'), 'SKU-B: カート獲得率の値のある PV が少ない → 低下に出さない', o.sku_conversion_drops.items);
+  ok(o.ads_poor_roas.status === 'ok' && o.ads_poor_roas.settled_days === 6 && !o.ads_poor_roas.items.some((i) => i.sku === 'SKU-X')
+    && o.ads_poor_roas.spend_yen === 10200, '広告: 出そろっていない 10-04 は集計に入れない (SKU-X は出ない・費用 6 日分)', o.ads_poor_roas);
+  db.close();
+}
 
 // ═══ 5. 返品 0 件 ═══
 console.log('\n■ 5. 返品が 0 件の週');
