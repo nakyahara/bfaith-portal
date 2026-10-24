@@ -213,18 +213,18 @@ await ta('[A1] 送り手の「残す日」(isKeptDate) と受け手の消す SQL
 });
 
 await ta('[A2] 送る期間: 初回 = 残す日数ぶん / 毎朝 = 直近 sendDays 日 / 止まった後 = 前に送れた次の日から / --full / 残す日数より前には戻らない', async () => {
-  const sp = spec('amazon_catalog_rank_daily');   // sendDays 3・keepDays 75
+  const sp = spec('amazon_catalog_rank_daily');   // sendDays 3・keepDays 100
   const T0 = '2026-11-12';
-  assert.deepEqual(S.planScope(sp, { today: T0 }), { from: L.addDaysYmd(T0, -74), to: T0, mode: 'first' });
+  assert.deepEqual(S.planScope(sp, { today: T0 }), { from: L.addDaysYmd(T0, -(sp.keepDays - 1)), to: T0, mode: 'first' });
   assert.deepEqual(S.planScope(sp, { today: T0, lastTo: '2026-11-11' }), { from: '2026-11-10', to: T0, mode: 'daily' });
   assert.deepEqual(S.planScope(sp, { today: T0, lastTo: T0 }), { from: '2026-11-10', to: T0, mode: 'daily' });   // 同じ日の 2 回目
   assert.deepEqual(S.planScope(sp, { today: T0, lastTo: '2026-11-01' }), { from: '2026-10-31', to: T0, mode: 'catch_up' });
-  assert.deepEqual(S.planScope(sp, { today: T0, lastTo: '2026-01-01' }), { from: L.addDaysYmd(T0, -74), to: T0, mode: 'catch_up' });
-  assert.deepEqual(S.planScope(sp, { today: T0, lastTo: '2026-11-11', full: true }), { from: L.addDaysYmd(T0, -74), to: T0, mode: 'full' });
+  assert.deepEqual(S.planScope(sp, { today: T0, lastTo: '2026-01-01' }), { from: L.addDaysYmd(T0, -(sp.keepDays - 1)), to: T0, mode: 'catch_up' });
+  assert.deepEqual(S.planScope(sp, { today: T0, lastTo: '2026-11-11', full: true }), { from: L.addDaysYmd(T0, -(sp.keepDays - 1)), to: T0, mode: 'full' });
   // 前の回が途中で失敗 (--full の途中など) = その run の最初の日から今日まで
   assert.deepEqual(S.planScope(sp, { today: T0, lastTo: '2026-11-11', resume: '2026-09-20' }), { from: '2026-09-20', to: T0, mode: 'catch_up' });
   assert.deepEqual(S.planScope(sp, { today: T0, lastTo: '2026-11-11', resume: '2026-11-12' }), { from: '2026-11-10', to: T0, mode: 'daily' });
-  assert.deepEqual(S.planScope(sp, { today: T0, lastTo: '2026-11-11', resume: '2026-01-01' }), { from: L.addDaysYmd(T0, -74), to: T0, mode: 'catch_up' });
+  assert.deepEqual(S.planScope(sp, { today: T0, lastTo: '2026-11-11', resume: '2026-01-01' }), { from: L.addDaysYmd(T0, -(sp.keepDays - 1)), to: T0, mode: 'catch_up' });
 });
 
 await ta('[A3] run の分け方: 古い順・すきまも重なりも無い・runDays 日まで', async () => {
@@ -342,7 +342,7 @@ await ta('[D1] 初回: 全部の表を残す日数ぶん送る (run は runDays 
   // 残す日の決まり
   assert.equal(count(mdb, `SELECT COUNT(*) AS n FROM mirror_amazon_listing_status_daily WHERE date_jst = '2026-06-15'`), 0);
   assert.equal(count(mdb, `SELECT COUNT(*) AS n FROM mirror_amazon_listing_status_daily WHERE date_jst = '2026-06-30'`), N);
-  assert.equal(count(mdb, `SELECT COUNT(*) AS n FROM mirror_amazon_catalog_rank_daily WHERE date_jst < ?`, L.addDaysYmd(TODAY, -74)), 0);
+  assert.equal(count(mdb, `SELECT COUNT(*) AS n FROM mirror_amazon_catalog_rank_daily WHERE date_jst < ?`, L.addDaysYmd(TODAY, -(spec('amazon_catalog_rank_daily').keepDays - 1))), 0);
   assert.equal(count(mdb, `SELECT COUNT(*) AS n FROM mirror_amazon_sales_traffic_daily`), L.datesBetween(DATA_FROM, TODAY).length, '店全体は 400 日 = 全部');
   assert.equal(count(mdb, `SELECT COUNT(*) AS n FROM mirror_fba_planning_daily WHERE market <> 'jp'`), 0);
   assert.equal(count(mdb, `SELECT COUNT(*) AS n FROM mirror_amazon_listing_issue_daily WHERE severity <> 'ERROR'`), 0);
@@ -412,8 +412,8 @@ await ta('[D3] 翌日: 直近だけ送り直す・変わった値を置き換え
   }
   assert.equal(count(mdb, `SELECT COUNT(*) AS n FROM mirror_amazon_sales_traffic_sku_daily WHERE date_jst = ? AND seller_sku = 'SKU-9'`, TODAY), 0, '元で消えた行');
   assert.equal(mdb.prepare(`SELECT rank FROM mirror_amazon_catalog_rank_daily WHERE date_jst = ? AND asin = ? AND rank_type = 'display_group'`).get(TODAY, asinOf(6)).rank, (1000 + 600) * 6);
-  assert.equal(count(mdb, `SELECT COUNT(*) AS n FROM mirror_amazon_catalog_rank_daily WHERE date_jst < ?`, L.addDaysYmd(day2, -74)), 0, 'BSR の 75 日より古い行');
-  assert.equal(count(mdb, `SELECT COUNT(*) AS n FROM mirror_amazon_catalog_rank_daily WHERE date_jst = ?`, L.addDaysYmd(day2, -74)), 2 * N);
+  assert.equal(count(mdb, `SELECT COUNT(*) AS n FROM mirror_amazon_catalog_rank_daily WHERE date_jst < ?`, L.addDaysYmd(day2, -(spec('amazon_catalog_rank_daily').keepDays - 1))), 0, 'BSR の残す日数より古い行');
+  assert.equal(count(mdb, `SELECT COUNT(*) AS n FROM mirror_amazon_catalog_rank_daily WHERE date_jst = ?`, L.addDaysYmd(day2, -(spec('amazon_catalog_rank_daily').keepDays - 1))), 2 * N);
   // 1 日の送りの大きさ = 直近の日数だけ
   const rowsSent = c.calls.reduce((s, x) => s + x.rows, 0);
   assert.ok(rowsSent < first.calls.reduce((s, x) => s + x.rows, 0) / 3, `翌日の送り ${rowsSent} 行`);
@@ -581,6 +581,24 @@ await ta('[H1] daily-sync: 取得 (広告の帰属・在庫計画の履歴・出
   const G = await import('../apps/warehouse/publish-gate.js');
   assert.ok(Object.hasOwn(G.PUBLISH_UNGATED_SCRIPTS, 'apps/warehouse/sync-amazon-ai-mirror.js'));
   assert.equal(G.publishGateDecision('apps/warehouse/sync-amazon-ai-mirror.js --daily', { broken: true }).skip, false);
+});
+
+await ta('[E6] データの表 (返品・広告の帰属) の送りが失敗した回は、取得の記録 (sp_report_fetch_days・ads_attrib_fetch_days) を送らない = facts が「0 件で正常」と誤らない (Codex round2 P1)', async () => {
+  const deps = ['amazon_fba_returns', 'fact_amazon_ads_sku_attrib'];
+  const marks = ['sp_report_fetch_days', 'ads_attrib_fetch_days'];
+  const before = Object.fromEntries(marks.map((m) => [m, S.lastAppliedTo(SRC, m)]));
+  const c = countingPost(httpPost, (entity) => deps.includes(entity));
+  const outcomes = await S.syncAmazonAiMirror(SRC, { today: '2026-08-21', post: c.post, entities: [...marks, ...deps, 'amazon_fba_reimbursements'], log: quiet });
+  for (const m of marks) {
+    const o = outcomes.find((x) => x.entity === m);
+    assert.equal(o.status, 'failed', m);
+    assert.match(o.error, /データの表が失敗/);
+    assert.equal(S.lastAppliedTo(SRC, m), before[m], `${m} は送らない`);
+    assert.ok(!c.calls.some((x) => x.entity === m), `${m} の要求は出さない`);
+  }
+  // 記録は データの表の後に送る順 (返品が通れば、同じ回の補てんの失敗が無い限り記録も送る)
+  const idx = (e) => outcomes.findIndex((x) => x.entity === e);
+  assert.ok(idx('amazon_fba_reimbursements') < idx('sp_report_fetch_days'));
 });
 
 server.close();

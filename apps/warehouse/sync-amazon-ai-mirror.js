@@ -227,8 +227,18 @@ export async function syncEntity(db, spec, { today, full = false, dryRun = false
 export async function syncAmazonAiMirror(db, { today = jstToday(), full = false, dryRun = false, entities = null, post, chunkSize = DEFAULT_CHUNK_SIZE, log = console.log } = {}) {
   if (!dryRun) seedAmazonAiMirrorContracts(db);   // 契約は code が正 (initDB の前でも送れる・冪等)
   const specs = entities ? AMAZON_AI_MIRROR_ENTITIES.filter((s) => entities.includes(s.entity)) : AMAZON_AI_MIRROR_ENTITIES;
+  // 取得の記録 (dependsOn がある表) はデータの表の後に送り、データの表がこの回に失敗したら送らない (前の回の記録のまま = 前の回のデータと合う)。Codex round2 P1
+  const ordered = [...specs.filter((s) => !s.dependsOn), ...specs.filter((s) => s.dependsOn)];
   const outcomes = [];
-  for (const spec of specs) outcomes.push(await syncEntity(db, spec, { today, full, dryRun, post, chunkSize, log }));
+  for (const spec of ordered) {
+    const failedDeps = (spec.dependsOn || []).filter((dep) => outcomes.some((o) => o.entity === dep && o.status === 'failed'));
+    if (failedDeps.length) {
+      log(`  ❌ ${spec.entity}: データの表 (${failedDeps.join(', ')}) の送りが失敗した = 記録だけ先に送らない (次の朝にまとめて送る)`);
+      outcomes.push({ entity: spec.entity, status: 'failed', error: `データの表が失敗 (${failedDeps.join(', ')}) = 記録を送らない` });
+      continue;
+    }
+    outcomes.push(await syncEntity(db, spec, { today, full, dryRun, post, chunkSize, log }));
+  }
   return outcomes;
 }
 
