@@ -294,6 +294,44 @@ let normal;
   db.close();
 }
 
+// ═══ 4b. 分からない値を 0 や完全な値にしない (Codex R1) ═══
+console.log('\n■ 4b. 分からない値・取れていない日');
+{
+  const db = new Database(':memory:');
+  createAll(db);
+  seedNormal(db);
+  // 店全体: 今週 1 日だけ units が NULL → そろった 6 日で割る (4.0% のまま)
+  db.prepare("UPDATE amazon_sales_traffic_daily SET units_ordered = NULL WHERE date_jst = '2026-10-12'").run();
+  // SKU-A: 今週 3 日 units が NULL → 転換率は分からない → 転換率の低下として出さない
+  db.prepare("UPDATE amazon_sales_traffic_sku_daily SET units_ordered = NULL WHERE seller_sku = 'SKU-A' AND date_jst IN ('2026-10-12','2026-10-13','2026-10-14')").run();
+  // SKU-B: 売上の列が全部 NULL → 売上は分からない (0 にして外さない)
+  db.prepare("UPDATE amazon_sales_traffic_sku_daily SET ordered_product_sales = NULL WHERE seller_sku = 'SKU-B'").run();
+  // 補てん: 金額の列が無い行
+  db.prepare("UPDATE amazon_fba_reimbursements SET amount_total = NULL WHERE reimbursement_id = 'rb1'").run();
+  // 広告: 一部の行の 14 日売上が NULL / 09-30 は広告が無い日 (0 行で取れている)
+  db.prepare("UPDATE fact_amazon_ads_sku_attrib SET sales_14d = NULL WHERE target = 'sku-c' AND date_jst = '2026-09-29'").run();
+  db.prepare("DELETE FROM fact_amazon_ads_sku_attrib WHERE date_jst = '2026-09-30'").run();
+  const o = buildAmazonHealthFacts(db, weekly());
+  ok(o.store_traffic.this_week.cvr_pct === 4, '店全体: units が NULL の日を除いて 4.0%', o.store_traffic.this_week);
+  ok(o.sku_conversion_drops.items.every((i) => i.sku !== 'SKU-A') && o.sku_conversion_drops.matched_skus === 1, 'SKU-A は転換率が分からない → 低下に出さない', o.sku_conversion_drops);
+  const b = o.buybox_lost.items.find((i) => i.sku === 'SKU-B');
+  ok(b && b.sales_28d_yen === null, 'カート: 売上が分からない SKU-B も外さない (sales_28d_yen = null)', o.buybox_lost);
+  ok(o.reimbursements.amount_yen === null && o.reimbursements.amount_unknown_cases === 1 && o.reimbursements.by_reason[0].amount_yen === null,
+    '補てん: 金額が NULL の行があれば合計は null (0 にしない)', o.reimbursements);
+  ok(o.ads_poor_roas.status === 'ok' && o.ads_poor_roas.sales_14d_yen === null && o.ads_poor_roas.roas_14d === null && o.ads_poor_roas.sales_14d_unknown_rows === 1,
+    '広告: 14 日売上が NULL の行があれば全体の売上・ROAS は null', o.ads_poor_roas);
+  ok(o.ads_poor_roas.items[0]?.sku === 'SKU-A' && o.ads_poor_roas.items[0].spend_yen === 6000, '広告の無い日は取得の記録で数える (6 日分の SKU-A は出る)', o.ads_poor_roas.items);
+  // 2 日 NULL → 店全体の転換率も分からない
+  db.prepare("UPDATE amazon_sales_traffic_daily SET units_ordered = NULL WHERE date_jst = '2026-10-13'").run();
+  // 返品・補てん: 取得の記録が今週の最後の 1 日だけ
+  db.prepare("DELETE FROM sp_report_fetch_days WHERE date_jst <> ?").run(REF);
+  const o2 = buildAmazonHealthFacts(db, weekly());
+  ok(o2.store_traffic.this_week.cvr_pct === null, '店全体: units のそろった日が 5/7 → 転換率 null', o2.store_traffic.this_week);
+  ok(o2.returns.status === 'no_data' && /取れた日数が足りない \(1\/7/.test(o2.returns.reason), '返品: 取得の記録 1/7 日 → no_data', o2.returns);
+  ok(o2.reimbursements.status === 'no_data' && /取れた日数が足りない/.test(o2.reimbursements.reason), '補てん: 同じく no_data', o2.reimbursements);
+  db.close();
+}
+
 // ═══ 5. 返品 0 件 ═══
 console.log('\n■ 5. 返品が 0 件の週');
 {

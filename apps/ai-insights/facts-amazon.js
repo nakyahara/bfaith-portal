@@ -137,56 +137,50 @@ function guard(fn) {
 function inList(arr) { return arr.map(() => '?').join(','); }
 
 /**
- * SKU (小文字) → { sales, units }。注文ベース (アクセスのレポート) があればそれ・無ければ決済ベース (finance の統合 view)。
- * どちらも無ければ null。memo は同じ期間の呼び出しを 1 回にする
+ * SKU (小文字) / ASIN (大文字) → { sales, units }。注文ベース (アクセスのレポート) があればそれ・無ければ決済ベース (finance の統合 view)。
+ * どちらも無ければ null。memo は同じ期間の呼び出しを 1 回にする。
+ * 🚨 アクセスのレポートの行はあっても売上の列が全部 NULL なら使わない (次の候補へ)。SKU ごとの売上が NULL = 分からない (0 にしない)。Codex R1
  */
-function salesBySku(db, from, to, memo) {
-  const key = `sku|${from}|${to}`;
+function salesMap(db, by, from, to, memo) {
+  const key = `${by}|${from}|${to}`;
   if (memo.has(key)) return memo.get(key);
+  const trafficKey = by === 'sku' ? 'LOWER(TRIM(seller_sku))' : 'UPPER(TRIM(child_asin))';
+  const financeKey = by === 'sku' ? 'sku_key' : 'UPPER(TRIM(asin_norm))';
+  const financeWhere = by === 'sku' ? '' : "AND asin_norm IS NOT NULL AND asin_norm <> ''";
   let out = null;
   try {
     const t = resolveTable(db, TABLES.trafficSku);
     if (t) {
-      const rows = db.prepare(`SELECT LOWER(TRIM(seller_sku)) AS k, SUM(ordered_product_sales) AS sales, SUM(units_ordered) AS units
-        FROM ${t} WHERE date_jst >= ? AND date_jst < ? GROUP BY LOWER(TRIM(seller_sku))`).all(from, to);
-      if (rows.length > 0) out = { source: 'amazon_sales_traffic (注文ベース)', map: new Map(rows.map((r) => [r.k, r])) };
+      const rows = db.prepare(`SELECT ${trafficKey} AS k, SUM(ordered_product_sales) AS sales, SUM(units_ordered) AS units
+        FROM ${t} WHERE date_jst >= ? AND date_jst < ? GROUP BY ${trafficKey}`).all(from, to);
+      if (rows.some((r) => r.sales != null)) out = { source: 'amazon_sales_traffic (注文ベース)', map: new Map(rows.map((r) => [r.k, r])) };
     }
   } catch { out = null; }
   if (!out) {
     try {
-      const rows = db.prepare(`SELECT sku_key AS k, SUM(sales_gross_jpy_incl) AS sales, SUM(units_net_sold) AS units
-        FROM v_mall_finance_daily_unified WHERE mall = 'amazon' AND date_jst >= ? AND date_jst < ? GROUP BY sku_key`).all(from, to);
+      const rows = db.prepare(`SELECT ${financeKey} AS k, SUM(sales_gross_jpy_incl) AS sales, SUM(units_net_sold) AS units
+        FROM v_mall_finance_daily_unified WHERE mall = 'amazon' AND date_jst >= ? AND date_jst < ? ${financeWhere} GROUP BY ${financeKey}`).all(from, to);
       if (rows.length > 0) out = { source: 'v_mall_finance_daily_unified (決済ベース)', map: new Map(rows.map((r) => [r.k, r])) };
     } catch { out = null; }
   }
   memo.set(key, out);
   return out;
 }
+const salesBySku = (db, from, to, memo) => salesMap(db, 'sku', from, to, memo);
+const salesByAsin = (db, from, to, memo) => salesMap(db, 'asin', from, to, memo);
 
-/** ASIN (大文字) → { sales, units }。考え方は salesBySku と同じ */
-function salesByAsin(db, from, to, memo) {
-  const key = `asin|${from}|${to}`;
-  if (memo.has(key)) return memo.get(key);
-  let out = null;
-  try {
-    const t = resolveTable(db, TABLES.trafficSku);
-    if (t) {
-      const rows = db.prepare(`SELECT UPPER(TRIM(child_asin)) AS k, SUM(ordered_product_sales) AS sales, SUM(units_ordered) AS units
-        FROM ${t} WHERE date_jst >= ? AND date_jst < ? GROUP BY UPPER(TRIM(child_asin))`).all(from, to);
-      if (rows.length > 0) out = { source: 'amazon_sales_traffic (注文ベース)', map: new Map(rows.map((r) => [r.k, r])) };
-    }
-  } catch { out = null; }
-  if (!out) {
-    try {
-      const rows = db.prepare(`SELECT UPPER(TRIM(asin_norm)) AS k, SUM(sales_gross_jpy_incl) AS sales, SUM(units_net_sold) AS units
-        FROM v_mall_finance_daily_unified WHERE mall = 'amazon' AND date_jst >= ? AND date_jst < ? AND asin_norm IS NOT NULL AND asin_norm <> ''
-        GROUP BY UPPER(TRIM(asin_norm))`).all(from, to);
-      if (rows.length > 0) out = { source: 'v_mall_finance_daily_unified (決済ベース)', map: new Map(rows.map((r) => [r.k, r])) };
-    } catch { out = null; }
-  }
-  memo.set(key, out);
-  return out;
+/**
+ * 売上の表から 1 つの値: 売上の出どころが無い → null / その SKU の行が無い → 0 (売れていない) / 行はあるが売上が NULL → null (分からない)
+ * field = 'sales' | 'units'
+ */
+function salesValue(sales, k, field = 'sales') {
+  if (!sales) return null;
+  const r = sales.map.get(k);
+  if (!r) return 0;
+  return r[field] == null ? null : r[field];
 }
+/** 売れ筋か: 売上が正 / 分からない (null) も外さない (分からないことを「売れていない」にしない) */
+const sellingOrUnknown = (v) => v == null || v > 0;
 
 /** SKU (小文字) → 商品名。出品の写し → finance の順。読めなければ空 */
 function productNames(db, skus) {
@@ -222,6 +216,8 @@ function storeTraffic(db, ctx) {
   const agg = ([from, to]) => {
     const r = db.prepare(`SELECT COUNT(sessions) AS days, SUM(sessions) AS sessions, SUM(page_views) AS pv,
         SUM(units_ordered) AS units, SUM(ordered_product_sales) AS sales,
+        COUNT(CASE WHEN units_ordered IS NOT NULL THEN sessions END) AS cvr_days,
+        SUM(CASE WHEN units_ordered IS NOT NULL THEN sessions END) AS s_pair, SUM(CASE WHEN sessions IS NOT NULL THEN units_ordered END) AS u_pair,
         SUM(buy_box_percentage * page_views) AS bb_w, SUM(CASE WHEN buy_box_percentage IS NOT NULL THEN page_views END) AS bb_pv,
         AVG(buy_box_percentage) AS bb_avg
       FROM ${chk.table} WHERE date_jst >= ? AND date_jst < ?`).get(from, to);
@@ -233,7 +229,8 @@ function storeTraffic(db, ctx) {
       page_views: r?.pv ?? null,
       units_ordered: r?.units ?? null,
       ordered_sales_yen: yen(r?.sales),
-      cvr_pct: pctOf(r?.units, r?.sessions),
+      // 転換率は sessions と units の両方がある日だけで割る (片方が NULL の日を混ぜない)。そろった日が足りなければ null。Codex R1
+      cvr_pct: (r?.cvr_days || 0) >= minDaysFor(daysBetween(from, to)) ? pctOf(r.u_pair, r.s_pair) : null,
       // カート獲得率は PV の重み付き平均 (PV が無い日だけなら単純平均)
       buy_box_pct: r?.bb_pv > 0 ? r1(r.bb_w / r.bb_pv) : r1(r?.bb_avg),
     };
@@ -272,16 +269,20 @@ function skuConversionDrops(db, ctx) {
   const prevDays = dayCount(ctx.prev);
   if (curDays < minDaysFor(daysBetween(...ctx.cur))) return noData(`この期間の日数が足りない (${curDays}/${daysBetween(...ctx.cur)} 日)`);
   if (prevDays < minDaysFor(daysBetween(...ctx.prev))) return noData(`前の期間の日数が足りない (${prevDays}/${daysBetween(...ctx.prev)} 日・取り始めたばかり)`);
+  // 転換率は sessions と units の両方がある行だけで割る (sp_* / up_*)。Codex R1
   const rows = db.prepare(`SELECT LOWER(TRIM(seller_sku)) AS k, MAX(seller_sku) AS sku, MAX(child_asin) AS asin,
-      SUM(CASE WHEN date_jst >= ? THEN sessions END) AS s_cur, SUM(CASE WHEN date_jst < ? THEN sessions END) AS s_prev,
-      SUM(CASE WHEN date_jst >= ? THEN units_ordered END) AS u_cur, SUM(CASE WHEN date_jst < ? THEN units_ordered END) AS u_prev,
-      SUM(CASE WHEN date_jst >= ? THEN ordered_product_sales END) AS y_cur, SUM(CASE WHEN date_jst < ? THEN ordered_product_sales END) AS y_prev,
-      SUM(CASE WHEN date_jst >= ? THEN buy_box_percentage * page_views END) AS bbw_cur,
-      SUM(CASE WHEN date_jst >= ? AND buy_box_percentage IS NOT NULL THEN page_views END) AS bbpv_cur,
-      SUM(CASE WHEN date_jst < ? THEN buy_box_percentage * page_views END) AS bbw_prev,
-      SUM(CASE WHEN date_jst < ? AND buy_box_percentage IS NOT NULL THEN page_views END) AS bbpv_prev
-    FROM ${chk.table} WHERE date_jst >= ? AND date_jst < ?
-    GROUP BY LOWER(TRIM(seller_sku))`).all(...Array(10).fill(ctx.cur[0]), ctx.prev[0], ctx.cur[1]);
+      SUM(CASE WHEN date_jst >= @cs THEN sessions END) AS s_cur, SUM(CASE WHEN date_jst < @cs THEN sessions END) AS s_prev,
+      SUM(CASE WHEN date_jst >= @cs AND units_ordered IS NOT NULL THEN sessions END) AS sp_cur,
+      SUM(CASE WHEN date_jst < @cs AND units_ordered IS NOT NULL THEN sessions END) AS sp_prev,
+      SUM(CASE WHEN date_jst >= @cs AND sessions IS NOT NULL THEN units_ordered END) AS up_cur,
+      SUM(CASE WHEN date_jst < @cs AND sessions IS NOT NULL THEN units_ordered END) AS up_prev,
+      SUM(CASE WHEN date_jst >= @cs THEN ordered_product_sales END) AS y_cur, SUM(CASE WHEN date_jst < @cs THEN ordered_product_sales END) AS y_prev,
+      SUM(CASE WHEN date_jst >= @cs THEN buy_box_percentage * page_views END) AS bbw_cur,
+      SUM(CASE WHEN date_jst >= @cs AND buy_box_percentage IS NOT NULL THEN page_views END) AS bbpv_cur,
+      SUM(CASE WHEN date_jst < @cs THEN buy_box_percentage * page_views END) AS bbw_prev,
+      SUM(CASE WHEN date_jst < @cs AND buy_box_percentage IS NOT NULL THEN page_views END) AS bbpv_prev
+    FROM ${chk.table} WHERE date_jst >= @ps AND date_jst < @ce
+    GROUP BY LOWER(TRIM(seller_sku))`).all({ cs: ctx.cur[0], ps: ctx.prev[0], ce: ctx.cur[1] });
   const minPrev = MIN_SESSIONS_PER_DAY * daysBetween(...ctx.prev);
   const minCur = Math.ceil((MIN_SESSIONS_PER_DAY * daysBetween(...ctx.cur)) / 2);
   const hits = [];
@@ -289,8 +290,9 @@ function skuConversionDrops(db, ctx) {
   for (const r of rows) {
     if (!(r.s_prev >= minPrev) || !(r.s_cur >= minCur)) continue;
     checked++;
-    const cvrCur = pctOf(r.u_cur, r.s_cur);
-    const cvrPrev = pctOf(r.u_prev, r.s_prev);
+    // 両方ある行のセッションが全体の MIN_COVERAGE_RATIO 未満なら、その期間の転換率は分からない (null)
+    const cvrCur = r.sp_cur >= r.s_cur * MIN_COVERAGE_RATIO ? pctOf(r.up_cur, r.sp_cur) : null;
+    const cvrPrev = r.sp_prev >= r.s_prev * MIN_COVERAGE_RATIO ? pctOf(r.up_prev, r.sp_prev) : null;
     const bbCur = r.bbpv_cur > 0 ? r1(r.bbw_cur / r.bbpv_cur) : null;
     const bbPrev = r.bbpv_prev > 0 ? r1(r.bbw_prev / r.bbpv_prev) : null;
     const cvrDrop = cvrCur != null && cvrPrev != null && cvrCur <= cvrPrev * CVR_DROP_RATIO && cvrPrev - cvrCur >= CVR_DROP_MIN_PT;
@@ -343,16 +345,17 @@ function listingProblems(db, ctx) {
     for (const i of iss) if (!topIssue.has(i.sku_key)) topIssue.set(i.sku_key, { code: i.code, message: cutName(i.message) });
   }
   const enriched = rows.map((r) => {
-    const s = sales?.map.get(String(r.sku_key).toLowerCase());
+    const v = salesValue(sales, String(r.sku_key).toLowerCase());
     return {
       sku: r.seller_sku, asin: r.asin, product_name: cutName(r.item_name),
       listing_status: r.status, is_buyable: r.is_buyable === 1, suppressed: r.suppressed === 1, error_count: r.error_count,
       top_error: topIssue.get(r.sku_key) || null,
-      sales_28d_yen: sales ? yen(s?.sales ?? 0) : null,
+      sales_28d_yen: yen(v),   // null = 売上が分からない (出どころが無い・その SKU の売上の列が NULL)
     };
   });
-  const selling = sales ? enriched.filter((e) => e.sales_28d_yen > 0) : enriched;
-  selling.sort((a, b) => (b.sales_28d_yen || 0) - (a.sales_28d_yen || 0) || (b.error_count || 0) - (a.error_count || 0) || (a.sku < b.sku ? -1 : 1));
+  // 売れ筋 = 売上が正。売上が分からない SKU も外さない (後ろに並べる)
+  const selling = sales ? enriched.filter((e) => sellingOrUnknown(e.sales_28d_yen)) : enriched;
+  selling.sort((a, b) => (b.sales_28d_yen ?? -1) - (a.sales_28d_yen ?? -1) || (b.error_count || 0) - (a.error_count || 0) || (a.sku < b.sku ? -1 : 1));
   return {
     status: 'ok',
     as_of: asOf,
@@ -385,10 +388,10 @@ function buyboxLost(db, ctx) {
     k: r.k, sku: r.sku, asin: r.asin,
     lost_days: r.lost_days, seen_days: r.seen_days,
     my_price_yen: yen(r.my_price), buybox_price_yen: yen(r.buybox_price),
-    sales_28d_yen: sales ? yen(sales.map.get(r.k)?.sales ?? 0) : null,
+    sales_28d_yen: yen(salesValue(sales, r.k)),   // null = 売上が分からない
   }));
-  const selling = sales ? items.filter((i) => i.sales_28d_yen > 0) : items;
-  selling.sort((a, b) => (b.sales_28d_yen || 0) - (a.sales_28d_yen || 0) || (b.lost_days || 0) - (a.lost_days || 0) || (a.k < b.k ? -1 : 1));
+  const selling = sales ? items.filter((i) => sellingOrUnknown(i.sales_28d_yen)) : items;
+  selling.sort((a, b) => (b.sales_28d_yen ?? -1) - (a.sales_28d_yen ?? -1) || (b.lost_days || 0) - (a.lost_days || 0) || (a.k < b.k ? -1 : 1));
   const top = selling.slice(0, TOP_N);
   const names = productNames(db, top.map((t) => t.k));
   return {
@@ -410,12 +413,11 @@ function returnsFacts(db, ctx) {
   });
   // 返品が 0 件の期間は表が空でもありうる → 取得の記録 (sp_report_fetch_days) が新しければ「0 件で取れている」= ok
   if (!chk.ok) return chk.out;
+  const cov = reportCoverage(db, chk, RETURNS_REPORT, ctx);
+  if (cov.curShort) return noData(cov.curShort);
   const [from, to] = ctx.cur;
   const total = db.prepare(`SELECT COALESCE(SUM(quantity), 0) AS q, COUNT(*) AS n FROM ${chk.table} WHERE return_date_jst >= ? AND return_date_jst < ?`).get(from, to);
   const prevTotal = db.prepare(`SELECT COALESCE(SUM(quantity), 0) AS q FROM ${chk.table} WHERE return_date_jst >= ? AND return_date_jst < ?`).get(...ctx.prev);
-  const prevCovered = chk.src !== chk.table
-    ? (db.prepare(`SELECT COUNT(*) AS n FROM ${chk.src} WHERE report_type = ? AND date_jst >= ? AND date_jst < ?`).get(RETURNS_REPORT, ...ctx.prev)?.n || 0)
-    : null;
   const reasons = db.prepare(`SELECT COALESCE(NULLIF(reason, ''), '(理由なし)') AS reason, SUM(quantity) AS units FROM ${chk.table}
     WHERE return_date_jst >= ? AND return_date_jst < ? GROUP BY 1 ORDER BY units DESC, reason LIMIT 5`).all(from, to);
   const skuRows = db.prepare(`SELECT LOWER(TRIM(seller_sku)) AS k, MAX(seller_sku) AS sku, MAX(asin) AS asin, MAX(product_name) AS name, SUM(quantity) AS units
@@ -424,25 +426,44 @@ function returnsFacts(db, ctx) {
   const reasonStmt = db.prepare(`SELECT COALESCE(NULLIF(reason, ''), '(理由なし)') AS reason, SUM(quantity) AS units FROM ${chk.table}
     WHERE LOWER(TRIM(seller_sku)) = ? AND return_date_jst >= ? AND return_date_jst < ? GROUP BY 1 ORDER BY units DESC, reason LIMIT 3`);
   const sold = salesBySku(db, from, to, ctx.memo);
-  const prevComparable = prevCovered === null || prevCovered >= minDaysFor(daysBetween(...ctx.prev));
   return {
     status: 'ok',
     as_of: chk.latest,
+    coverage: cov.label,
     returned_units: total.q,
-    [`${ctx.labels.prevShort}_returned_units`]: prevComparable ? prevTotal.q : null,
+    [`${ctx.labels.prevShort}_returned_units`]: cov.prevOk ? prevTotal.q : null,
     top_reasons: reasons,
     top_skus: skuRows.map((r) => {
-      const s = sold?.map.get(r.k);
+      const soldUnits = salesValue(sold, r.k, 'units');
       return {
         sku: r.sku, asin: r.asin, product_name: cutName(r.name), returned_units: r.units,
-        sold_units: sold ? (s?.units ?? 0) : null,
+        sold_units: soldUnits,
         // 返品は注文より後に来るため、同じ期間の販売数との比は目安
-        return_rate_pct: sold && s?.units > 0 ? pctOf(r.units, s.units) : null,
-        sales_yen: sold ? yen(s?.sales ?? 0) : null,
+        return_rate_pct: soldUnits > 0 ? pctOf(r.units, soldUnits) : null,
+        sales_yen: yen(salesValue(sold, r.k)),
         reasons: reasonStmt.all(r.k, from, to),
       };
     }),
     note: '返品日の基準。return_rate_pct = 同じ期間の販売数に対する返品数 (返品は注文より遅れて来るので目安)。理由は Amazon のコードのまま',
+  };
+}
+
+/**
+ * 返品・補てんの「期間がそろって取れているか」を取得の記録 (sp_report_fetch_days) で見る。Codex R1
+ * 記録の表が無い (新しさを表の行で見た) ときは確かめられない = 'unverified' (数字は出すが印を付ける)
+ */
+function reportCoverage(db, chk, reportType, ctx) {
+  const t = resolveTable(db, TABLES.reportDays);
+  if (!t || chk.src !== t) return { label: 'unverified (取得の記録が無いため期間のそろいは確かめていない)', prevOk: true, curShort: null };
+  const count = ([from, to]) => db.prepare(`SELECT COUNT(DISTINCT date_jst) AS n FROM ${t} WHERE report_type = ? AND date_jst >= ? AND date_jst < ?`)
+    .get(reportType, from, to)?.n || 0;
+  const cur = count(ctx.cur);
+  const curDays = daysBetween(...ctx.cur);
+  const prev = count(ctx.prev);
+  return {
+    label: `取得の記録 ${cur}/${curDays} 日`,
+    curShort: cur < minDaysFor(curDays) ? `この期間の取れた日数が足りない (${cur}/${curDays} 日)` : null,
+    prevOk: prev >= minDaysFor(daysBetween(...ctx.prev)),
   };
 }
 
@@ -453,20 +474,27 @@ function reimbursementFacts(db, ctx) {
     fetchDays: { candidates: TABLES.reportDays, dateCol: 'date_jst', where: 'report_type = ?', params: [REIMB_REPORT] },
   });
   if (!chk.ok) return chk.out;
+  const cov = reportCoverage(db, chk, REIMB_REPORT, ctx);
+  if (cov.curShort) return noData(cov.curShort);
   const [from, to] = ctx.cur;
-  const cur = db.prepare(`SELECT COUNT(*) AS n, COALESCE(SUM(amount_total), 0) AS amt, COALESCE(SUM(quantity_reimbursed_total), 0) AS q
-    FROM ${chk.table} WHERE approval_date_jst >= ? AND approval_date_jst < ?`).get(from, to);
-  const prev = db.prepare(`SELECT COALESCE(SUM(amount_total), 0) AS amt FROM ${chk.table} WHERE approval_date_jst >= ? AND approval_date_jst < ?`).get(...ctx.prev);
-  const reasons = db.prepare(`SELECT COALESCE(NULLIF(reason, ''), '(理由なし)') AS reason, COUNT(*) AS cases, SUM(amount_total) AS amt
+  // 金額・数量が NULL の行 (レポートに列が無い) があれば合計は「分からない」(0 にしない)。行が 0 件なら 0。Codex R1
+  const AGG = `COUNT(*) AS n, SUM(amount_total) AS amt, COUNT(amount_total) AS amt_n,
+    SUM(quantity_reimbursed_total) AS q, COUNT(quantity_reimbursed_total) AS q_n`;
+  const total = (n, sum, cnt) => (n === 0 ? 0 : cnt < n ? null : sum);
+  const cur = db.prepare(`SELECT ${AGG} FROM ${chk.table} WHERE approval_date_jst >= ? AND approval_date_jst < ?`).get(from, to);
+  const prev = db.prepare(`SELECT ${AGG} FROM ${chk.table} WHERE approval_date_jst >= ? AND approval_date_jst < ?`).get(...ctx.prev);
+  const reasons = db.prepare(`SELECT COALESCE(NULLIF(reason, ''), '(理由なし)') AS reason, ${AGG}
     FROM ${chk.table} WHERE approval_date_jst >= ? AND approval_date_jst < ? GROUP BY 1 ORDER BY amt DESC, reason LIMIT 5`).all(from, to);
   return {
     status: 'ok',
     as_of: chk.latest,
+    coverage: cov.label,
     cases: cur.n,
-    units: cur.q,
-    amount_yen: yen(cur.amt),
-    [`${ctx.labels.prevShort}_amount_yen`]: yen(prev.amt),
-    by_reason: reasons.map((r) => ({ reason: r.reason, cases: r.cases, amount_yen: yen(r.amt) })),
+    units: total(cur.n, cur.q, cur.q_n),
+    amount_yen: yen(total(cur.n, cur.amt, cur.amt_n)),
+    amount_unknown_cases: cur.n - cur.amt_n,
+    [`${ctx.labels.prevShort}_amount_yen`]: cov.prevOk ? yen(total(prev.n, prev.amt, prev.amt_n)) : null,
+    by_reason: reasons.map((r) => ({ reason: r.reason, cases: r.n, amount_yen: yen(total(r.n, r.amt, r.amt_n)) })),
   };
 }
 
@@ -502,11 +530,11 @@ function bsrDrops(db, ctx) {
       asin: r.asin, category: r.title || r.category_id, rank_type: r.rank_type,
       rank: Math.round(r.r_cur), [`${ctx.labels.prevShort}_rank`]: Math.round(r.r_prev),
       rank_worse_pct: changePct(r.r_cur, r.r_prev),
-      [`${ctx.labels.prevShort}_sales_yen`]: sales ? yen(sales.map.get(String(r.asin).toUpperCase())?.sales ?? 0) : null,
+      [`${ctx.labels.prevShort}_sales_yen`]: yen(salesValue(sales, String(r.asin).toUpperCase())),
     });
   }
   const sk = `${ctx.labels.prevShort}_sales_yen`;
-  hits.sort((a, b) => (b[sk] || 0) - (a[sk] || 0) || (b.rank_worse_pct || 0) - (a.rank_worse_pct || 0) || (a.asin < b.asin ? -1 : 1));
+  hits.sort((a, b) => (b[sk] ?? -1) - (a[sk] ?? -1) || (b.rank_worse_pct || 0) - (a.rank_worse_pct || 0) || (a.asin < b.asin ? -1 : 1));
   return {
     status: 'ok',
     as_of: chk.latest,
@@ -593,8 +621,11 @@ function adsPoorRoas(db, ctx) {
   if (!chk.ok) return chk.out;
   const [from, to] = ctx.adsWindow;
   const days = daysBetween(from, to);
-  const n = db.prepare(`SELECT COUNT(DISTINCT date_jst) AS n FROM ${chk.table} WHERE date_jst >= ? AND date_jst < ?`).get(from, to)?.n || 0;
-  if (n < minDaysFor(days)) return noData(`見る期間 (${from}〜${addDays(to, -1)}) の日数が足りない (${n}/${days} 日)`);
+  // 日数は取得の記録 (ads_attrib_fetch_days) で数える: 広告の無い日は 0 行で取れている (行の日付だけ数えると足りなく見える)。Codex R1
+  //   記録の表が無い・記録が無いときは checkSource が表の行で新しさを見た (chk.src = 表そのもの) → 行の日付で数える
+  const daysT = chk.src;
+  const n = db.prepare(`SELECT COUNT(DISTINCT date_jst) AS n FROM ${daysT} WHERE date_jst >= ? AND date_jst < ?`).get(from, to)?.n || 0;
+  if (n < minDaysFor(days)) return noData(`見る期間 (${from}〜${addDays(to, -1)}) の取れた日数が足りない (${n}/${days} 日)`);
   const tot = db.prepare(`SELECT SUM(cost) AS cost, SUM(sales_14d) AS s14, SUM(CASE WHEN sales_14d IS NULL THEN 1 ELSE 0 END) AS nulls, COUNT(*) AS rows
     FROM ${chk.table} WHERE date_jst >= ? AND date_jst < ?`).get(from, to);
   if (tot.rows > 0 && tot.nulls === tot.rows) return noData('14 日の帰属売上 (sales_14d) が全部空 (レポートが列を返していない)');
@@ -612,9 +643,11 @@ function adsPoorRoas(db, ctx) {
     as_of: chk.latest,
     window: { from, to: addDays(to, -1) },
     window_note: ctx.adsWindowNote,
-    spend_yen: yen(tot.cost),
-    sales_14d_yen: yen(tot.s14),
-    roas_14d: tot.cost > 0 && tot.s14 != null ? r2(tot.s14 / tot.cost) : null,
+    spend_yen: yen(tot.cost ?? 0),
+    // 14 日の帰属売上が NULL の行が 1 つでもあれば、全体の売上と ROAS は分からない (費用だけ全部入って低く出るため)。Codex R1
+    sales_14d_yen: tot.nulls > 0 ? null : yen(tot.s14 ?? 0),
+    roas_14d: tot.nulls === 0 && tot.cost > 0 ? r2((tot.s14 || 0) / tot.cost) : null,
+    sales_14d_unknown_rows: tot.nulls || 0,
     rule: `広告費 ${minSpend} 円以上で 14 日の帰属売上 ÷ 広告費 が ${ADS_POOR_ROAS} 未満`,
     matched_targets: hits.length,
     items: top.map((r) => ({
