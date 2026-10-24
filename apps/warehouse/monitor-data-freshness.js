@@ -18,13 +18,15 @@
  *       台帳の remove_by を過ぎた = paused_overdue (⚠️ で目立たせる・GChat も新しく + 週 1 回)。
  *       MALL_FETCH_ONLY で外しているのに台帳に無い = paused_unregistered (⚠️)。止めていてもデータが新しい (手で入れた) = ふつう (ok)
  *   - 週末・祝日: 一覧の表はどれもモールの集計・API の注文・毎朝の写しで、土日・祝日も日付が進む (0 件の日も行がある・注文は毎日ある) ものだけにした。
- *     件数の少ないもの (au PAY・Qoo10・LINEギフトの注文、検索語・商品別、返品・補てん) はしきい値を長くしている
+ *     件数の少ないもの (au PAY・Qoo10・LINEギフトの注文、検索語・商品別) はしきい値を長くしている。
+ *     件数の無い日があるもの (レビュー・返品・補てん・台帳) は行の日付ではなく取込・取得の記録 (0 件の日・中身が前と同じ日も残る) で見る
  *   - 週次・月次の表はしきい値を長く (週次 21 日・月次 = 月の 1 日から 70 日 / 楽天RPP の月次 = 今月分が毎朝入るので 40 日)
  *   - 今朝の自動取得 (fetch-all) の結果 (scripts/mall-csv-fetcher/logs/fetch-all-last.json = lib-fetch-status.mjs) も読み、
  *     exit 3 (ログイン切れなど手で直すもの) と、再試行でも直らなかった失敗を要約に出す (データが古くなる前の 1 日目から見える)
  *
  * 通知 (GChat・env GCHAT_WEBHOOK・monitor-fee-coverage.js と同じ形):
- *   - 止まっているもの (stale / unreadable / paused_overdue / paused_unregistered) を 1 通にまとめる (取得の単位 = feed ごと)
+ *   - 止まっているもの (stale / unreadable / paused_overdue / paused_unregistered) を 1 通にまとめる (取得の単位 = feed ごと)。
+ *     文字数の上限に入らない feed は載せず「送った」にもしない (翌朝に送る)。1 つの feed の一部の表だけ戻った = 「一部」と表の名前で言う
  *   - 同じものを毎日は鳴らさない: 新しく止まった日に 1 回 → その後は REMIND_EVERY_DAYS (7) 日ごとに念押し。戻ったら 1 回「✅ 戻った」
  *     (記録 = warehouse.db の data_freshness_alert_state。送れなかった日は記録しない = 翌朝もう一度)
  *   - 今朝の自動取得の exit 3 だけでは GChat を送らない (子のスクリプトが送っている)。止まった feed の行に添える
@@ -75,17 +77,22 @@ export const FEEDS = Object.freeze({
   'amazon-listing': { mall: 'Amazon', label: 'Amazon出品の状態', fetcher: null, action: amazonAction('Amazon出品の状態') },
   'amazon-bsr': { mall: 'Amazon', label: 'Amazon BSR', fetcher: null, action: amazonAction('Amazon BSR') },
   'amazon-returns': { mall: 'Amazon', label: 'Amazon返品', fetcher: null, action: amazonAction('Amazon返品') },
-  'amazon-reimb': { mall: 'Amazon', label: 'Amazon補てん', fetcher: null, action: `${amazonAction('Amazon補てん')}。直近 60 日に補てんが 1 件も無いと取得日が進まない` },
+  'amazon-reimb': { mall: 'Amazon', label: 'Amazon補てん', fetcher: null, action: amazonAction('Amazon補てん') },
   'amazon-ledger': { mall: 'Amazon', label: 'Amazon在庫台帳', fetcher: null, action: amazonAction('Amazon在庫台帳') },
   'amazon-ads': { mall: 'Amazon', label: 'Amazon広告 (キャンペーン)', fetcher: null, action: 'daily-sync の「Amazon Ads (campaign)」の段を見る (Amazon Ads API のトークン・レポートの遅れ)' },
 });
 
-/** 1 行 = { table, column, kind ('date' = 日付・日時 / 'month' = YYYY-MM), maxAgeDays, feed, mall, what, action, fetcher, pause } */
-const row = (feed, table, column, maxAgeDays, what, kind = 'date') => {
+/**
+ * 1 行 = { key, table, column, kind ('date' = 日付・日時 / 'month' = YYYY-MM), where, maxAgeDays, feed, mall, what, action, fetcher, pause }
+ *   where = 行を絞る条件 (コードの中の固定の SQL だけ。例: 取込の記録のうち成功と「同じファイル」だけ) / key = 記録の鍵 (同じ表を 2 回見るときに分ける。既定 = 表の名前)
+ */
+const row = (feed, table, column, maxAgeDays, what, { kind = 'date', where = null, key = table } = {}) => {
   const f = FEEDS[feed];
   if (!f) throw new Error(`feed が無い: ${feed}`);
-  return Object.freeze({ table, column, kind, maxAgeDays, feed, mall: f.mall, what, action: f.action, fetcher: f.fetcher, pause: f.pause || null });
+  return Object.freeze({ key, table, column, kind, where, maxAgeDays, feed, mall: f.mall, what, action: f.action, fetcher: f.fetcher, pause: f.pause || null });
 };
+const OK_OR_DUP = "status IN ('ok', 'duplicate')";
+const spReport = (type) => `report_type = '${type}'`;
 
 /**
  * 見る表の一覧 (表と列はコードの CREATE TABLE で確かめた。2026-10-24)。
@@ -95,7 +102,7 @@ const row = (feed, table, column, maxAgeDays, what, kind = 'date') => {
 export const FRESHNESS_TABLES = Object.freeze([
   // 楽天 RPP 広告 (rakuten-ads-rpp-lib.js)。2026-07-17 から RMS のサブアプリで拒否 = MALL_FETCH_ONLY で取得から外している (台帳 mall-fetch-skip-rakuten-blocked)
   row('rakuten-rpp', 'fact_rakuten_ads_rpp_daily', 'date_jst', 4, 'RPP広告 日次 (キャンペーン別)'),
-  row('rakuten-rpp', 'fact_rakuten_ads_rpp', 'month_ym', 40, 'RPP広告 月次 (商品別・今月分が毎朝入る)', 'month'),
+  row('rakuten-rpp', 'fact_rakuten_ads_rpp', 'month_ym', 40, 'RPP広告 月次 (商品別・今月分が毎朝入る)', { kind: 'month' }),
   // 楽天 RMS データ分析 (rakuten-data-lib.js / rakuten-dd-lib.js)。同じく外している
   row('rakuten-data', 'fact_rakuten_store_daily', 'date_jst', 4, '店舗 日次'),
   row('rakuten-data', 'fact_rakuten_item_daily', 'date_jst', 4, '商品分析 日次'),
@@ -105,8 +112,9 @@ export const FRESHNESS_TABLES = Object.freeze([
   row('rakuten-data', 'fact_rakuten_purchaser_monthly', 'date_jst', 70, '新規・リピート購入者 月次 (date_jst = 月の 1 日)'),
   row('rakuten-data', 'fact_rakuten_item_purchaser_snapshot', 'date_jst', 4, '新規・リピート購入者 商品別 (取込日のスナップショット)'),
   row('rakuten-data', 'fact_rakuten_genre_purchaser_snapshot', 'date_jst', 4, '新規・リピート購入者 ジャンル別 (取込日のスナップショット)'),
-  // 楽天レビュー (rakuten-review-lib.js)。投稿日は客しだい = 取込が最後に見た時刻 (直近 30 日の窓の全部を毎回見る) で見る
-  row('rakuten-review', 'fact_rakuten_reviews', 'last_seen_at', 4, 'レビュー (取込が最後に見た時刻)'),
+  // 楽天レビュー (rakuten-review-lib.js)。投稿日は客しだい・中身が前と同じ CSV は取込が「同じファイル (duplicate)」で行に触らない
+  //   = 取込の記録 (成功 + 同じファイル) の時刻で見る (Codex R1 P2: レビューの行の last_seen_at だと、新しいレビューの無い週に止まった扱いになる)
+  row('rakuten-review', 'raw_rakuten_review_import_log', 'imported_at', 4, 'レビュー CSV の取込 (成功・同じファイルの記録の時刻)', { where: OK_OR_DUP }),
   // Yahoo ストクリ統計 6 種 (yahoo-data-lib.js)
   row('yahoo-data', 'fact_yahoo_store_device_daily', 'date_jst', 4, 'ストア 日次 (デバイス別)'),
   row('yahoo-data', 'fact_yahoo_inflow_daily', 'date_jst', 4, '流入 日次'),
@@ -114,8 +122,8 @@ export const FRESHNESS_TABLES = Object.freeze([
   row('yahoo-data', 'fact_yahoo_flash_hourly', 'date_jst', 4, '速報 時間帯別'),
   row('yahoo-data', 'fact_yahoo_item_daily', 'date_jst', 4, '商品 日次'),
   row('yahoo-data', 'fact_yahoo_keyword_daily', 'date_jst', 4, '検索キーワード 日次'),
-  // Yahoo レビュー (yahoo-review-lib.js)。90 日の全量 ZIP = 取込が最後に見た時刻
-  row('yahoo-review', 'fact_yahoo_reviews', 'last_seen_at', 4, 'レビュー (取込が最後に見た時刻)'),
+  // Yahoo レビュー (yahoo-review-lib.js)。楽天と同じ理由で取込の記録 (成功 + 同じファイル) の時刻で見る
+  row('yahoo-review', 'raw_yahoo_review_import_log', 'imported_at', 4, 'レビュー ZIP の取込 (成功・同じファイルの記録の時刻)', { where: OK_OR_DUP }),
   // au PAY 分析 (aupay-data-lib.js)
   row('aupay-data', 'fact_aupay_sales_daily', 'date_jst', 4, '売上分析 日次'),
   row('aupay-data', 'fact_aupay_referer_daily', 'date_jst', 4, '参照元分析 日次'),
@@ -142,9 +150,10 @@ export const FRESHNESS_TABLES = Object.freeze([
   row('amazon-traffic', 'amazon_sales_traffic_sku_daily', 'date_jst', 5, 'アクセス・転換率 日次 (SKU 別)'),
   row('amazon-listing', 'amazon_listing_status_daily', 'date_jst', 3, '出品の状態 (毎朝の写し)'),
   row('amazon-bsr', 'amazon_catalog_rank_daily', 'date_jst', 3, '売れ筋順位 (毎朝の写し)'),
-  row('amazon-returns', 'amazon_fba_returns', 'fetched_at', 3, 'FBA の返品 (直近 60 日を毎朝取り直す = 取得の時刻)'),
-  row('amazon-reimb', 'amazon_fba_reimbursements', 'fetched_at', 7, 'FBA の補てん (直近 60 日を毎朝取り直す = 取得の時刻)'),
-  row('amazon-ledger', 'amazon_inventory_ledger', 'fetched_at', 3, 'FBA の在庫の台帳 (直近 30 日を毎朝置き換え = 取得の時刻)'),
+  // 返品・補てん・台帳は件数の無い日がある = 取得の完全性の記録 (sp-api-report.js の sp_report_fetch_days・0 行の日も残る) の「揃った日」で見る
+  row('amazon-returns', 'sp_report_fetch_days', 'date_jst', 3, 'FBA の返品のレポート (揃った日・0 件の日も)', { where: spReport('GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA'), key: 'sp_report_fetch_days:returns' }),
+  row('amazon-reimb', 'sp_report_fetch_days', 'date_jst', 3, 'FBA の補てんのレポート (揃った日・0 件の日も)', { where: spReport('GET_FBA_REIMBURSEMENTS_DATA'), key: 'sp_report_fetch_days:reimbursements' }),
+  row('amazon-ledger', 'sp_report_fetch_days', 'date_jst', 3, 'FBA の在庫の台帳のレポート (揃った日)', { where: spReport('GET_LEDGER_DETAIL_VIEW_DATA'), key: 'sp_report_fetch_days:ledger' }),
   // 広告
   row('amazon-ads', 'fact_ad_spend_campaign', '日付', 4, '広告費 日次 (キャンペーン別)'),
 ]);
@@ -186,7 +195,7 @@ export function readLatest(db, t) {
   if (!has) return { state: 'missing', latest: null, raw: null, error: null };
   let r;
   try {
-    r = db.prepare(`SELECT MAX(${qid(t.column)}) AS v FROM ${qid(t.table)} WHERE ${qid(t.column)} IS NOT NULL AND TRIM(${qid(t.column)}) <> ''`).get();
+    r = db.prepare(`SELECT MAX(${qid(t.column)}) AS v FROM ${qid(t.table)} WHERE ${qid(t.column)} IS NOT NULL AND TRIM(${qid(t.column)}) <> ''${t.where ? ` AND (${t.where})` : ''}`).get();
   } catch (e) {
     return { state: 'unreadable', latest: null, raw: null, error: String(e && e.message).slice(0, 160) };
   }
@@ -270,7 +279,7 @@ export function problemsOf(items) {
       byPause.set(key, np);
       out.push(np);
     } else {
-      out.push({ key: `table:${it.table}`, status: it.status, feed: it.feed, latest: it.latest, item: it });
+      out.push({ key: `table:${it.key || it.table}`, status: it.status, feed: it.feed, latest: it.latest, item: it });
     }
   }
   return out;
@@ -285,9 +294,10 @@ export function planNotifications(problems, stateRows, today) {
   const due = [], quiet = [];
   for (const p of problems) {
     const s = prev.get(p.key);
-    if (!s || s.status !== p.status) due.push({ ...p, reason: 'new', since: today });
-    else if (!s.last_notified_on) due.push({ ...p, reason: 'retry', since: s.since_on });
-    else if (daysBetween(s.last_notified_on, today) >= REMIND_EVERY_DAYS) due.push({ ...p, reason: 'remind', since: s.since_on });
+    if (!s || s.status !== p.status) due.push({ ...p, reason: 'new', since: today, lastNotified: null });
+    else if (!s.last_notified_on) due.push({ ...p, reason: 'retry', since: s.since_on, lastNotified: null });
+    // 念押し: 送れなかったら前に送れた日を残す (= 翌朝もまた念押しの日・戻ったときに「戻った」を送る。Codex R1 P2)
+    else if (daysBetween(s.last_notified_on, today) >= REMIND_EVERY_DAYS) due.push({ ...p, reason: 'remind', since: s.since_on, lastNotified: s.last_notified_on });
     else quiet.push({ ...p, since: s.since_on, lastNotified: s.last_notified_on });
   }
   const now = new Set(problems.map((p) => p.key));
@@ -339,26 +349,57 @@ function feedLine(feed, ps, { fetch, today }) {
   return `${line}\n   → ${f.action}`;
 }
 
-/** GChat の 1 通 (送るものが無ければ null) */
+const labelOf = (feed) => (FEEDS[feed] ? FEEDS[feed].label : feed);
+
+/**
+ * GChat の 1 通 (送るものが無ければ null)。🚨 文字数の上限 (GCHAT_MAX) に入らない feed は載せない = 「送った」にしない (翌朝にまた送る。Codex R1 P2)
+ * @returns {null | { text: string, keys: Set<string>, recoveredKeys: Set<string>, omitted: number }}
+ *   keys = 載せた (= 送れたら「送った」にしてよい) 問題の鍵 / recoveredKeys = 載せた「戻った」の鍵
+ */
 export function buildFreshnessMessage({ today, due, quiet, recovered, fetch }) {
   if (due.length === 0 && recovered.length === 0) return null;
-  let msg = `⚠️ *データが止まっている* (${today} daily-sync・データの新しさ)\n`;
+  const footer = `\n見方: node apps/warehouse/monitor-data-freshness.js --dry-run (warehouse.db の表の最新の日付を読むだけ)`;
+  const head = (h) => `${h} (${today} daily-sync・データの新しさ)\n`;
+  const keys = new Set(), recoveredKeys = new Set();
+  const body = [];
+  let omitted = 0;
+  const budget = () => GCHAT_MAX - 200 - footer.length - body.join('').length;   // 200 = 見出し・省いた件数の行の分
+  const addBlocks = (title, groups, render) => {
+    const fit = [];
+    for (const g of groups) {
+      const s = render(g);
+      if (s.length + 1 + (fit.length ? 0 : title.length) > budget() - fit.join('\n').length) { omitted += g.ps.length; continue; }
+      fit.push(s);
+      for (const p of g.ps) keys.add(p.key);
+    }
+    if (fit.length) body.push(`${title}${fit.join('\n')}\n`);
+  };
   const fresh = due.filter((d) => d.reason !== 'remind');
   const remind = due.filter((d) => d.reason === 'remind');
-  if (fresh.length) msg += `\n🆕 *新しく止まった*\n${groupByFeed(fresh).map((g) => feedLine(g.feed, g.ps, { fetch, today })).join('\n')}\n`;
-  if (remind.length) msg += `\n🔁 *止まったまま (${REMIND_EVERY_DAYS} 日ごとの念押し)*\n${groupByFeed(remind).map((g) => feedLine(g.feed, g.ps, { fetch, today }) + `\n   (${md(g.ps[0].since)} から)`).join('\n')}\n`;
+  addBlocks('\n🆕 *新しく止まった*\n', groupByFeed(fresh), (g) => feedLine(g.feed, g.ps, { fetch, today }));
+  addBlocks(`\n🔁 *止まったまま (${REMIND_EVERY_DAYS} 日ごとの念押し)*\n`, groupByFeed(remind), (g) => `${feedLine(g.feed, g.ps, { fetch, today })}\n   (${md(g.ps[0].since)} から)`);
+  // 戻った: その feed にまだ止まっている表があれば「一部」と表の名前で言う (Codex R1 P2: 1 表だけ戻ったのに feed 全体が戻ったと言わない)
+  const stillBad = new Set([...due, ...quiet].map((p) => p.feed));
   if (recovered.length) {
-    const names = [...new Set(recovered.map((r) => FEEDS[r.feed] ? FEEDS[r.feed].label : r.feed))];
-    msg += `\n✅ *戻った*: ${names.join('・')}\n`;
-    if (due.length === 0) msg = msg.replace('⚠️ *データが止まっている*', '✅ *止まっていたデータが戻った*');
+    const parts = [];
+    for (const [feed, rs] of groupByFeed(recovered).map((g) => [g.feed, g.ps])) {
+      const s = stillBad.has(feed) ? `${labelOf(feed)} の一部 (${rs.map((r) => r.item_key.replace(/^table:/, '')).join(', ')}・ほかの表はまだ止まっている)` : labelOf(feed);
+      if (s.length + 20 > budget() - parts.join('・').length) continue;
+      parts.push(s);
+      for (const r of rs) recoveredKeys.add(r.item_key);
+    }
+    if (parts.length) body.push(`\n✅ *戻った*: ${parts.join('・')}\n`);
   }
   if (quiet.length) {
-    const names = groupByFeed(quiet).map((g) => `${FEEDS[g.feed] ? FEEDS[g.feed].label : g.feed} (${md(g.ps[0].since)} から)`);
-    msg += `\nほかに止まったまま (今日は念押ししない): ${names.join('・')}\n`;
+    const names = groupByFeed(quiet).map((g) => `${labelOf(g.feed)} (${md(g.ps[0].since)} から)`).join('・');
+    const s = `\nほかに止まったまま (今日は念押ししない): ${names}\n`;
+    body.push(s.length < budget() ? s : `\nほかに止まったまま (今日は念押ししない): ${quiet.length} 件\n`);
   }
-  msg += `\n見方: node apps/warehouse/monitor-data-freshness.js --dry-run (warehouse.db の表の最新の日付を読むだけ)`;
-  if (msg.length > GCHAT_MAX) msg = `${msg.slice(0, GCHAT_MAX)}\n…[切り詰め]`;
-  return msg;
+  if (omitted) body.push(`\n…ほか ${omitted} 件は文字数の上限で載せられない = 明日の朝に送る\n`);
+  if (keys.size === 0 && recoveredKeys.size === 0) return null;
+  const remaining = keys.size > 0 || quiet.length > 0 || omitted > 0;
+  const title = keys.size > 0 ? '⚠️ *データが止まっている*' : remaining ? '✅ *止まっていたデータの一部が戻った*' : '✅ *止まっていたデータが戻った*';
+  return { text: head(title) + body.join('') + footer, keys, recoveredKeys, omitted };
 }
 
 /** 要約の 1 行 (daily-sync の朝の通知にそのまま載る) */
@@ -416,8 +457,11 @@ async function sendGChat(webhook, text, fetchImpl = fetch) {
   }
 }
 
-/** 記録を今日の状態にそろえる (送れた = last_notified_on を今日に) */
-function saveState(db, { problems, plan, today, sent, nowIso }) {
+/**
+ * 記録を今日の状態にそろえる。送れた + 文面に載せた = last_notified_on を今日に。
+ * 送れなかった・載せられなかった = 新しく止まったものは null (翌朝もう一度) / 念押しは前に送れた日のまま (翌朝もまた念押しの日)
+ */
+function saveState(db, { problems, plan, today, sent, keys = new Set(), recoveredKeys = new Set(), nowIso }) {
   db.transaction(() => {
     const upsert = db.prepare(`INSERT INTO data_freshness_alert_state (item_key, status, feed, since_on, latest_date, last_notified_on, updated_at)
       VALUES (@key, @status, @feed, @since, @latest, @notified, @now)
@@ -429,12 +473,12 @@ function saveState(db, { problems, plan, today, sent, nowIso }) {
       const d = dueKeys.get(p.key);
       const q = quietKeys.get(p.key);
       const since = d ? d.since : q ? q.since : today;
-      const notified = d ? (sent ? today : null) : q ? q.lastNotified : null;
+      const notified = d ? (sent && keys.has(p.key) ? today : d.lastNotified || null) : q ? q.lastNotified : null;
       upsert.run({ key: p.key, status: p.status, feed: p.feed, since, latest: p.latest || null, notified, now: nowIso });
     }
     // 戻ったもの: 知らせていた (last_notified_on あり) ものは「戻った」を送れたときだけ消す (送れなかった = 翌朝もう一度)。知らせていないものは黙って消す
     const del = db.prepare('DELETE FROM data_freshness_alert_state WHERE item_key = ?');
-    for (const r of plan.recovered) if (sent || !r.last_notified_on) del.run(r.item_key);
+    for (const r of plan.recovered) if ((sent && recoveredKeys.has(r.item_key)) || !r.last_notified_on) del.run(r.item_key);
   })();
 }
 
@@ -449,32 +493,32 @@ export async function runFreshness(db, {
   const { today, items } = evaluateFreshness(db, { nowMs, tables, registry, fetchOnly });
   const fetch = summarizeFetchStatus(fetchStatus, { nowMs });
   for (const it of items) {
-    log(`  ${it.status.padEnd(19)} ${it.table}.${it.column}  最新 ${it.latest || '-'}${it.ageDays !== null ? ` (${it.ageDays} 日前)` : ''}  しきい値 ${it.maxAgeDays} 日${it.note ? `  ${it.note}` : ''}${it.error ? `  ${it.error}` : ''}`);
+    log(`  ${it.status.padEnd(19)} ${it.key && it.key !== it.table ? it.key : it.table}.${it.column}  最新 ${it.latest || '-'}${it.ageDays !== null ? ` (${it.ageDays} 日前)` : ''}  しきい値 ${it.maxAgeDays} 日${it.note ? `  ${it.note}` : ''}${it.error ? `  ${it.error}` : ''}`);
   }
   if (fetch.problem && fetch.problem !== 'missing') log(`  自動取得の記録を読めない: ${fetch.problem}`);
   const problems = problemsOf(items);
   if (dryRun) {
     const plan = planNotifications(problems, [], today);   // 記録を読まない = 全部「新しく止まった」として文面を出す
-    const message = buildFreshnessMessage({ today, ...plan, recovered: [], fetch });
-    if (message) log(`\n--- GChat の文面 (--dry-run = 送らない・記録しない) ---\n${message}\n---`);
-    return { status: 'dry_run', items, message, lastLine: buildSummaryLine({ items, fetch, notify: '--dry-run' }) };
+    const built = buildFreshnessMessage({ today, ...plan, recovered: [], fetch });
+    if (built) log(`\n--- GChat の文面 (--dry-run = 送らない・記録しない) ---\n${built.text}\n---`);
+    return { status: 'dry_run', items, message: built ? built.text : null, lastLine: buildSummaryLine({ items, fetch, notify: '--dry-run' }) };
   }
   ensureFreshnessState(db);
   const stateRows = db.prepare('SELECT item_key, status, feed, since_on, latest_date, last_notified_on FROM data_freshness_alert_state').all();
   const plan = planNotifications(problems, stateRows, today);
-  const message = buildFreshnessMessage({ today, ...plan, recovered: plan.recovered.filter((r) => r.last_notified_on), fetch });
+  const built = buildFreshnessMessage({ today, ...plan, recovered: plan.recovered.filter((r) => r.last_notified_on), fetch });
   let sent = false, notify = null, status = 'no_message';
-  if (message) {
-    log(`\n--- GChat の文面 ---\n${message}\n---`);
+  if (built) {
+    log(`\n--- GChat の文面 ---\n${built.text}\n---`);
     if (!webhook) { notify = 'GCHAT_WEBHOOK 未設定で送らない'; status = 'no_webhook'; }
     else {
-      try { sent = await send(webhook, message); } catch (e) { console.error(`[GChat] 通知失敗: ${e.message}`); sent = false; }
-      notify = sent ? `GChat に送った (${plan.due.length} 件)` : 'GChat に送れなかった = 明日もう一度';
+      try { sent = await send(webhook, built.text); } catch (e) { console.error(`[GChat] 通知失敗: ${e.message}`); sent = false; }
+      notify = sent ? `GChat に送った (${built.keys.size} 件${built.omitted ? `・上限で ${built.omitted} 件は明日` : ''})` : 'GChat に送れなかった = 明日もう一度';
       status = sent ? 'sent' : 'send_failed';
     }
   } else if (plan.quiet.length) notify = `GChat は ${REMIND_EVERY_DAYS} 日ごとの念押しの日まで送らない`;
-  saveState(db, { problems, plan, today, sent, nowIso: new Date(nowMs).toISOString() });
-  return { status, items, message, lastLine: buildSummaryLine({ items, fetch, notify }) };
+  saveState(db, { problems, plan, today, sent, keys: built ? built.keys : new Set(), recoveredKeys: built ? built.recoveredKeys : new Set(), nowIso: new Date(nowMs).toISOString() });
+  return { status, items, message: built ? built.text : null, lastLine: buildSummaryLine({ items, fetch, notify }) };
 }
 
 async function main() {

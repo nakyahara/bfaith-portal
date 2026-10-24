@@ -35,7 +35,7 @@ const DAY = 86400000;
 const day = (n) => new Date(NOW + 9 * 3600000 - n * DAY).toISOString().slice(0, 10);   // n 日前 (JST)
 
 /** 小さな一覧 (本物の FEEDS を使う) */
-const T = (feed, table, column, maxAgeDays, kind = 'date') => ({ ...F.FRESHNESS_TABLES.find((x) => x.feed === feed), table, column, kind, maxAgeDays });
+const T = (feed, table, column, maxAgeDays, kind = 'date') => ({ ...F.FRESHNESS_TABLES.find((x) => x.feed === feed), key: table, table, column, kind, maxAgeDays, where: null });
 const yahooTables = ['fact_yahoo_store_device_daily', 'fact_yahoo_inflow_daily'].map((n) => T('yahoo-data', n, 'date_jst', 4));
 const TABLES = [
   ...yahooTables,
@@ -331,6 +331,91 @@ await t('--dry-run = 送らない・記録の表も作らない', async () => {
   assert.equal(db.prepare("SELECT COUNT(*) n FROM sqlite_master WHERE name = 'data_freshness_alert_state'").get().n, 0);
 });
 
+console.log('Codex R1 の直し');
+await t('レビュー: 中身が前と同じ CSV (取込の記録 = duplicate) でも新しい = ふつう / 失敗 (error) の記録だけ = 止まっている', () => {
+  const rv = F.FRESHNESS_TABLES.filter((x) => x.feed === 'rakuten-review');
+  const db = new Database(':memory:');
+  db.exec(`CREATE TABLE raw_rakuten_review_import_log (imported_at TEXT, status TEXT)`);
+  const ins = db.prepare('INSERT INTO raw_rakuten_review_import_log VALUES (?, ?)');
+  ins.run(new Date(NOW - 10 * DAY).toISOString(), 'ok');
+  ins.run(new Date(NOW - 3 * 3600000).toISOString(), 'duplicate');
+  assert.equal(F.evaluateFreshness(db, { nowMs: NOW, tables: rv, registry: NO_PAUSE }).items[0].status, 'ok');
+  db.exec("UPDATE raw_rakuten_review_import_log SET status = 'error' WHERE status = 'duplicate'");
+  assert.equal(F.evaluateFreshness(db, { nowMs: NOW, tables: rv, registry: NO_PAUSE }).items[0].status, 'stale');
+});
+await t('返品・補てん: 0 件の日も取得の記録 (sp_report_fetch_days) で見る・レポートの種類ごとに分ける', () => {
+  const am = F.FRESHNESS_TABLES.filter((x) => x.table === 'sp_report_fetch_days');
+  const db = new Database(':memory:');
+  db.exec('CREATE TABLE sp_report_fetch_days (report_type TEXT, date_jst TEXT, row_count INTEGER)');
+  const ins = db.prepare('INSERT INTO sp_report_fetch_days VALUES (?, ?, ?)');
+  ins.run('GET_FBA_REIMBURSEMENTS_DATA', day(1), 0);
+  ins.run('GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA', day(9), 3);
+  const r = F.evaluateFreshness(db, { nowMs: NOW, tables: am, registry: NO_PAUSE });
+  assert.deepEqual(r.items.map((i) => [i.key, i.status]), [['sp_report_fetch_days:returns', 'stale'], ['sp_report_fetch_days:reimbursements', 'ok'], ['sp_report_fetch_days:ledger', 'not_started']]);
+  assert.deepEqual(F.problemsOf(r.items).map((p) => p.key), ['table:sp_report_fetch_days:returns']);
+});
+await t('文字数の上限: 入らない feed は載せず「送った」にしない = 翌朝に送る (全部の表が止まった朝)', async () => {
+  const db = new Database(':memory:');
+  for (const tb of F.FRESHNESS_TABLES) {
+    db.exec(`CREATE TABLE IF NOT EXISTS ${tb.table} ("${tb.column}" TEXT${tb.where ? ', status TEXT, report_type TEXT' : ''})`);
+    db.prepare(`INSERT INTO ${tb.table} ("${tb.column}"${tb.where ? ', status, report_type' : ''}) VALUES (?${tb.where ? ', ?, ?' : ''})`)
+      .run(tb.kind === 'month' ? '2026-01' : '2026-01-05', ...(tb.where ? ['ok', (tb.where.match(/'([A-Z_]+)'/) || [])[1] || null] : []));
+  }
+  const s = sender();
+  const all = (o = {}) => run(db, { send: s, tables: F.FRESHNESS_TABLES, ...o });
+  const r1 = await all();
+  assert.equal(r1.items.filter((i) => i.status === 'stale').length, F.FRESHNESS_TABLES.length);
+  assert.ok(s.sent[0].length <= 3900, String(s.sent[0].length));
+  assert.match(s.sent[0], /…ほか \d+ 件は文字数の上限で載せられない = 明日の朝に送る/);
+  assert.match(r1.lastLine, /上限で \d+ 件は明日/);
+  const left = db.prepare('SELECT COUNT(*) n FROM data_freshness_alert_state WHERE last_notified_on IS NULL').get().n;
+  assert.ok(left > 0);
+  // 載せた feed の表は送った・載せていない feed の表は送っていない (表の名前ではなく feed の名前で見る)
+  for (const row of db.prepare('SELECT item_key, feed, last_notified_on FROM data_freshness_alert_state').all()) {
+    const shown = s.sent[0].includes(`*${F.FEEDS[row.feed].label}*`);
+    assert.equal(!!row.last_notified_on, shown, `${row.item_key}: 載せた=${shown}・記録=${row.last_notified_on}`);
+  }
+  await all({ nowMs: NOW + DAY });
+  assert.equal(s.sent.length, 2);
+  assert.ok(s.sent[1].length <= 3900);
+  const left2 = db.prepare('SELECT COUNT(*) n FROM data_freshness_alert_state WHERE last_notified_on IS NULL').get().n;
+  assert.ok(left2 < left, `${left2} < ${left}`);
+});
+await t('1 つの feed の一部の表だけ戻った = 「一部」と表の名前・全部が戻ったとは言わない', async () => {
+  const run2 = runOnly('fact_yahoo_store_device_daily', 'fact_yahoo_inflow_daily');
+  const db = makeDb({ ...FRESH, fact_yahoo_store_device_daily: ['2026-10-13'], fact_yahoo_inflow_daily: ['2026-10-13'] });
+  const s = sender();
+  await run2(db, { send: s });
+  db.exec(`INSERT INTO fact_yahoo_inflow_daily (date_jst) VALUES ('${day(-1)}')`);
+  await run2(db, { send: s, nowMs: NOW + DAY });
+  assert.equal(s.sent.length, 2);
+  assert.match(s.sent[1], /^✅ \*止まっていたデータの一部が戻った\*/);
+  assert.match(s.sent[1], /✅ \*戻った\*: Yahoo統計 の一部 \(fact_yahoo_inflow_daily・ほかの表はまだ止まっている\)/);
+  assert.match(s.sent[1], /ほかに止まったまま \(今日は念押ししない\): Yahoo統計/);
+  assert.deepEqual(db.prepare('SELECT item_key FROM data_freshness_alert_state').all().map((x) => x.item_key), ['table:fact_yahoo_store_device_daily']);
+});
+await t('念押しを送れなかった = 前に送れた日を残す → 翌朝また念押し・その間に戻ったら「戻った」を送る', async () => {
+  const run2 = runOnly('fact_qoo10_cvr_daily');
+  const db = makeDb({ ...FRESH, fact_qoo10_cvr_daily: ['2026-10-03'] });
+  const s = sender();
+  await run2(db, { send: s });
+  s.ok = false;
+  await run2(db, { send: s, nowMs: NOW + 7 * DAY });
+  assert.equal(db.prepare('SELECT last_notified_on FROM data_freshness_alert_state').get().last_notified_on, '2026-10-24', '前に送れた日のまま');
+  s.ok = true;
+  await run2(db, { send: s, nowMs: NOW + 8 * DAY });
+  assert.match(s.sent[2], /🔁 \*止まったまま/);
+  assert.equal(db.prepare('SELECT last_notified_on FROM data_freshness_alert_state').get().last_notified_on, '2026-11-01');
+  // 念押しが失敗した日の翌朝に戻った = 「戻った」を送る (黙って消さない)
+  s.ok = false;
+  await run2(db, { send: s, nowMs: NOW + 15 * DAY });
+  s.ok = true;
+  db.exec(`INSERT INTO fact_qoo10_cvr_daily (date_jst) VALUES ('2026-11-08')`);
+  await run2(db, { send: s, nowMs: NOW + 16 * DAY });
+  assert.match(s.sent[s.sent.length - 1], /^✅ \*止まっていたデータが戻った\*[\s\S]*Qoo10分析/);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM data_freshness_alert_state').get().n, 0);
+});
+
 console.log('今朝の自動取得 (fetch-all) の記録');
 const fetchRead = (results, finishedMs = NOW - 2 * 3600000) => ({ status: FS.buildFetchStatus(results, { now: new Date(finishedMs) }), problem: null });
 await t('exit 3 (ログイン切れ) = データがまだ新しい 1 日目から要約が ⚠️・GChat は送らない (子が送っている)・止まった feed の行に添える', async () => {
@@ -389,6 +474,7 @@ await t('一覧の表と列がコードにある (ensure の関数で :memory: �
     ['../apps/warehouse/fetch-amazon-sales-traffic.js', 'ensureSalesTrafficTables'], ['../apps/warehouse/fetch-amazon-listing-issues.js', 'ensureListingTables'],
     ['../apps/warehouse/fetch-amazon-bsr.js', 'ensureRankTables'], ['../apps/warehouse/fetch-amazon-returns.js', 'ensureReturnsTable'],
     ['../apps/warehouse/fetch-amazon-reimbursements.js', 'ensureReimbursementsTable'], ['../apps/warehouse/fetch-amazon-ledger.js', 'ensureLedgerTable'],
+    ['../apps/warehouse/sp-api-report.js', 'ensureReportFetchDays'],
   ];
   for (const [mod, fn] of libs) (await import(mod))[fn](db);
   const srcFiles = ['db.js', 'rakuten-orders.js', 'aupay-orders.js', 'qoo10-orders.js', 'linegift-orders.js'].map((f) => fs.readFileSync(path.join(ROOT, 'apps/warehouse', f), 'utf8'));
@@ -407,8 +493,12 @@ await t('一覧の表と列がコードにある (ensure の関数で :memory: �
   assert.ok(!F.FRESHNESS_TABLES.some((x) => x.table === 'fact_ad_spend'), 'CREATE TABLE がコードに無い fact_ad_spend は入れない');
 });
 await t('1 行 = 表・列・しきい値・モール・何のデータか・人がやること。表は重ならない・止める台帳の id と取得の名前が実在する', () => {
-  const names = F.FRESHNESS_TABLES.map((x) => x.table);
-  assert.equal(new Set(names).size, names.length);
+  const names = F.FRESHNESS_TABLES.map((x) => x.key);
+  assert.equal(new Set(names).size, names.length, '記録の鍵は重ならない');
+  for (const x of F.FRESHNESS_TABLES.filter((y) => y.where)) assert.notEqual(x.key, undefined);
+  // 件数の無い日があるもの = 取込・取得の記録で見る (Codex R1 P2)
+  for (const feed of ['rakuten-review', 'yahoo-review']) assert.match(F.FRESHNESS_TABLES.find((x) => x.feed === feed).table, /_import_log$/, feed);
+  for (const feed of ['amazon-returns', 'amazon-reimb', 'amazon-ledger']) assert.equal(F.FRESHNESS_TABLES.find((x) => x.feed === feed).table, 'sp_report_fetch_days', feed);
   assert.ok(names.length >= 40, String(names.length));
   for (const x of F.FRESHNESS_TABLES) {
     assert.ok(x.table && x.column && Number.isInteger(x.maxAgeDays) && x.maxAgeDays >= 3 && x.mall && x.what && x.action, JSON.stringify(x));
