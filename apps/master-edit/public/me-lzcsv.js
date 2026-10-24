@@ -1,6 +1,8 @@
 /*
  * me-lzcsv.js — 「ロジザード登録の CSV」の画面の動き (views/lz-csv.ejs・lib/lz-new-export.mjs・0081)
  *   - 「N 件の CSV を作ってダウンロード」= POST /api/lz-csv/build (画面で見た商品と行番号)。作れたらファイルをダウンロードして画面を読み直す
+ *   - 🆕 2026-10-24 ダウンロード = 部品 (me-download.js・NE 登録の CSV と同じ) で fetch して保存。断られたら理由をその行に出す。
+ *     断ると決まっている行 (ボタンで取り込み中・取り込んだ・分からない回) はボタンを押せない形と理由 (読み直しのたびに合わせる)
  *   - 写しが古い = 作れない (画面がボタンを止める・DB も断る = #1721 R2)
  *   - 通信が分からないまま終わった = 同じ request_id で送り直す (2 回作らない)
  *   - 「取り消す」= 理由を聞いて POST /api/lz-csv/:id/void
@@ -48,12 +50,52 @@
         setTimeout(function () { location.reload(); }, 1500);
         return;
       }
-      msg('CSV #' + x.j.export_id + ' (' + x.j.rows + ' 件) を作りました。ダウンロードします', 'ok');
-      var a = document.createElement('a');
-      a.href = P.base + '/lz-csv/' + encodeURIComponent(x.j.export_id) + '/file'; a.download = 'logizard_bc_upload.csv';
-      document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(function () { location.reload(); }, 1500);
+      msg('CSV #' + x.j.export_id + ' (' + x.j.rows + ' 件) を作りました。ダウンロードします…', 'ok');
+      // 🆕 2026-10-24: 部品 (me-download.js) = 断られたら理由を出す (前は隠した <a download> = 何も出なかった)
+      lzDownload(x.j.export_id).then(function (d) {
+        if (!d.ok) { msg('CSV #' + x.j.export_id + ' を作りましたが、ダウンロードできませんでした: ' + d.t + ' (画面を読み直すと「作った CSV」に出ます)', 'err'); return; }
+        msg('CSV #' + x.j.export_id + ' (' + x.j.rows + ' 件) を作って、ダウンロードしました', 'ok');
+        setTimeout(function () { location.reload(); }, 1500);
+      });
     }).catch(function () { busy = false; btn.disabled = false; msg('通信できませんでした。作れたか分からないので、もう一度押してください (同じ CSV として送り直します)', 'err'); });
+  });
+  /* ── 🆕 2026-10-24 ダウンロード (中原さん「ダウンロードを押しても CSV が落ちない」= サーバーが 409 / 503 で断っても <a download> は何も出さなかった) ── */
+  // 断りの理由 (router の GET /lz-csv/:id/file・lz-bc-import の recordDownload) → 行に出すふつうの言葉 (サーバーの文があればそれ)
+  var LZ_DL_WORDS = {
+    import_running: 'いまボタンでロジザードに取り込んでいます。終わってから (取り込み中はダウンロードできません)',
+    imported_by_button: 'ボタンで取り込んだ CSV です。手でもう一度取り込まないでください (ダウンロードできません)',
+    import_unresolved: '取り込みが「取り込めたか分からない」のままです。下の③で確かめて記してから、ダウンロードできます',
+    voided: '取り消した CSV です。ダウンロードできません (作り直してください)',
+    bc_db_unavailable: 'ダウンロードの記録を残せないので、いまは出せません (少し待ってからもう一度)',
+    not_approver: 'ダウンロードできるのは名簿の人だけです',
+  };
+  var LZ_DL_STOP = { import_running: 1, imported_by_button: 1, import_unresolved: 1, voided: 1 };   // もう一度押しても同じ = ボタンを止める
+  function lzDownload(id) {
+    var ME = window.MasterEdit || {};
+    if (!ME.downloadFile) return Promise.resolve({ ok: false, t: '画面の部品が読めませんでした。画面を開き直してください' });
+    return ME.downloadFile(P.base + '/lz-csv/' + encodeURIComponent(id) + '/file', { name: 'logizard_bc_upload.csv' }).then(function (d) {
+      if (d.ok) return d;
+      var t = d.status === 404 ? 'ファイルがありません。画面を開き直してください' : (d.error || LZ_DL_WORDS[d.reason] || ('ダウンロードできませんでした (HTTP ' + d.status + ')。もう一度押してください'));
+      return { ok: false, t: t, stop: !!LZ_DL_STOP[d.reason] };
+    });
+  }
+  document.addEventListener('click', function (e) {
+    var b = e.target.closest && e.target.closest('button[data-lz-dl]');
+    if (!b || b.disabled) return;
+    var id = b.getAttribute('data-lz-dl');
+    var line = document.querySelector('[data-lz-dl-msg="' + id + '"]');
+    var say = function (t, c) { if (line) { line.className = 'msgline ' + (c || ''); line.textContent = t; } };
+    b.disabled = true; b.setAttribute('data-lz-dl-busy', '');   // 読み直し (syncDl) が途中で押せるように戻さない (#Codex R1 Low)
+    say('ダウンロードしています…');
+    lzDownload(id).then(function (d) {
+      b.removeAttribute('data-lz-dl-busy');
+      if (!d.ok) { say(d.t, 'err'); b.disabled = !!d.stop; return; }
+      b.disabled = false;
+      say('ダウンロードしました (' + d.name + ')。', 'ok');
+      // 保存したかはページから分からない = 人が押す保存のリンク (#Codex R1 High)
+      var again = window.MasterEdit && window.MasterEdit.saveAgainLink && window.MasterEdit.saveAgainLink(d);
+      if (again && line) { var old = line.parentNode.querySelector('[data-save-again]'); if (old) old.remove(); line.parentNode.insertBefore(again, line.nextSibling); }
+    });
   });
   document.addEventListener('click', function (e) {
     var b = e.target.closest && e.target.closest('button[data-void]');
@@ -128,11 +170,29 @@
     return null;
   }
 
+  // 🆕 2026-10-24 ダウンロードのボタン: ポータルが断ると決まっている CSV (取り込み中・分からない回・ボタンで取り込んだ = lz-bc-import の recordDownload と同じ決まり) は押せない形と理由。
+  //   読み直しのたびに合わせる (取り込みが始まった・終わった)。描いた形は views/lz-csv.ejs の dlWhy と同じ
+  function dlWhy(s) {
+    if (!s) return null;
+    if (s.unresolved_job) return '取り込み (#' + s.unresolved_job + ') が「取り込めたか分からない」のままです。下の③で確かめて記してから、ダウンロードできます';
+    if (s.active_job) return 'いまボタンでロジザードに取り込んでいます (#' + s.active_job + ')。終わってから (取り込み中はダウンロードできません)';
+    if (s.imported_ok_job) return 'ボタンで取り込んだ CSV です (#' + s.imported_ok_job + ')。手でもう一度取り込まないでください (ダウンロードできません)';
+    return null;
+  }
+  function syncDl(e, s) {
+    var b = document.querySelector('button[data-lz-dl="' + e.id + '"]');
+    var w = document.querySelector('[data-lz-dl-why="' + e.id + '"]');
+    if (!b) return;
+    var why = dlWhy(s);
+    if (!b.hasAttribute('data-lz-dl-busy')) b.disabled = !!why;   // ダウンロードの途中は触らない (#Codex R1 Low)
+    if (w) { w.textContent = why || ''; w.hidden = !why; }
+  }
   function renderCells() {
     (P.exports || []).forEach(function (e) {
       var cell = document.querySelector('[data-bc-cell="' + e.id + '"]');
       if (!cell) return;
       var s = (S.byExport || {})[e.id] || null;
+      syncDl(e, s);
       var last = s && s.last;
       cell.textContent = '';
       // 🆕 2026-10-21 CSV の商品が全部ロジザードの写しにある = 手で取り込み済み (ボタンで取り込むと 2 回登録になる = ボタンを出さない・ポータルも断る)

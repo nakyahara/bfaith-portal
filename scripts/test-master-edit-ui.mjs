@@ -1427,15 +1427,37 @@ await ta('[38] NE 登録の CSV (🆕 10/20 ボタン 1 つ): 「NE 登録の CS
     await dl.saveAs(file);
     assert.match(fs.readFileSync(file, 'utf8'), /ui-new-1/);
     await p.waitForSelector('.saved-note:has-text("CSV ができました")');
+    assert.match(await p.textContent('.saved-note'), /ダウンロードしました → NE の \[商品\] → \[商品管理の一括登録\] で「商品 CSV」を選んで取り込み/);
     assert.ok(/\/reg-csv$/.test(new URL(p.url()).pathname), p.url());
-    // 「NE で取り込む」のカード = 「NE に取り込んだ」1 つ
+    // 「NE で取り込む」のカード = 「NE に取り込んだ」1 つ (🆕 10/24: この画面でダウンロードした = 押せる・「ダウンロードしました」)
     const todo = p.locator('#todo article.todo-card').first();
     assert.match(await todo.textContent(), /単品 \d+ 件の CSV/);
+    assert.equal(await todo.locator('[data-dl-badge]').textContent(), 'ダウンロードしました');
+    assert.equal(await todo.locator('button[data-act="declare-quick"][data-result="ok"]').isDisabled(), false, 'ダウンロードした後 = 押せる');
+    assert.equal(await todo.locator('[data-need-dl-hint]').isVisible(), false);
+    assert.equal(await todo.locator('button[data-act="skip-dl"]').isVisible(), false);
+    // もう一度ダウンロード (fetch → 保存・同じ中身)
+    const [dl2] = await Promise.all([p.waitForEvent('download'), todo.locator('button[data-act="download"]').click()]);
+    const file2 = path.join(DATA_TMP, 'ui-reg-2.csv');
+    await dl2.saveAs(file2);
+    assert.ok(fs.readFileSync(file2).equals(fs.readFileSync(file)), 'もう一度ダウンロード = 同じ byte 列');
+    assert.match(await todo.locator('[data-msg-card]').textContent(), /ダウンロードしました/);
+    // 保存したかはページから分からない (#Codex R1 High) = 人が押す保存のリンク (受け取った byte 列)
+    const again = todo.locator('a[data-save-again]');
+    assert.match(await again.textContent(), /ファイルが届いていなければ、ここを押して保存/);
+    const [dl3] = await Promise.all([p.waitForEvent('download'), again.click()]);
+    const file3 = path.join(DATA_TMP, 'ui-reg-3.csv');
+    await dl3.saveAs(file3);
+    assert.ok(fs.readFileSync(file3).equals(fs.readFileSync(file)), '保存のリンク = 同じ byte 列');
     await todo.locator('button[data-act="declare-quick"][data-result="ok"]').click();
     await p.waitForSelector('.saved-note:has-text("NE に取り込んだ」を記録しました")');
     const st = (await pg.query("select r.state from ops.master_registrations r join core.skus s on s.sku_id = r.sku_id where s.code_norm = 'ui-new-1'")).rows[0].state;
     assert.equal(st, 'ne_pending');
-    assert.equal(await p.locator('#todo article.todo-card').count(), 0, '取り込んだファイルのカードは消える');
+    // 🆕 10/24: 取り込んだファイル = 「記録しました」の小さいカード (ダウンロードした = 「まだダウンロードしていません」の一言は出さない)
+    assert.equal(await p.locator('#todo article.todo-card[data-state="issued"]').count(), 0, '取り込み待ちのカードは消える');
+    const dcard = p.locator('#todo article.todo-card[data-state="declared"]').first();
+    assert.match(await dcard.textContent(), /「NE に取り込んだ」を記録しました/);
+    assert.equal(await dcard.locator('.why-wrn[data-not-dl]').isVisible(), false, 'この画面でダウンロードした = 一言は出さない');
     // 「これまでの記録」の中のファイル = 申告し直せる (書きかけ = 未保存・違うファイルは照合で止める)
     await p.click('#history > summary');
     const c2 = p.locator('#history article.exp').first();
@@ -1466,6 +1488,81 @@ await ta('[38] NE 登録の CSV (🆕 10/20 ボタン 1 つ): 「NE 登録の CS
     assert.ok(att.imported_at && new Date(att.imported_at) <= new Date(att.declared_at), JSON.stringify(att));
     assert.equal(await dirty(p), 0);
   } finally { delete process.env.MASTER_DECISION_APPROVERS; }
+});
+
+await ta('[38b] NE 登録の CSV (🆕 10/24 本番 #21・#22「セットの CSV が DL できない・動線もおかしい」): ファイルが 2 つ = 自動のダウンロードは 0 (ファイルごとのボタン)・セットのカード (手順・「セット商品情報 CSV」・NE のリンク・単品の文を混ぜない)・ダウンロードできない = カードに理由と「使わない」への道・「NE に取り込んだ」は押せないまま・「ダウンロードせずに取り込んだ」(確かめ) で押せる (読み直しても)・申告したのにこの画面で落としていない = 一言', async (p) => {
+  process.env.MASTER_DECISION_APPROVERS = 'naka@test';
+  const { seedIssuedExport, dropExport } = await import('./fixtures/reg-csv-trial-done.mjs');
+  // 配った・まだ申告していないセットのファイル (配った時の許可が無い = DB がダウンロードを断る = 本番の期限切れと同じ道)
+  const setx = await seedIssuedExport(pg, { sessionUser, schema: 'ne-reg-set-v2', code: 'set001' });
+  let downloads = 0;
+  p.on('download', () => { downloads++; });
+  try {
+    // 作る = ファイルが 2 つ (単品・セット) → 自動では 1 つも落とさない・読み直して「ファイルごとに」の知らせ
+    await p.route('**/api/reg-csv/build-all', (rt) => rt.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, errors: [], files: [
+      { export_id: '990001', kind: 'products', item_count: 1, state: 'issued', sha256: 'a'.repeat(64), file_name: 'p.csv' },
+      { export_id: setx.id, kind: 'sets', item_count: 1, state: 'issued', sha256: setx.sha256, file_name: 's.csv' }] }) }));
+    await p.goto(B + '/reg-csv');
+    // 次の CSV が空でも押す (答えは上の偽物): 空のときはボタンが無い = 同じ形のボタンを置く (画面の JS は data-act で受ける)
+    await p.evaluate(() => { if (!document.querySelector('button[data-act="build-all"]')) document.querySelector('#next').insertAdjacentHTML('beforeend', '<button class="btn pri lg" type="button" data-act="build-all">NE 登録の CSV を作る</button>'); else document.querySelector('button[data-act="build-all"]').disabled = false; });
+    await p.click('button[data-act="build-all"]');
+    await p.waitForSelector('.saved-note:has-text("ファイルが 2 つあります")');
+    assert.match(await p.textContent('.saved-note'), /ファイルごとに「ダウンロード」を押してください \(単品の CSV・セットの CSV\)/);
+    assert.equal(downloads, 0, 'ファイルが 2 つ = 自動のダウンロードはしない (2 つ目はブラウザが黙って止める)');
+    await p.unroute('**/api/reg-csv/build-all');
+    // セットのカード = セットの手順 (ダウンロード → 「セット商品情報 CSV」で取り込む → 「NE に取り込んだ」は必ず)
+    const card = p.locator(`#todo article.todo-card[data-id="${setx.id}"]`);
+    await card.waitFor();
+    const t = await card.textContent();
+    assert.match(t, /セット 1 件の CSV/);
+    assert.match(t, /セットの CSV をダウンロード/);
+    assert.match(t, /NE の \[商品\] → \[商品管理の一括登録\] で「セット商品情報 CSV」を選んで取り込む/);
+    assert.match(t, /取り込んだら「NE に取り込んだ」を押す \(セットは必ず押します/);
+    assert.doesNotMatch(t, /「商品 CSV」|押し忘れても/, '単品の文は混ぜない');
+    assert.deepEqual(await card.locator('ol.dlsteps > li').evaluateAll((xs) => xs.map((x) => x.getAttribute('data-step'))), ['dl', 'ne', 'declare'], '上から順に');
+    assert.equal(await card.locator('a[data-ne-link]').getAttribute('href'), 'https://main.next-engine.com/User_Syohin_Csvupload_Item/upload');
+    assert.equal(await card.locator('a[data-ne-link]').getAttribute('target'), '_blank');
+    const ok = card.locator('button[data-act="declare-quick"][data-result="ok"]');
+    assert.equal(await ok.isDisabled(), true, 'ダウンロードする前は「NE に取り込んだ」を押せない');
+    assert.match(await card.locator('[data-need-dl-hint]').textContent(), /ダウンロードした後に押せます/);
+    // ダウンロードできない = カードに理由 (サーバーの文)・「使わない」への道・押せないまま・ファイルは落ちていない
+    await card.locator('button[data-act="download"]').click();
+    await card.locator('[data-msg-card].err').waitFor();
+    assert.match(await card.locator('[data-msg-card]').textContent(), /許可の記録がありません。「使わない」にして作り直してください/);
+    assert.equal(downloads, 0);
+    assert.equal(await ok.isDisabled(), true);
+    await card.locator('button[data-act="open-supersede"]').click();
+    assert.equal(await p.locator('#history').evaluate((d) => d.open), true, '「これまでの記録」を開く');
+    assert.equal(await p.locator(`#dr-s-${setx.id}`).isVisible(), true, 'そのファイルの「使わない」');
+    assert.match(await p.inputValue(`#dr-s-${setx.id} input[name="reason"]`), /ダウンロード/);
+    await p.click(`#dr-s-${setx.id} [data-act="close-drawer"]`);
+    // 別のパソコンで落とした = 「ダウンロードせずに取り込んだ」(確かめ) で押せる・読み直しても
+    p.once('dialog', (d) => d.accept());
+    await card.locator('button[data-act="skip-dl"]').click();
+    assert.equal(await ok.isDisabled(), false);
+    assert.equal(await card.locator('[data-dl-badge]').textContent(), 'ダウンロードしました');
+    await p.reload();
+    await card.waitFor();
+    assert.equal(await card.locator('button[data-act="declare-quick"][data-result="ok"]').isDisabled(), false, '読み直しても (このブラウザの印)');
+    // 申告したのに、このパソコンでは落としていない (本番 #22) = 一言と「使わない」
+    await p.evaluate((id) => { for (const k of Object.keys(localStorage)) if (k.startsWith('master-edit:regcsv-dl:' + id + ':')) localStorage.removeItem(k); }, setx.id);
+    await pg.query(`set session authorization ${sessionUser}`);
+    try {
+      await pg.query('set session_replication_role = replica');
+      await pg.query("update ops.ne_reg_exports set state = 'declared', declared_at = now(), declared_by = 'naka@test' where export_id = $1", [setx.id]);
+    } finally { await pg.query('set session_replication_role = origin'); await pg.query(`set session authorization ${sessionUser}`); await pg.query('set role deploy'); }
+    await p.reload();
+    const dc = p.locator(`#todo article.todo-card[data-id="${setx.id}"][data-state="declared"]`);
+    await dc.waitFor();
+    assert.equal(await dc.locator('.why-wrn[data-not-dl]').isVisible(), true);
+    assert.match(await dc.locator('.why-wrn[data-not-dl]').textContent(), /このパソコンでは、このファイルをまだダウンロードしていません。NE に取り込んでいないときは/);
+    assert.equal(await dc.locator('button[data-act="open-supersede"]').isVisible(), true);
+    assert.equal(downloads, 0);
+  } finally {
+    await p.unroute('**/api/reg-csv/build-all').catch(() => {});
+    await dropExport(pg, { sessionUser, id: setx.id });
+    delete process.env.MASTER_DECISION_APPROVERS;
+  }
 });
 
 await ta('[60] NE 登録の CSV (10/12 中原さんの画面の写真): 試し用・閉じた・商品が全部 NE で確かめ済みのファイル = 引退した v1 は「この形を実機で確かめた」「問題があった (ng)」と「本番の行数で作れるようになります」を出さず「引退しました … このファイルですることはありません」/ 門の無い v2・まとまりも出さない / 🆕 0099: セットも v1 は引退・v2 は門なし = どれにもボタンを出さない', async (p) => {

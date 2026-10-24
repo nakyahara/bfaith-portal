@@ -25,6 +25,16 @@
       if (inLzAll(e) && !viaBtn) return 'ロジザードにもうあります (手で取り込み済み)';
       return s && s.last ? s.last.state_words : 'ボタンではまだ';
     };
+    // 🆕 2026-10-24 (中原さん「ダウンロードを押しても落ちない」): ポータルが断ると決まっている CSV (lz-bc-import の recordDownload と同じ決まり) =
+    //   ダウンロードのボタンを押せない形にして理由を添える。ほかの断り (取り消した・記録を残せない) は押した時にその行に出す (画面の動き = me-lzcsv.js・部品 = me-download.js)
+    const dlWhy = (e) => {
+      const s = bc && bc.byExport[e.id];
+      if (!s) return null;
+      if (s.unresolved_job) return `取り込み (#${s.unresolved_job}) が「取り込めたか分からない」のままです。下の③で確かめて記してから、ダウンロードできます`;
+      if (s.active_job) return `いまボタンでロジザードに取り込んでいます (#${s.active_job})。終わってから (取り込み中はダウンロードできません)`;
+      if (s.imported_ok_job) return `ボタンで取り込んだ CSV です (#${s.imported_ok_job})。手でもう一度取り込まないでください (ダウンロードできません)`;
+      return null;
+    };
   %>
   <div class="page" id="lzc" data-base="<%= base %>">
     <nav class="crumb" aria-label="いまの場所"><a href="<%= base %>/" data-list-back>商品・セット</a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><span aria-current="page">ロジザード登録の CSV</span></nav>
@@ -98,7 +108,8 @@
         <tr data-export="<%= e.id %>"><td class="mono">#<%= e.id %></td><td><%= when(e.created_at) %> <span class="hint"><%= e.actor_id %></span></td><td><%= e.rows %></td><td class="hint"><%= e.codes %><%= e.rows > 6 ? ' …' : '' %></td>
           <td><% if (e.state === 'issued') { %><span class="b ok">出した</span><% } else { %><span class="b mute">取り消した</span> <span class="hint"><%= when(e.voided_at) %> · <%= e.void_reason %></span><% } %></td>
           <td data-bc-cell="<%= e.id %>"><span class="hint"><%= bcCell(e) %></span></td>
-          <td><% if (e.state === 'issued' && canApprove) { %><a class="btn sm" href="<%= base %>/lz-csv/<%= e.id %>/file" download="logizard_bc_upload.csv"><svg class="ic s" aria-hidden="true"><use href="#i-download"/></svg>ダウンロード</a> <button class="btn sm ghost" type="button" data-void="<%= e.id %>">取り消す</button><% } %></td></tr>
+          <td><% if (e.state === 'issued' && canApprove) { const w = dlWhy(e); %><button class="btn sm" type="button" data-lz-dl="<%= e.id %>"<%= w ? ' disabled' : '' %>><svg class="ic s" aria-hidden="true"><use href="#i-download"/></svg>ダウンロード</button> <button class="btn sm ghost" type="button" data-void="<%= e.id %>">取り消す</button>
+            <div class="hint" data-lz-dl-why="<%= e.id %>"<%= w ? '' : ' hidden' %>><%= w || '' %></div><div class="msgline" data-lz-dl-msg="<%= e.id %>" role="status" aria-live="polite"></div><% } %></td></tr>
         <% } %>
       </tbody></table></div>
       <% } %>
@@ -118,6 +129,6 @@
     <script type="application/json" id="me-lzc"><%- JSON.stringify(pageData).replace(/</g, '\\u003c') %></script>
   </div>
   <%- include('_footer') %>
-  <% if (canApprove && C && C.db_ready) { %><script src="<%= base %>/public/me-lzcsv.js?v=<%= assetV %>" defer></script><% } %>
+  <% if (canApprove && C && C.db_ready) { %><script src="<%= base %>/public/me-download.js?v=<%= assetV %>" defer></script><script src="<%= base %>/public/me-lzcsv.js?v=<%= assetV %>" defer></script><% } %>
 </body>
 </html>

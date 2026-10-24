@@ -36,3 +36,48 @@ export async function seedTrialDoneExport(pg, { sessionUser, schema, code, role 
     await pg.query(`set role ${role}`);
   }
 }
+
+/**
+ * 🆕 2026-10-24 試験だけ: 「配った (issued)・まだ申告していない」ファイルを 1 つ置く (本番 #22 = セットのファイルの形)。
+ *   配った時の許可 (lease_id) は付けない = ダウンロードは DB (ops.ne_reg_file) が no_lease で断る = 画面の「ダウンロードできない」の文を確かめる。
+ *   戻り値 = { id, sha256 }。dropExport で消す (ほかの試験の商品の生きている品目にしない)
+ */
+export async function seedIssuedExport(pg, { sessionUser, schema, code, role = 'deploy', run = 'mc_seed_issued' }) {
+  const rule = Object.prototype.hasOwnProperty.call(REG_SCHEMA_RULES, schema) ? REG_SCHEMA_RULES[schema] : null;
+  if (!rule) throw new Error(`知らない版: ${schema}`);
+  const tag = `${schema}|${code}|${Date.now()}|${Math.random()}`;
+  const bytes = Buffer.from(`${rule.header.join(',')}\r\n${code},試し,1000,10,x,1\r\n`, 'utf8');
+  const sha = crypto.createHash('sha256').update(bytes).digest('hex');
+  await pg.query(`set session authorization ${sessionUser}`);
+  try {
+    await pg.query('set session_replication_role = replica');
+    const s = (await pg.query('select sku_id::text as id, code, code_norm, sku_kind from core.skus where code = $1', [code])).rows[0];
+    if (!s) throw new Error(`商品が無い: ${code}`);
+    const e = (await pg.query(`insert into ops.ne_reg_exports (kind, schema_version, header, encoding, trial, item_count, row_count, aggregate_token, payload_hash, sha256, file_bytes, request_id, ne_codes_run, cost_day,
+        created_by, state, issued_at, issued_by)
+      values ($1, $2, $3, 'utf8', false, 1, 1, $4, $5, $6, $7, $8::uuid, $9, current_date, 'seed@test', 'issued', now(), 'seed@test') returning export_id::text as id`,
+    [rule.kind, schema, rule.header.join(','), hex('agg' + tag), hex('payload' + tag), sha, bytes, crypto.randomUUID(), run])).rows[0].id;
+    await pg.query(`insert into ops.ne_reg_export_items (export_id, sku_id, code_norm, ne_code, sku_kind, item_token, expected, snapshot_hash, row_from, row_to, state, state_changed_by)
+      values ($1, $2, $3, $4, $5, $6, '{}'::jsonb, $7, 1, 1, 'issued', 'system')`,
+    [e, s.id, s.code_norm, s.code, s.sku_kind, hex('item' + tag), hex('snap' + tag)]);
+    return { id: e, sha256: sha };
+  } finally {
+    await pg.query('set session_replication_role = origin');
+    await pg.query(`set session authorization ${sessionUser}`);
+    await pg.query(`set role ${role}`);
+  }
+}
+/** seedIssuedExport で置いたファイルを消す (試験だけ) */
+export async function dropExport(pg, { sessionUser, id, role = 'deploy' }) {
+  await pg.query(`set session authorization ${sessionUser}`);
+  try {
+    await pg.query('set session_replication_role = replica');
+    await pg.query('delete from ops.ne_reg_checks where item_id in (select item_id from ops.ne_reg_export_items where export_id = $1)', [id]);
+    await pg.query('delete from ops.ne_reg_export_items where export_id = $1', [id]);
+    await pg.query('delete from ops.ne_reg_exports where export_id = $1', [id]);
+  } finally {
+    await pg.query('set session_replication_role = origin');
+    await pg.query(`set session authorization ${sessionUser}`);
+    await pg.query(`set role ${role}`);
+  }
+}
