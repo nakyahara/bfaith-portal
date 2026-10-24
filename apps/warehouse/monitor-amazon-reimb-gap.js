@@ -16,6 +16,7 @@
  *     ③ 補てん (Lost_Warehouse / Damaged_Warehouse・現金と在庫の両方 = quantity-reimbursed-total)。同じ種類を先に、無ければ別の種類も
  *     ④ 補てんの取り消し (数量が負・同じ日の補てんより後) = 取り消された補てん (original-reimbursement-id) が消した塊を戻す (ID が無ければ同じ種類の補てん → どれでも、新しい順)。
  *        戻す塊は、同じ種類でその発生日より後の「余り」で先に打ち消す (見つかった → Amazon が補てんを取り消した = 差し引きゼロ)
+ *        次に、消す塊が無かった補てん (その発生日より後) で覆う (取り消しと同じ日の出し直し)。ID の無い取り消しは補てんの種類で選ぶ
  *   残った分の発生日から: 待つ日数 (紛失 WAIT_DAYS_LOST・破損 WAIT_DAYS_DAMAGED = Amazon の自動の補てん・見つかるのを待つ) より前 = 「待っている」(載せない)
  *                      申請の期限 (発生から CLAIM_DEADLINE_DAYS 日) を過ぎた = 「期限切れの可能性」(件数だけ) / そのあいだ = 候補
  *   見込みの金額 = 個数 × 単価 (① その FNSKU (無ければ SKU) の最後の補てんの単価 amount-per-unit ② 在庫計画の売価 your_price ③ 分からなければ数量だけ)
@@ -143,7 +144,8 @@ export function matchEvents(events) {
   const typeOf = (e) => (e.type === 'reimb' && Number(e.qty) < 0 ? 'reversal' : e.type);
   const evs = [...events].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : ORDER[typeOf(a)] - ORDER[typeOf(b)]));
   const open = [];             // 残っている塊 (古い順)
-  const reimbursed = [];       // 補てんで消した塊 { date, kind, qty, id } (取り消しで戻す)
+  const reimbursed = [];       // 補てんで消した塊 { date, kind, qty, id, rkind = 補てんの種類 } (取り消しで戻す)
+  const unpaired = [];         // 消す塊が無かった補てん { date, rkind, qty, id } (台帳の外の紛失の分か、取り消しと同じ日の出し直し = 後で戻した塊を覆う。Codex R3 P2)
   const surplus = [];          // 消す相手が無かった「見つかった」「戻し」{ date, kind, qty } (補てんの後に来た分 = 後の取り消しで戻す塊を打ち消す)
   const consume = (n, pred) => {
     const taken = [];
@@ -165,6 +167,15 @@ export function matchEvents(events) {
       if (s.qty <= 0 || s.kind !== piece.kind || s.date < piece.date) continue;
       const k = Math.min(s.qty, q); s.qty -= k; q -= k;
     }
+    // 消す塊が無かった補てんのうち、その塊の発生日より後 (同じ日を含む) のもので覆う (同じ種類を先に)
+    for (const same of [true, false]) {
+      for (const u of unpaired) {
+        if (q <= 0) break;
+        if (u.qty <= 0 || u.date < piece.date || (same && u.rkind !== piece.kind && u.rkind !== 'any')) continue;
+        const k = Math.min(u.qty, q); u.qty -= k; q -= k;
+        reimbursed.push({ date: piece.date, kind: piece.kind, qty: k, id: u.id, rkind: u.rkind });
+      }
+    }
     if (q <= 0) return;
     const i = open.findIndex((p) => p.date > piece.date);
     if (i < 0) open.push({ date: piece.date, kind: piece.kind, qty: q }); else open.splice(i, 0, { date: piece.date, kind: piece.kind, qty: q });
@@ -184,22 +195,30 @@ export function matchEvents(events) {
       if (qty > 0) {
         const a = consume(qty, (p) => e.kind === 'any' || p.kind === e.kind);
         const b = a.rest > 0 ? consume(a.rest, () => true) : { taken: [] };
-        for (const p of [...a.taken, ...b.taken]) reimbursed.push({ ...p, id: e.id ?? null });
+        for (const p of [...a.taken, ...b.taken]) reimbursed.push({ ...p, id: e.id ?? null, rkind: e.kind });
+        const left = a.rest > 0 ? b.rest : 0;
+        if (left > 0) unpaired.push({ date: e.date, rkind: e.kind, qty: left, id: e.id ?? null });
       } else {
         let n = -qty;
         // 戻す塊: 取り消された補てんの ID が分かれば、その補てんが消した塊だけ (無ければ戻さない = 台帳の外の紛失への補てん。Codex R2 P2)。
-        //         分からなければ 同じ種類の補てんが消した塊 → どれでも。それぞれ新しい順
-        const pickers = e.origId ? [(p) => p.id === e.origId] : [...(e.kind && e.kind !== 'any' ? [(p) => p.kind === e.kind] : []), () => true];
+        //         分からなければ 同じ種類の補てん (補てんの種類で選ぶ。Codex R3 P2) が消した塊 → どれでも。それぞれ新しい順
+        //         ID の分かる補てんが塊を消していなければ (消す相手が無かった補てん) その余りを減らすだけ
+        if (e.origId) {
+          for (const u of unpaired) { if (n <= 0) break; if (u.id !== e.origId || u.qty <= 0) continue; const k = Math.min(u.qty, n); u.qty -= k; n -= k; }
+        }
+        const pickers = e.origId ? [(p) => p.id === e.origId] : [...(e.kind && e.kind !== 'any' ? [(p) => p.rkind === e.kind] : []), () => true];
+        const toReopen = [];   // 先に選んでから戻す (戻すときに覆った塊を同じ取り消しで選び直さない)
         for (const pick of pickers) {
           for (let i = reimbursed.length - 1; i >= 0 && n > 0; i--) {
             const p = reimbursed[i];
             if (!pick(p)) continue;
             const q = Math.min(p.qty, n);
-            reopen({ date: p.date, kind: p.kind, qty: q });
+            toReopen.push({ date: p.date, kind: p.kind, qty: q });
             p.qty -= q; n -= q;
             if (p.qty <= 0) reimbursed.splice(i, 1);
           }
         }
+        for (const p of toReopen) reopen(p);
       }
     }
   }
