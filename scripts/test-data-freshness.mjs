@@ -35,7 +35,7 @@ const DAY = 86400000;
 const day = (n) => new Date(NOW + 9 * 3600000 - n * DAY).toISOString().slice(0, 10);   // n 日前 (JST)
 
 /** 小さな一覧 (本物の FEEDS を使う) */
-const T = (feed, table, column, maxAgeDays, kind = 'date') => ({ ...F.FRESHNESS_TABLES.find((x) => x.feed === feed), key: table, table, column, kind, maxAgeDays, where: null });
+const T = (feed, table, column, maxAgeDays, kind = 'date') => ({ ...F.FRESHNESS_TABLES.find((x) => x.feed === feed), key: table, table, column, kind, maxAgeDays, where: null, also: [] });
 const yahooTables = ['fact_yahoo_store_device_daily', 'fact_yahoo_inflow_daily'].map((n) => T('yahoo-data', n, 'date_jst', 4));
 const TABLES = [
   ...yahooTables,
@@ -357,7 +357,7 @@ await t('返品・補てん: 0 件の日も取得の記録 (sp_report_fetch_days
 await t('文字数の上限: 入らない feed は載せず「送った」にしない = 翌朝に送る (全部の表が止まった朝)', async () => {
   const db = new Database(':memory:');
   for (const tb of F.FRESHNESS_TABLES) {
-    db.exec(`CREATE TABLE IF NOT EXISTS ${tb.table} ("${tb.column}" TEXT${tb.where ? ', status TEXT, report_type TEXT, mall TEXT' : ''})`);
+    db.exec(`CREATE TABLE IF NOT EXISTS ${tb.table} ("${tb.column}" TEXT${tb.where ? ', status TEXT, report_type TEXT, mall TEXT, message TEXT' : ''})`);
     const pick = (re) => ((tb.where || '').match(re) || [])[1] || null;
     db.prepare(`INSERT INTO ${tb.table} ("${tb.column}"${tb.where ? ', status, report_type, mall' : ''}) VALUES (?${tb.where ? ', ?, ?, ?' : ''})`)
       .run(tb.kind === 'month' ? '2026-01' : '2026-01-05', ...(tb.where ? ['ok', pick(/report_type = '([^']+)'/), pick(/mall = '([^']+)'/)] : []));
@@ -422,11 +422,11 @@ await t('PM検索クエリ (週次): 0 件の週も取得の記録 (report_fetch
   const pm = F.FRESHNESS_TABLES.filter((x) => x.key === 'report_fetch_log:aupay_pm_query');
   assert.equal(pm.length, 1);
   const db = new Database(':memory:');
-  db.exec('CREATE TABLE report_fetch_log (fetched_at TEXT, mall TEXT, report_type TEXT, status TEXT)');
-  const ins = db.prepare('INSERT INTO report_fetch_log VALUES (?, ?, ?, ?)');
-  ins.run(new Date(NOW - 30 * DAY).toISOString(), 'aupay', 'adata_pm_query', 'ok');
-  ins.run(new Date(NOW - 1 * DAY).toISOString(), 'aupay', 'adata_pm_query', 'empty');
-  ins.run(new Date(NOW).toISOString(), 'rakuten', 'adata_pm_query', 'ok');
+  db.exec('CREATE TABLE report_fetch_log (fetched_at TEXT, mall TEXT, report_type TEXT, status TEXT, message TEXT)');
+  const ins = db.prepare('INSERT INTO report_fetch_log VALUES (?, ?, ?, ?, ?)');
+  ins.run(new Date(NOW - 30 * DAY).toISOString(), 'aupay', 'adata_pm_query', 'ok', 'rows_sha256=x');
+  ins.run(new Date(NOW - 1 * DAY).toISOString(), 'aupay', 'adata_pm_query', 'empty', '0件');
+  ins.run(new Date(NOW).toISOString(), 'rakuten', 'adata_pm_query', 'ok', '');
   assert.equal(F.evaluateFreshness(db, { nowMs: NOW, tables: pm, registry: NO_PAUSE }).items[0].status, 'ok');
   db.exec("UPDATE report_fetch_log SET status = 'error' WHERE status = 'empty'");
   const r = F.evaluateFreshness(db, { nowMs: NOW, tables: pm, registry: NO_PAUSE });
@@ -483,6 +483,42 @@ await t('状態が変わった (止まっている → 読めない) 知らせ�
   await run2(db2, { send: s, nowMs: NOW + 2 * DAY });
   assert.equal(s.sent.length, before + 1);
   assert.match(s.sent[before], /戻った\*: Qoo10分析/);
+});
+
+console.log('Codex R3 の直し');
+await t('PM検索クエリ: 「画面未更新の疑い」の empty は新しさに数えない・本当の 0 件は数える', () => {
+  const pm = F.FRESHNESS_TABLES.filter((x) => x.key === 'report_fetch_log:aupay_pm_query');
+  const db = new Database(':memory:');
+  db.exec('CREATE TABLE report_fetch_log (fetched_at TEXT, mall TEXT, report_type TEXT, status TEXT, message TEXT)');
+  const ins = db.prepare('INSERT INTO report_fetch_log VALUES (?, ?, ?, ?, ?)');
+  ins.run(new Date(NOW - 20 * DAY).toISOString(), 'aupay', 'adata_pm_query', 'ok', 'rows_sha256=x');
+  ins.run(new Date(NOW - 1 * DAY).toISOString(), 'aupay', 'adata_pm_query', 'empty', '画面未更新の疑い (2026-09-28 と同一内容)');
+  assert.equal(F.evaluateFreshness(db, { nowMs: NOW, tables: pm, registry: NO_PAUSE }).items[0].status, 'stale');
+  ins.run(new Date(NOW - 2 * DAY).toISOString(), 'aupay', 'adata_pm_query', 'empty', '0件');
+  assert.equal(F.evaluateFreshness(db, { nowMs: NOW, tables: pm, registry: NO_PAUSE }).items[0].status, 'ok');
+});
+await t('楽天レビュー: 窓にレビューが無い朝 (取得の記録 = empty・CSV なし) も新しい / 取込の記録が無い表 = まだ始まっていない (empty の記録だけでは始まらない)', () => {
+  const rv = F.FRESHNESS_TABLES.filter((x) => x.feed === 'rakuten-review');
+  const db = new Database(':memory:');
+  db.exec('CREATE TABLE report_fetch_log (fetched_at TEXT, mall TEXT, report_type TEXT, status TEXT, message TEXT)');
+  db.prepare('INSERT INTO report_fetch_log VALUES (?, ?, ?, ?, ?)').run(new Date(NOW - DAY).toISOString(), 'rakuten', 'rreview_csv', 'empty', 'レビュー0件');
+  assert.equal(F.evaluateFreshness(db, { nowMs: NOW, tables: rv, registry: NO_PAUSE }).items[0].status, 'not_started');
+  db.exec('CREATE TABLE raw_rakuten_review_import_log (imported_at TEXT, status TEXT)');
+  db.prepare('INSERT INTO raw_rakuten_review_import_log VALUES (?, ?)').run(new Date(NOW - 12 * DAY).toISOString(), 'ok');
+  assert.equal(F.evaluateFreshness(db, { nowMs: NOW, tables: rv, registry: NO_PAUSE }).items[0].status, 'ok', '0 件の取得が昨日');
+  db.exec("UPDATE report_fetch_log SET status = 'error'");
+  assert.equal(F.evaluateFreshness(db, { nowMs: NOW, tables: rv, registry: NO_PAUSE }).items[0].status, 'stale', '失敗の記録は数えない');
+  db.exec("UPDATE report_fetch_log SET status = 'empty', mall = 'yahoo'");
+  assert.equal(F.evaluateFreshness(db, { nowMs: NOW, tables: rv, registry: NO_PAUSE }).items[0].status, 'stale', '別のモールは数えない');
+});
+await t('1 つの feed に「読めない」と「止まっている」が混ざった = 状態ごとに別の行 (それぞれの書き方・人がやること)', async () => {
+  const run2 = runOnly('fact_yahoo_store_device_daily', 'fact_yahoo_inflow_daily');
+  const db = makeDb({ ...FRESH, fact_yahoo_store_device_daily: ['bad-value'], fact_yahoo_inflow_daily: ['2026-10-13'] });
+  const s = sender();
+  await run2(db, { send: s });
+  assert.match(s.sent[0], /❓ \*Yahoo統計\* — 読めない: fact_yahoo_store_device_daily\.date_jst/);
+  assert.match(s.sent[0], /• \*Yahoo統計\* \(Yahoo・1 表\) — 最新 10\/13 \(11 日前・しきい値 4 日\): fact_yahoo_inflow_daily\n   → ミニPCの画面でデスクトップの「Yahoo-Relogin\.bat」/);
+  assert.doesNotMatch(s.sent[0], /\(null\)/);
 });
 
 console.log('今朝の自動取得 (fetch-all) の記録');

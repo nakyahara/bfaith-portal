@@ -86,10 +86,10 @@ export const FEEDS = Object.freeze({
  * 1 行 = { key, table, column, kind ('date' = 日付・日時 / 'month' = YYYY-MM), where, maxAgeDays, feed, mall, what, action, fetcher, pause }
  *   where = 行を絞る条件 (コードの中の固定の SQL だけ。例: 取込の記録のうち成功と「同じファイル」だけ) / key = 記録の鍵 (同じ表を 2 回見るときに分ける。既定 = 表の名前)
  */
-const row = (feed, table, column, maxAgeDays, what, { kind = 'date', where = null, key = table } = {}) => {
+const row = (feed, table, column, maxAgeDays, what, { kind = 'date', where = null, key = table, also = [] } = {}) => {
   const f = FEEDS[feed];
   if (!f) throw new Error(`feed が無い: ${feed}`);
-  return Object.freeze({ key, table, column, kind, where, maxAgeDays, feed, mall: f.mall, what, action: f.action, fetcher: f.fetcher, pause: f.pause || null });
+  return Object.freeze({ key, table, column, kind, where, also: Object.freeze(also.map((a) => Object.freeze({ ...a }))), maxAgeDays, feed, mall: f.mall, what, action: f.action, fetcher: f.fetcher, pause: f.pause || null });
 };
 const OK_OR_DUP = "status IN ('ok', 'duplicate')";
 const spReport = (type) => `report_type = '${type}'`;
@@ -114,7 +114,9 @@ export const FRESHNESS_TABLES = Object.freeze([
   row('rakuten-data', 'fact_rakuten_genre_purchaser_snapshot', 'date_jst', 4, '新規・リピート購入者 ジャンル別 (取込日のスナップショット)'),
   // 楽天レビュー (rakuten-review-lib.js)。投稿日は客しだい・中身が前と同じ CSV は取込が「同じファイル (duplicate)」で行に触らない
   //   = 取込の記録 (成功 + 同じファイル) の時刻で見る (Codex R1 P2: レビューの行の last_seen_at だと、新しいレビューの無い週に止まった扱いになる)
-  row('rakuten-review', 'raw_rakuten_review_import_log', 'imported_at', 4, 'レビュー CSV の取込 (成功・同じファイルの記録の時刻)', { where: OK_OR_DUP }),
+  //   窓の中にレビューが 1 件も無い朝は CSV が出ず、取得が report_fetch_log に 'empty' (レビュー0件) と残す = それも新しさの証拠に数える (Codex R3 P2)
+  row('rakuten-review', 'raw_rakuten_review_import_log', 'imported_at', 4, 'レビュー CSV の取込 (成功・同じファイルの記録の時刻・0 件の取得も)', {
+    where: OK_OR_DUP, also: [{ table: 'report_fetch_log', column: 'fetched_at', where: "mall = 'rakuten' AND report_type = 'rreview_csv' AND status = 'empty'" }] }),
   // Yahoo ストクリ統計 6 種 (yahoo-data-lib.js)
   row('yahoo-data', 'fact_yahoo_store_device_daily', 'date_jst', 4, 'ストア 日次 (デバイス別)'),
   row('yahoo-data', 'fact_yahoo_inflow_daily', 'date_jst', 4, '流入 日次'),
@@ -132,8 +134,9 @@ export const FRESHNESS_TABLES = Object.freeze([
   row('aupay-data', 'fact_aupay_product_daily', 'date_jst', 7, '商品分析 日次 (流入の無い日があり得る)'),
   row('aupay-data', 'fact_aupay_pm_ad_daily', 'date_jst', 7, 'プラチナマッチ広告 日次'),
   // プラチナマッチ検索クエリ (週次)。0 件の週は表に何も入らない (取得は report_fetch_log に 'empty' と残す) = 取得の記録 (成功・0 件) の時刻で見る (Codex R2 P2)。
+  //   「画面未更新の疑い」(前の週と同じ中身で取り込まない) の 'empty' は数えない (Codex R3 P2: 画面が古いままなのに新しい扱いにしない)。
   //   月曜は取得しない・火〜日に毎朝。記録は WAREHOUSE_DATA_DIR がある取得だけ書く (無い = 行が無い = まだ始まっていない)
-  row('aupay-data', 'report_fetch_log', 'fetched_at', 7, 'プラチナマッチ検索クエリ 週次の取得 (成功・0 件の記録の時刻)', { where: "mall = 'aupay' AND report_type = 'adata_pm_query' AND status IN ('ok', 'empty')", key: 'report_fetch_log:aupay_pm_query' }),
+  row('aupay-data', 'report_fetch_log', 'fetched_at', 7, 'プラチナマッチ検索クエリ 週次の取得 (成功・0 件の記録の時刻)', { where: "mall = 'aupay' AND report_type = 'adata_pm_query' AND (status = 'ok' OR (status = 'empty' AND message NOT LIKE '画面未更新%'))", key: 'report_fetch_log:aupay_pm_query' }),
   row('aupay-data', 'fact_aupay_sales_monthly', 'date_jst', 70, '売上分析 月次 (date_jst = 月の 1 日)'),
   // Qoo10 分析 (qoo10-data-lib.js)
   row('qoo10-data', 'fact_qoo10_cvr_daily', 'date_jst', 4, '転換率 日次'),
@@ -192,19 +195,35 @@ export function toJstDay(v, kind = 'date') {
 const qid = (name) => `"${String(name).replace(/"/g, '""')}"`;
 
 /** 1 表の最新の日。{ state: 'missing' | 'empty' | 'unreadable' | 'ok', latest, raw, error } */
-export function readLatest(db, t) {
-  const has = db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?").get(t.table);
+function readOne(db, src, kind) {
+  const has = db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?").get(src.table);
   if (!has) return { state: 'missing', latest: null, raw: null, error: null };
   let r;
   try {
-    r = db.prepare(`SELECT MAX(${qid(t.column)}) AS v FROM ${qid(t.table)} WHERE ${qid(t.column)} IS NOT NULL AND TRIM(${qid(t.column)}) <> ''${t.where ? ` AND (${t.where})` : ''}`).get();
+    r = db.prepare(`SELECT MAX(${qid(src.column)}) AS v FROM ${qid(src.table)} WHERE ${qid(src.column)} IS NOT NULL AND TRIM(${qid(src.column)}) <> ''${src.where ? ` AND (${src.where})` : ''}`).get();
   } catch (e) {
     return { state: 'unreadable', latest: null, raw: null, error: String(e && e.message).slice(0, 160) };
   }
   if (!r || r.v === null || r.v === undefined) return { state: 'empty', latest: null, raw: null, error: null };
-  const latest = toJstDay(r.v, t.kind);
+  const latest = toJstDay(r.v, kind);
   if (!latest) return { state: 'unreadable', latest: null, raw: String(r.v).slice(0, 40), error: `日付として読めない値: ${String(r.v).slice(0, 40)}` };
   return { state: 'ok', latest, raw: String(r.v), error: null };
+}
+
+/**
+ * 1 表 (+ also = 同じ取得の「0 件で取れた」記録など、新しさの証拠になるほかの所) の最新の日。{ state: 'missing' | 'empty' | 'unreadable' | 'ok', latest, raw, error }
+ *   主の表が無い = missing (also だけあっても始まっていない) / どれかが読めない = unreadable / 全部空 = empty / それ以外 = 一番新しい日
+ */
+export function readLatest(db, t) {
+  const main = readOne(db, t, t.kind);
+  if (main.state === 'missing' || main.state === 'unreadable') return main;
+  let best = main;
+  for (const src of t.also || []) {
+    const r = readOne(db, src, t.kind);
+    if (r.state === 'unreadable') return r;
+    if (r.state === 'ok' && (best.state !== 'ok' || r.latest > best.latest)) best = r;
+  }
+  return best;
 }
 
 /** MALL_FETCH_ONLY (カンマ区切り) → 取得するもの (空 = 全部) */
@@ -311,14 +330,15 @@ export function planNotifications(problems, stateRows, today) {
 
 const STATUS_WORD = { stale: '止まっている', unreadable: '読めない', paused_overdue: '止めている (台帳の期限切れ)', paused_unregistered: '止めている (台帳に無い)' };
 
-/** feed ごとにまとめる (同じ feed の表は 1 行) */
-function groupByFeed(list) {
+/** feed ごとにまとめる (同じ feed の表は 1 行)。byStatus = feed × 状態ごと (通知の行は状態ごとに書き方が違う = 混ぜない。Codex R3 P2) */
+function groupByFeed(list, { byStatus = false } = {}) {
   const m = new Map();
   for (const p of list) {
-    if (!m.has(p.feed)) m.set(p.feed, []);
-    m.get(p.feed).push(p);
+    const k = byStatus ? `${p.feed}\u0000${p.status}` : p.feed;
+    if (!m.has(k)) m.set(k, { feed: p.feed, ps: [] });
+    m.get(k).ps.push(p);
   }
-  return [...m.entries()].map(([feed, ps]) => ({ feed, ps }));
+  return [...m.values()];
 }
 
 /** feed の止まった表の代表 = しきい値の一番短い表 (日次) のうち、いちばん新しい日の表 (月次の古い日を「最新」と言わない) */
@@ -380,8 +400,8 @@ export function buildFreshnessMessage({ today, due, quiet, recovered, fetch }) {
   };
   const fresh = due.filter((d) => d.reason !== 'remind');
   const remind = due.filter((d) => d.reason === 'remind');
-  addBlocks('\n🆕 *新しく止まった*\n', groupByFeed(fresh), (g) => feedLine(g.feed, g.ps, { fetch, today }));
-  addBlocks(`\n🔁 *止まったまま (${REMIND_EVERY_DAYS} 日ごとの念押し)*\n`, groupByFeed(remind), (g) => `${feedLine(g.feed, g.ps, { fetch, today })}\n   (${md(g.ps[0].since)} から)`);
+  addBlocks('\n🆕 *新しく止まった*\n', groupByFeed(fresh, { byStatus: true }), (g) => feedLine(g.feed, g.ps, { fetch, today }));
+  addBlocks(`\n🔁 *止まったまま (${REMIND_EVERY_DAYS} 日ごとの念押し)*\n`, groupByFeed(remind, { byStatus: true }), (g) => `${feedLine(g.feed, g.ps, { fetch, today })}\n   (${md(g.ps[0].since)} から)`);
   // 戻った: その feed にまだ止まっている表があれば「一部」と表の名前で言う (Codex R1 P2: 1 表だけ戻ったのに feed 全体が戻ったと言わない)
   const stillBad = new Set([...due, ...quiet].map((p) => p.feed));
   if (recovered.length) {
