@@ -6,9 +6,9 @@
  * 表・列・日数の決まりは lib/amazon-ai-mirror.js (受け手と共有)。sync-amazon-price-snapshot.js と同じ型 (chunk POST + sync_runs の記録)。
  *
  *   - 毎朝 (--daily): 表ごとに直近 sendDays 日を送り直す (取得が直近を取り直す幅)。前の回に送れた最後の日 (sync_runs の applied) が
- *     それより前なら、その日から送り直す (止まっていた日を埋める)。一度も送っていない表は残す日数 (keepDays) ぶん全部
+ *     それより前なら、その日から送り直す (止まっていた日を埋める)。いちばん新しい run が失敗していれば (--full の途中など) その run の最初の日から。一度も送っていない表は残す日数 (keepDays) ぶん全部
  *   - 1 回の run は runDays 日まで (初回の全部送りを小分けにする = Render の stage を小さく)。run ごとに sync_runs に 1 行
- *   - 表が無い・行が 1 つも無い (まだ取り始めていない) = 送らない (⏭️・失敗にしない・mirror はそのまま)
+ *   - 表が無い・行が 1 つも無く一度も送っていない (まだ取り始めていない) = 送らない (⏭️・失敗にしない・mirror はそのまま)。一度送った表が空になったら送る (mirror の行を消す)
  *   - 期間の中に行が無い日 = その日を mirror でも空にする (元が正)
  *   - 送るのは facts-amazon.js が読む列と主キーだけ。返品・補てんは元の主キー (注文番号など) のハッシュ row_key だけ送る
  *
@@ -37,29 +37,43 @@ const POST_TIMEOUT_MS = 120000;
 
 export const jstToday = (nowMs = Date.now()) => new Date(nowMs + 9 * 3600 * 1000).toISOString().slice(0, 10);
 
-/** 表の状態: missing = 表が無い / empty = 行が 1 つも無い (まだ取り始めていない) / ok */
+/**
+ * 表の状態: missing = 表が無い / empty = 表に行が 1 つも無く、一度も送っていない (まだ取り始めていない) / ok
+ *   🚨 一度送った表は、元が空になっても (ERROR が全部直った・JP の行が無い) 送る = mirror の行を消す (古い ERROR を残さない。Codex R2 P2)。
+ *   「空」は where (ERROR だけ・JP だけ) で絞らずに表全体で見る (絞った行が 0 = 正しく 0 件のこともある)
+ */
 export function sourceState(db, spec) {
   const t = db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(spec.source);
   if (!t) return 'missing';
-  const w = spec.where ? `WHERE ${spec.where}` : '';
-  return db.prepare(`SELECT 1 FROM ${spec.source} ${w} LIMIT 1`).get() ? 'ok' : 'empty';
+  if (db.prepare(`SELECT 1 FROM ${spec.source} LIMIT 1`).get()) return 'ok';
+  return lastAppliedTo(db, spec.entity) ? 'ok' : 'empty';
 }
 
 /** 前の回に送れた最後の日 (この表の applied の run の scope_to の最大)。無ければ null */
 export function lastAppliedTo(db, entity) {
   return db.prepare(`SELECT MAX(scope_to) AS d FROM sync_runs WHERE entity = ? AND status = 'applied'`).get(entity)?.d || null;
 }
+/**
+ * いちばん新しい run が失敗・途中 (started のまま) なら、その run の最初の日 (そこから後は送れていない = run は古い順に送り、失敗したら止める)。
+ * --full の途中で止まったときも、次の回はそこから今日まで送り直す (前に送れた最後の日だけ見ると、直近しか送らずに古い日が欠けたままになる。Codex R2 P2)
+ */
+export function resumeFrom(db, entity) {
+  const r = db.prepare(`SELECT status, scope_from FROM sync_runs WHERE entity = ? ORDER BY started_at DESC, rowid DESC LIMIT 1`).get(entity);
+  return r && r.status !== 'applied' ? r.scope_from : null;
+}
 
 /**
  * 送る期間 [from, to]。to = 今日 (JST)。
- *   full / 一度も送っていない = 残す日数ぶん全部。それ以外 = 直近 sendDays 日、前の回の最後の日がそれより前ならそこから (残す日数まで)
+ *   full / 一度も送っていない = 残す日数ぶん全部。それ以外 = 直近 sendDays 日、前の回の最後の日がそれより前ならそこから・
+ *   前の回が途中で失敗していればその run の最初の日から (どれも残す日数まで)
  */
-export function planScope(spec, { today, lastTo = null, full = false }) {
+export function planScope(spec, { today, lastTo = null, resume = null, full = false }) {
   const to = today;
   const keepFrom = addDaysYmd(to, -(spec.keepDays - 1));
   if (full || !lastTo) return { from: keepFrom, to, mode: full ? 'full' : 'first' };
   const base = lastTo < to ? addDaysYmd(lastTo, 1) : to;   // 前の回の次の日 (今日までに送っていれば今日)
-  const from = addDaysYmd(base, -(spec.sendDays - 1));
+  let from = addDaysYmd(base, -(spec.sendDays - 1));
+  if (resume && resume < from) from = resume;
   return { from: from < keepFrom ? keepFrom : from, to, mode: from < addDaysYmd(to, -(spec.sendDays - 1)) ? 'catch_up' : 'daily' };
 }
 
@@ -194,7 +208,7 @@ export async function syncEntity(db, spec, { today, full = false, dryRun = false
     if (!contract || contract.contract_version !== AMAZON_AI_CONTRACT_VERSION) {
       return { entity: spec.entity, status: 'failed', error: `契約 (sync_contracts) が無い・版が違う (code=${AMAZON_AI_CONTRACT_VERSION}, db=${contract?.contract_version ?? 'なし'})` };
     }
-    const scope = planScope(spec, { today, lastTo: lastAppliedTo(db, spec.entity), full });
+    const scope = planScope(spec, { today, lastTo: lastAppliedTo(db, spec.entity), resume: resumeFrom(db, spec.entity), full });
     const runs = splitRuns(scope.from, scope.to, spec.runDays);
     log(`  ${spec.entity}: ${scope.from}〜${scope.to} (${scope.mode}・run ${runs.length})`);
     let rows = 0, chunks = 0, bytes = 0;

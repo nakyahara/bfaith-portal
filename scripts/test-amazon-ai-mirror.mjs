@@ -221,6 +221,10 @@ await ta('[A2] 送る期間: 初回 = 残す日数ぶん / 毎朝 = 直近 sendD
   assert.deepEqual(S.planScope(sp, { today: T0, lastTo: '2026-11-01' }), { from: '2026-10-31', to: T0, mode: 'catch_up' });
   assert.deepEqual(S.planScope(sp, { today: T0, lastTo: '2026-01-01' }), { from: L.addDaysYmd(T0, -74), to: T0, mode: 'catch_up' });
   assert.deepEqual(S.planScope(sp, { today: T0, lastTo: '2026-11-11', full: true }), { from: L.addDaysYmd(T0, -74), to: T0, mode: 'full' });
+  // 前の回が途中で失敗 (--full の途中など) = その run の最初の日から今日まで
+  assert.deepEqual(S.planScope(sp, { today: T0, lastTo: '2026-11-11', resume: '2026-09-20' }), { from: '2026-09-20', to: T0, mode: 'catch_up' });
+  assert.deepEqual(S.planScope(sp, { today: T0, lastTo: '2026-11-11', resume: '2026-11-12' }), { from: '2026-11-10', to: T0, mode: 'daily' });
+  assert.deepEqual(S.planScope(sp, { today: T0, lastTo: '2026-11-11', resume: '2026-01-01' }), { from: L.addDaysYmd(T0, -74), to: T0, mode: 'catch_up' });
 });
 
 await ta('[A3] run の分け方: 古い順・すきまも重なりも無い・runDays 日まで', async () => {
@@ -466,15 +470,14 @@ await ta('[E2] 表が無い・行が無い (まだ取り始めていない) = �
   ensureReturnsTable(bare);   // 表はあるが空
   ensureRankTables(bare);
   insertRows(bare, 'amazon_catalog_rank_daily', []);
-  // 在庫計画は US の行だけ (JP の行が無い = 送る行が無い)
-  ensurePlanningHistoryTables(bare);
-  insertRows(bare, 'fba_planning_daily', [{ snapshot_date: TODAY, market: 'us', amazon_sku: 'SKU-1' }]);
+  ensurePlanningHistoryTables(bare);   // 在庫計画の表はあるが空
   const c = countingPost();
   const outcomes = await S.syncAmazonAiMirror(bare, { today: TODAY, post: c.post, log: quiet });
   assert.equal(c.calls.length, 0, '何も送らない');
   assert.ok(outcomes.every((o) => o.status === 'skipped'), JSON.stringify(outcomes));
   assert.equal(outcomes.find((o) => o.entity === 'amazon_fba_returns').reason, 'empty');
   assert.equal(outcomes.find((o) => o.entity === 'fba_planning_daily').reason, 'empty');
+  assert.equal(S.sourceState(bare, spec('fba_planning_daily')), 'empty');
   assert.equal(outcomes.find((o) => o.entity === 'amazon_sales_traffic_daily').reason, 'missing');
   assert.deepEqual(Object.fromEntries(L.AMAZON_AI_MIRROR_ENTITIES.map((sp) => [sp.entity, mirrorCount(sp)])), before, 'mirror はそのまま');
   const line = S.summaryLine(outcomes);
@@ -496,6 +499,43 @@ await ta('[E3] 契約 (sync_contracts) は送り手が入れる (initDB の前�
   const r = await S.syncEntity(db, spec('amazon_listing_fetch_runs'), { today: TODAY, post: httpPost, log: quiet });
   assert.equal(r.status, 'failed');
   assert.match(r.error, /版が違う/);
+});
+
+await ta('[E4] 一度送った表は、元が空になっても送る (ERROR が全部直った・表が空になった) = mirror のその日の行を消す', async () => {
+  const day3 = '2026-08-20';
+  const iss = spec('amazon_listing_issue_daily');
+  const scopeFrom = L.addDaysYmd(day3, -(iss.sendDays - 1));
+  assert.ok(count(mdb, `SELECT COUNT(*) AS n FROM mirror_amazon_listing_issue_daily WHERE date_jst >= ?`, scopeFrom) > 0);
+  SRC.prepare(`DELETE FROM amazon_listing_issue_daily WHERE severity = 'ERROR'`).run();   // WARNING は残る (送る行は 0)
+  let o = await S.syncAmazonAiMirror(SRC, { today: day3, post: httpPost, entities: [iss.entity], log: quiet });
+  assert.equal(o[0].status, 'sent');
+  assert.equal(count(mdb, `SELECT COUNT(*) AS n FROM mirror_amazon_listing_issue_daily WHERE date_jst >= ?`, scopeFrom), 0, '直った ERROR を残さない');
+  assert.ok(count(mdb, `SELECT COUNT(*) AS n FROM mirror_amazon_listing_issue_daily WHERE date_jst < ?`, scopeFrom) > 0, '送る期間より前は残る');
+  // 表が丸ごと空 (一度は送った) = 空ではなく ok (clear だけ送る)
+  const rb = spec('amazon_fba_reimbursements');
+  SRC.prepare('DELETE FROM amazon_fba_reimbursements').run();
+  assert.equal(S.sourceState(SRC, rb), 'ok');
+  o = await S.syncAmazonAiMirror(SRC, { today: day3, post: httpPost, entities: [rb.entity], log: quiet });
+  assert.equal(o[0].status, 'sent');
+  assert.equal(o[0].rows, 0);
+  assert.equal(count(mdb, `SELECT COUNT(*) AS n FROM mirror_amazon_fba_reimbursements WHERE approval_date_jst >= ?`, L.addDaysYmd(day3, -(rb.sendDays - 1))), 0);
+});
+
+await ta('[E5] --full が途中で失敗 = 次の毎朝の回は失敗した run の最初の日から今日まで送り直す (古い日を欠けたままにしない)', async () => {
+  const day3 = '2026-08-20';
+  const bsr = spec('amazon_catalog_rank_daily');
+  const runs = S.splitRuns(L.addDaysYmd(day3, -(bsr.keepDays - 1)), day3, bsr.runDays);
+  mdb.prepare(`DELETE FROM ${bsr.table}`).run();   // mirror を作り直した (空) の想定
+  const c = countingPost(httpPost, (entity, body) => entity === bsr.entity && body.scope_from === runs[2].from);
+  let o = await S.syncAmazonAiMirror(SRC, { today: day3, full: true, post: c.post, entities: [bsr.entity], log: quiet });
+  assert.equal(o[0].status, 'failed');
+  assert.equal(S.resumeFrom(SRC, bsr.entity), runs[2].from);
+  assert.equal(count(mdb, `SELECT COUNT(*) AS n FROM ${bsr.table} WHERE date_jst >= ?`, runs[2].from), 0, '失敗した run より後は送っていない');
+  o = await S.syncAmazonAiMirror(SRC, { today: day3, post: httpPost, entities: [bsr.entity], log: quiet });
+  assert.equal(o[0].status, 'sent');
+  assert.equal(o[0].scope.from, runs[2].from);
+  assert.equal(S.resumeFrom(SRC, bsr.entity), null);
+  assert.equal(mirrorCount(bsr), expectedCount(SRC, bsr, day3));
 });
 
 // ════════ F. 受け手 ════════
