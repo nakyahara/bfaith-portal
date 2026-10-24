@@ -2768,15 +2768,46 @@ try {
     r = await call('GET', '/apps/master-edit/reg-csv');
     const card = new RegExp(`<article class="filecard todo-card exp" data-id="${f.export_id}"[\\s\\S]*?</article>`).exec(r.text);
     assert.ok(card, '取り込み待ちのカード');
-    assert.match(card[0], /data-act="declare-quick" data-result="ok"/);
+    assert.match(card[0], /data-act="declare-quick" data-result="ok" data-need-dl disabled/, '🆕 10/24: 「NE に取り込んだ」はダウンロードするまで押せない (JS が外す)');
     assert.match(card[0], new RegExp(`data-sha="${f.sha256}"`));
+    // 🆕 10/24 (本番 #21・#22): ファイルごとに大きなダウンロードのボタン・何時まで・NE のどこで何を選ぶか・単品の文 (セットの文と混ぜない)
+    assert.match(card[0], /<button class="btn pri lg" type="button" data-act="download"><svg[\s\S]*?<\/svg>単品の CSV をダウンロード<\/button>/);
+    assert.match(card[0], /までダウンロードできます \(作ってから 2 時間\)/);
+    assert.match(card[0], /「<b>商品 CSV<\/b>」を選んで取り込む/);
+    assert.match(card[0], /href="https:\/\/main\.next-engine\.com\/User_Syohin_Csvupload_Item\/upload"[^>]*data-ne-link/);
+    assert.doesNotMatch(card[0], /セット商品情報 CSV|セットは必ず/);
+    assert.match(card[0], /data-act="skip-dl"/);
+    const e1 = (await call('GET', '/apps/master-edit/api/reg-csv/summary')).j.exports.find((x) => x.export_id === f.export_id);
+    assert.equal(Date.parse(e1.download_until) - (await one('select (extract(epoch from issued_at) * 1000)::float8 as ms from ops.ne_reg_exports where export_id = $1', [f.export_id])).ms,
+      G.REG_FILE_HOURS * 3600000, 'download_until = 配ってから 2 時間');
     // 「NE に取り込んだ」= 申告 (ok)・sha256 は配ったファイルの記録
     const d = await call('POST', `/apps/master-edit/api/reg-csv/exports/${f.export_id}/declare`, { body: { sha256: f.sha256, result: 'ok', ne_message: '' } });
     assert.equal(d.status, 200, d.text);
     assert.equal(await regOf('new-one1'), 'ne_pending');
     r = await call('GET', '/apps/master-edit/reg-csv');
-    assert.doesNotMatch(r.text, new RegExp(`class="filecard todo-card exp" data-id="${f.export_id}"`), '取り込んだファイルのカードは消える');
-    assert.match(r.text, /id="wait-line"/, '翌朝の確かめ待ちは 1 行');
+    // 🆕 10/24: 取り込んだファイル = 「記録しました」の小さいカード (このパソコンでダウンロードしていなければ JS が一言を出す = 本番 #22)・2 時間の間はもう一度ダウンロード
+    const card2 = new RegExp(`<article class="filecard todo-card exp" data-id="${f.export_id}"[^>]*data-state="declared"[\\s\\S]*?</article>`).exec(r.text);
+    assert.ok(card2, '取り込んだファイルは「記録しました」のカード');
+    assert.match(card2[0], /「NE に取り込んだ」を記録しました/);
+    assert.match(card2[0], /data-act="download"/);
+    assert.match(card2[0], /<div class="why-wrn" data-not-dl hidden[\s\S]*?まだダウンロードしていません[\s\S]*?翌朝「取り込めなかった」/);
+    assert.doesNotMatch(card2[0], /data-act="declare-quick"/);
+    assert.doesNotMatch(r.text, /id="wait-line"/, '申告したファイルはカードに出す (1 行の待ちには数えない)');
+    // 🆕 10/24: 配ってから 2 時間を過ぎた = もう一度ダウンロードのボタンは出さない・次にすること (使わない → 作り直す)・API は 409 と同じ文
+    await pg.query('alter table ops.ne_reg_exports disable trigger trg_ne_reg_exports_guard');
+    await pg.query("update ops.ne_reg_exports set issued_at = issued_at - interval '2 hours 1 minute' where export_id = $1", [f.export_id]);
+    await pg.query('alter table ops.ne_reg_exports enable trigger trg_ne_reg_exports_guard');
+    r = await call('GET', '/apps/master-edit/reg-csv');
+    const card3 = new RegExp(`<article class="filecard todo-card exp" data-id="${f.export_id}"[\\s\\S]*?</article>`).exec(r.text)[0];
+    assert.doesNotMatch(card3, /data-act="download"/, '期限の後はダウンロードのボタンを出さない');
+    assert.match(card3, /このファイルを「使わない」にして、もう一度「NE 登録の CSV を作る」を押してください/);
+    assert.match(card3, /data-act="open-supersede" data-not-dl hidden/);
+    const hist3 = new RegExp(`<article class="filecard exp" data-id="${f.export_id}"[\\s\\S]*?</article>`).exec(r.text)[0];
+    assert.match(hist3, /data-dl-expired>ダウンロードの期限 \(.+?\) を過ぎました/);
+    assert.doesNotMatch(hist3, /data-act="download"/);
+    const exp3 = await call('GET', `/apps/master-edit/api/reg-csv/exports/${f.export_id}/file`);
+    assert.deepEqual([exp3.status, exp3.j.reason, exp3.j.detail], [409, 'reg_file_expired', 'issued_over_2h']);
+    assert.match(exp3.j.error, /^ダウンロードの期限 \(配ってから 2 時間\) を過ぎました。まだ NE に取り込んでいなければ、このファイルを「使わない」にして/);
     // 前の確かめで分からない断り (前に NE で見たコード = DB の ops.ne_code_seen) の商品は外して作り直した (ほかの商品は作る・理由は errors に)
     assert.ok(b.j.errors.every((x) => x.dropped === true), JSON.stringify(b.j.errors));
     // 🆕 #Codex R1: DB の断りの文から商品を取るのは最初の語だけ (文の中の「NE」などを商品と取り違えない)

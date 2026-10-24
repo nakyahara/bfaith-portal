@@ -399,6 +399,32 @@ await ta('[S6] 取り消し: 動いている・分からない・取り込んだ
     BC.resolveJob(u3, { jobId: q.job_id, outcome: 'not_imported', note: '履歴に無かった', by: 'naka@test', now: jst('10:05') });
     assert.doesNotThrow(() => BC.recordDownload(u3, { exportId: '32', by: 'naka@test', now: jst('10:05') }));
   }
+  // 🆕 2026-10-24 ボタンで取り込めた CSV (確かめで「取り込んだ」も) = 手の道のダウンロードもさせない (2 回取り込まない)・画面の印 imported_ok_job
+  {
+    alive(u3, jst('10:06'));
+    const q = BC.enqueue(u3, base({ now: jst('10:06'), exportId: '33' }));
+    const cq = BC.claimJob(u3, { jobId: q.job_id, runnerId: 'pc', now: jst('10:06') });
+    BC.markExecuting(u3, { jobId: q.job_id, claimToken: cq.claimToken, now: jst('10:06') });
+    BC.reportFinal(u3, { jobId: q.job_id, claimToken: cq.claimToken, executed: true, importResult: { status: 'unknown' }, now: jst('10:07') });
+    BC.resolveJob(u3, { jobId: q.job_id, outcome: 'imported', note: '履歴にあった', by: 'naka@test', now: jst('10:08') });
+    const e33 = err(() => BC.recordDownload(u3, { exportId: '33', by: 'naka@test', now: jst('10:08') }));
+    assert.deepEqual([e33.code, e33.status], ['imported_by_button', 409]);
+    assert.match(e33.message, /ボタンでロジザードに取り込みました \(#\d+\)。手でもう一度取り込まないでください \(ダウンロードできません\)/);
+    assert.equal(u3.prepare("select count(*) as n from bc_downloads where export_id = '33'").get().n, 0);
+    assert.equal(BC.screenStatus(u3, { now: jst('10:08'), exportIds: ['33', '32'] }).byExport['33'].imported_ok_job, q.job_id);
+    assert.equal(BC.screenStatus(u3, { now: jst('10:08'), exportIds: ['32'] }).byExport['32'].imported_ok_job, null, '「取り込んでいない」と記した回は止めない');
+    // #Codex R2 Medium: その後のもう一度 (理由つき) が「取り込んでいない」で終わった = 手の道に戻せる (前の成功がずっと塞がない)・押す前にやめた回は数えない
+    alive(u3, jst('10:09'));
+    const q2 = BC.enqueue(u3, base({ now: jst('10:09'), exportId: '33', rerunReason: 'ロジザードで商品を消したので取り込み直す' }));
+    BC.cancelJob(u3, { jobId: q2.job_id, by: 'x', now: jst('10:09') });
+    assert.equal(err(() => BC.recordDownload(u3, { exportId: '33', by: 'naka@test', now: jst('10:09') })).code, 'imported_by_button', 'やめた回 = 前の成功のまま');
+    const q3 = BC.enqueue(u3, base({ now: jst('10:10'), exportId: '33', rerunReason: 'ロジザードで商品を消したので取り込み直す' }));
+    const c3 = BC.claimJob(u3, { jobId: q3.job_id, runnerId: 'pc', now: jst('10:10') });
+    BC.markExecuting(u3, { jobId: q3.job_id, claimToken: c3.claimToken, now: jst('10:10') });
+    BC.reportFinal(u3, { jobId: q3.job_id, claimToken: c3.claimToken, executed: true, importResult: { status: 'unknown' }, now: jst('10:11') });
+    BC.resolveJob(u3, { jobId: q3.job_id, outcome: 'not_imported', note: '履歴に無かった', by: 'naka@test', now: jst('10:12') });
+    assert.doesNotThrow(() => BC.recordDownload(u3, { exportId: '33', by: 'naka@test', now: jst('10:12') }));
+  }
 });
 
 await ta('[S7] ロジザードの取込の状態の止め (lz-state.js): 鍵・取込の途中・確かめ待ち・手の取込 = 止める / 読めない = 止める / 初期化前・止めてある = 止めない', async () => {
@@ -490,7 +516,23 @@ await ta('[I2] 本物の流れ: 積む → 取る (帳面と同じ byte 列) →
   assert.deepEqual([st.j.latest.state, st.j.latest.import_total, st.j.latest.import_errors, st.j.latest.export_state, st.j.latest.export_rows], ['imported', 2, 0, 'ok', 5100]);
   assert.match(st.j.latest.log, /① ok[\s\S]*② ok/);
   assert.equal(st.j.byExport[e.id].imported_job, jobId);
+  assert.equal(st.j.byExport[e.id].imported_ok_job, jobId);
   assert.equal(st.j.runner.alive, true);
+  // 🆕 2026-10-24 ボタンで取り込んだ CSV = ダウンロードさせない (409 と理由の文)・画面の行はダウンロードのボタンを押せない形と理由
+  {
+    const dl = await fetch(`${ORIGIN}/apps/master-edit/lz-csv/${e.id}/file`);
+    const dj = await dl.json();
+    assert.deepEqual([dl.status, dj.reason], [409, 'imported_by_button']);
+    assert.match(dj.error, /手でもう一度取り込まないでください \(ダウンロードできません\)/);
+    const pg3 = await call('GET', '/lz-csv');
+    const row = new RegExp(`<tr data-export="${e.id}">[\\s\\S]*?</tr>`).exec(pg3.text)[0];
+    assert.match(row, new RegExp(`<button class="btn sm" type="button" data-lz-dl="${e.id}" disabled>`));
+    assert.match(row, new RegExp(`data-lz-dl-why="${e.id}">ボタンで取り込んだ CSV です \\(#${jobId}\\)。手でもう一度取り込まないでください`));
+    assert.doesNotMatch(row, /<a [^>]*download/, '隠れたダウンロードのリンクは使わない');
+    const orow = new RegExp(`<tr data-export="${other.id}">[\\s\\S]*?</tr>`).exec(pg3.text)[0];
+    assert.match(orow, new RegExp(`data-lz-dl="${other.id}">`), 'ほかの CSV は押せる');
+    assert.match(orow, new RegExp(`data-lz-dl-why="${other.id}" hidden>`));
+  }
   // もう一度 = 理由
   r = await call('POST', `/api/lz-csv/${e.id}/import`, importBody(e));
   assert.deepEqual([r.status, r.j.reason], [409, 'already_imported']);
@@ -965,6 +1007,11 @@ await ta('[U] 画面: miniPC が来ていない = 押せない (理由) / 来て
     await page.locator(`button[data-bc-import="${e2.id}"]`).waitFor();
     assert.equal(await page.locator(`button[data-bc-import="${e2.id}"]`).isDisabled(), true);
     assert.match(await page.locator(`[data-bc-why="${e2.id}"]`).textContent(), /ほかの取り込み/);
+    // 🆕 2026-10-24 (中原さん「ダウンロードを押しても落ちない」): ボタンで取り込み中の CSV = ダウンロードのボタンは押せない形と理由 (ポータルも 409 import_running)
+    assert.equal(await page.locator(`button[data-lz-dl="${e.id}"]`).isDisabled(), true, '取り込み中 = ダウンロードを押せない');
+    assert.match(await page.locator(`[data-lz-dl-why="${e.id}"]`).textContent(), /いまボタンでロジザードに取り込んでいます \(#\d+\)。終わってから/);
+    assert.equal(await page.locator(`button[data-lz-dl="${e2.id}"]`).isDisabled(), false, 'ほかの CSV はダウンロードできる');
+    assert.equal(await page.locator(`[data-lz-dl-why="${e2.id}"]`).isVisible(), false);
     // miniPC が取り込む → 画面が読み直して「取り込みました」・もう一度
     const out = await RUN.runOnce({ client: client(), ...runnerEnv(), localBusy: () => null, log: () => {}, ...noExit,
       session: async (o) => { await o.beforeExecute(); await o.onImported({ summary: 'インポート結果 総件数 : 1 エラー件数 : 0', counts: { total: 1, errors: 0 } }); return fakeExport(o, 77); } });
@@ -979,8 +1026,27 @@ await ta('[U] 画面: miniPC が来ていない = 押せない (理由) / 来て
     await page.locator(`#bc-rr-${e.id}`).waitFor();
     await page.locator(`button[data-bc-go="${e.id}"]`).click();
     assert.match(await page.locator(`[data-bc-form-msg="${e.id}"]`).textContent(), /理由を 4 字以上/);
-    // ダウンロードした CSV = 手の確かめ
-    await fetch(`${ORIGIN}/apps/master-edit/lz-csv/${e2.id}/file`);
+    // 🆕 2026-10-24: 取り込んだ後 = 読み直し (数秒おき) でダウンロードのボタンが止まり理由が出る
+    await page.waitForFunction((id) => { const b = document.querySelector(`button[data-lz-dl="${id}"]`); return b && b.disabled; }, e.id, { timeout: 10000 });
+    assert.match(await page.locator(`[data-lz-dl-why="${e.id}"]`).textContent(), /ボタンで取り込んだ CSV です \(#\d+\)。手でもう一度取り込まないでください \(ダウンロードできません\)/);
+    // 🆕 2026-10-24: 断られた (503 など) = その行に理由を 1 行 (前は <a download> で何も出なかった)・押し直せる
+    await page.route(`**/apps/master-edit/lz-csv/${e2.id}/file`, (rt) => rt.fulfill({ status: 503, contentType: 'application/json',
+      body: JSON.stringify({ ok: false, error: 'ダウンロードの記録を残せないので、いまは出せません (少し待ってからもう一度)', reason: 'bc_db_unavailable' }) }));
+    await page.click(`button[data-lz-dl="${e2.id}"]`);
+    await page.waitForFunction((id) => /記録を残せない/.test((document.querySelector(`[data-lz-dl-msg="${id}"]`) || {}).textContent || ''), e2.id, { timeout: 10000 });
+    assert.match(await page.getAttribute(`[data-lz-dl-msg="${e2.id}"]`, 'class'), /\berr\b/);
+    assert.equal(await page.locator(`button[data-lz-dl="${e2.id}"]`).isDisabled(), false, '少し待てば出せる = 押し直せる');
+    await page.unroute(`**/apps/master-edit/lz-csv/${e2.id}/file`);
+    // ダウンロードした CSV = 手の確かめ (🆕 画面のボタン = fetch → 保存。中身は帳面のファイルと 1 byte も違わない)
+    const [dlx] = await Promise.all([page.waitForEvent('download'), page.click(`button[data-lz-dl="${e2.id}"]`)]);
+    assert.equal(dlx.suggestedFilename(), 'logizard_bc_upload.csv');
+    const dlFile = path.join(os.tmpdir(), `lzbc-ui-${process.pid}.csv`);
+    await dlx.saveAs(dlFile);
+    assert.ok(fs.readFileSync(dlFile).equals(e2.file.file_bytes), 'ダウンロードした中身 = 帳面のファイル (Shift_JIS のまま)');
+    fs.rmSync(dlFile, { force: true });
+    assert.match(await page.locator(`[data-lz-dl-msg="${e2.id}"]`).textContent(), /ダウンロードしました/);
+    // 保存したかはページから分からない (#Codex R1 High) = 人が押す保存のリンク (受け取った byte 列・サーバーには 2 回目を取りに行かない)
+    assert.match(await page.locator(`tr[data-export="${e2.id}"] a[data-save-again]`).textContent(), /ファイルが届いていなければ、ここを押して保存/);
     await page.reload();
     await page.locator(`button[data-bc-import="${e2.id}"]`).click();
     await page.locator(`#bc-nm-${e2.id}`).waitFor();

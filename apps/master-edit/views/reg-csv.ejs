@@ -39,17 +39,38 @@
       if (e.state === 'built') return [done('作った'), { t: '配る (ダウンロード)', cls: 'cur' }, { t: 'NE で取り込む' }, { t: '翌朝の確かめ (自動)' }];
       if (e.state === 'issued') return [done('作った'), done('配った'), { t: 'NE で取り込む', cls: 'cur' }, { t: '翌朝の確かめ (自動)' }];
       if (e.state === 'declared') return [done('作った'), done('配った'), done('申告した'), { t: '翌朝の確かめ (自動)', cls: 'cur' }];
-      if (e.close_reason === 'finished') return [done('作った'), done('配った'), ...(e.declared_at ? [done('申告した')] : []), done('翌朝の確かめ')];
+      if (e.close_reason === 'finished') {
+        // 🆕 10/24: 翌朝の確かめで NE に無かった (取り込めなかった) 商品がある = 「確かめ終わった」に見せない (その商品は「次の CSV」に戻る)
+        const nf = notInNe(e);
+        return [done('作った'), done('配った'), ...(e.declared_at ? [done('申告した')] : []), nf ? { t: `NE に入らなかった ${nf} 件 (次の CSV に戻した)`, cls: 'bad' } : done('翌朝の確かめ')];
+      }
       return [done('作った'), { t: CLOSE_REASONS[e.close_reason] || '閉じた', cls: 'bad' }];
     };
-    let P = null, toDownload = [], toImport = [], partials = [], trialDone = [], waitingItems = 0;
+    // 🆕 10/24 (中原さん「セット商品を作成した場合の NE への登録 CSV が DL できない・動線もおかしい」): ブラウザは 2 つ目の自動のダウンロードを黙って止める =
+    //   ファイルごとに大きなダウンロードのボタン (押した 1 回 = 1 つ)・NE の取り込み先・「NE に取り込んだ」はダウンロードした後だけ押せる (画面の動き = me-regcsv.js)
+    const NE_UPLOAD_URL = 'https://main.next-engine.com/User_Syohin_Csvupload_Item/upload';
+    // セットも同じ NE の画面 ([商品] → [商品管理の一括登録]) の「CSV のアップロード」で「セット商品情報 CSV」を選んで取り込む
+    //   (NE の画面の写し = AI_reference の captures_ne_syohin_up・つかいかた #reg-csv と同じ。セットだけの別の画面は無い)
+    const NE_SET_UPLOAD_URL = NE_UPLOAD_URL;
+    const NE_PICK = { products: '商品 CSV', sets: 'セット商品情報 CSV' };
+    const neUrl = (e) => (e.kind === 'sets' ? NE_SET_UPLOAD_URL : NE_UPLOAD_URL);
+    // ダウンロードできるのは配ってから 2 時間 (DB の ops.ne_reg_file。lib の download_until)。許可が先に切れたときは押した時に DB が答える (409 の文をカードに出す)
+    const dlOpen = (e) => e.download_open === true;   // DB の時計 (lib の download_open)
+    const needDl = canAct ? ' data-need-dl disabled' : ' disabled';   // ダウンロードするまで押せない (JS がこのブラウザでダウンロードした印を見て外す)
+    const notInNe = (e) => e.items.filter((i) => i.state === 'failed' && i.failed_reason === 'not_in_ne').length;
+    let P = null, toDownload = [], toImport = [], toCheck = [], partials = [], trialDone = [], waitingItems = 0, againCodes = [];
     if (S && S.applied) {
       P = S.plan;
       const open = S.exports.filter((e) => e.state !== 'closed');
       toDownload = open.filter((e) => e.state === 'built');
       toImport = open.filter((e) => e.state === 'issued' && e.items.some((i) => i.state === 'issued'));
+      // 🆕 10/24: 「NE に取り込んだ」を押したファイル = 翌朝の確かめ待ち (このブラウザでダウンロードしていなければ一言・本番 #22 = 落とさずに押した)
+      toCheck = open.filter((e) => e.state === 'declared');
       partials = open.flatMap((e) => e.items.filter((i) => i.state === 'partial').map((i) => ({ e, i })));
-      waitingItems = open.filter((e) => !toDownload.includes(e) && !toImport.includes(e)).reduce((a, e) => a + e.items.filter((i) => ['issued', 'import_declared'].includes(i.state)).length, 0);
+      waitingItems = open.filter((e) => !toDownload.includes(e) && !toImport.includes(e) && !toCheck.includes(e)).reduce((a, e) => a + e.items.filter((i) => ['issued', 'import_declared'].includes(i.state)).length, 0);
+      // 🆕 10/24: 前の CSV で NE に入らなかった (翌朝 NE に無かった) 商品が「次の CSV」に戻っている = その一言
+      const inPlan = new Set([...P.singles, ...P.groups.flatMap((g) => g.codes), ...P.sets].map((c) => String(c).toLowerCase()));
+      againCodes = [...new Set(S.exports.flatMap((e) => e.items.filter((i) => i.state === 'failed' && i.failed_reason === 'not_in_ne' && inPlan.has(String(i.code).toLowerCase())).map((i) => i.code)))];
       // 試し用のセットのファイルが全部 NE で確かめ済み = この形を「実機で確かめた」にする (中原さんの番)
       trialDone = S.exports.filter((e) => e.trial && e.items.length && e.items.every((i) => i.state === 'verified') && e.verify && e.verify.can && !e.verify_recorded && !(S.verified[e.kind] && S.verified[e.kind].ok));
     }
@@ -67,7 +88,7 @@
     <div class="ph">
       <div>
         <h1>NE 登録の CSV</h1>
-        <div class="lead">新商品 (下書き) を NE に登録する CSV です。<b style="color:var(--text)">ボタンを押すと CSV ができてダウンロードされます → NE の「商品一括登録」で取り込む → 翌朝、自動で確かめます</b>。</div>
+        <div class="lead">新商品 (下書き) を NE に登録する CSV です。<b style="color:var(--text)">ボタンを押すと CSV ができます → ファイルごとにダウンロード → NE の「商品一括登録」で取り込む → 「NE に取り込んだ」を押す → 翌朝、自動で確かめます</b>。</div>
       </div>
       <div class="ph-actions"><a class="btn" href="<%= base %>/manual#reg-csv"><svg class="ic" aria-hidden="true"><use href="#i-book"/></svg>つかいかた</a></div>
     </div>
@@ -91,8 +112,9 @@
       <% } else { %><details class="more" id="next-items-more"><summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>入る商品を見る</summary><div class="body kidchips" id="next-items" style="display:flex;flex-wrap:wrap;gap:6px"><%- chipsHtml() %></div></details><% } %>
       <div class="buildbar">
         <button class="btn pri lg" type="button" data-act="build-all"<%= canAct && P.files.length ? '' : ' disabled' %>><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>NE 登録の CSV を作る</button>
-        <span class="hint" id="next-hint">押すと CSV ができて、そのままダウンロードされます<%= P.files.length > 1 ? `（ファイルは ${P.files.length} つ: ${P.files.filter((f) => f.kind === 'products').length ? '単品' + (P.files.filter((f) => f.kind === 'products').length > 1 ? ' ' + P.files.filter((f) => f.kind === 'products').length + ' つ' : '') : ''}${P.files.some((f) => f.kind === 'products') && P.files.some((f) => f.kind === 'sets') ? '・' : ''}${P.files.some((f) => f.kind === 'sets') ? 'セット' : ''}）` : '' %></span>
+        <span class="hint" id="next-hint"><%= P.files.length > 1 ? `押すと CSV が ${P.files.length} つ (${P.files.filter((f) => f.kind === 'products').length ? '単品' + (P.files.filter((f) => f.kind === 'products').length > 1 ? ' ' + P.files.filter((f) => f.kind === 'products').length + ' つ' : '') : ''}${P.files.some((f) => f.kind === 'products') && P.files.some((f) => f.kind === 'sets') ? '・' : ''}${P.files.some((f) => f.kind === 'sets') ? 'セット' : ''}) できます。下に出るボタンで 1 つずつダウンロードしてください` : '押すと CSV ができて、そのままダウンロードされます' %></span>
       </div>
+      <% if (againCodes.length) { %><div class="hint" id="next-again" style="margin-top:6px">前の CSV で NE に入らなかった商品 (<%= againCodes.join('・') %>) も入っています。今度は NE で取り込んでから「NE に取り込んだ」を押してください。</div><% } %>
       <% if (P.files.some((f) => f.kind === 'sets' && f.trial)) { %><div class="hint" style="margin-top:6px">セットの CSV はまだ試しの段階です (1 回 <%= S.trial_rows %> 行まで)。NE で確かめられたら、下の「NE で取り込む」にボタンが出ます。</div><% } %>
       <% if (canAct && P.files.length) { %>
       <details class="more" id="pick-some"><summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>一部を外して作る</summary>
@@ -114,40 +136,65 @@
       <% if (P.sets_later.length) { %><div class="hint" style="margin-top:6px" id="sets-later">セット <%= P.sets_later.join('・') %> は、<%= P.set_trial_waiting ? 'いま NE で確かめている試しのセットの CSV が終わってから' : '次の回に' %>作ります (セットの CSV はまだ試しの段階で、1 回 <%= S.trial_rows %> 行まで)。</div><% } %>
       <% if (P.sets_too_big.length) { %><div class="why-wrn" style="margin-top:6px" id="sets-too-big"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><span>セット <%= P.sets_too_big.join('・') %> は構成品が多く、1 つの CSV の行の上限 (<%= P.set_trial ? S.trial_rows : S.max_rows %> 行) を超えるので作れません<%= P.set_trial ? ' (セットの試しが確かめられると 1,000 行まで作れます)' : '' %>。</span></div><% } %>
       <div class="msgline" id="build-msg" role="status" aria-live="polite"></div>
-      <div id="build-result"></div>
     </section>
 
-    <% if (toDownload.length || toImport.length || trialDone.length || waitingItems) { %>
+    <% if (toDownload.length || toImport.length || toCheck.length || trialDone.length || waitingItems) { %>
     <section class="panel" id="todo" aria-labelledby="h-todo">
-      <div class="panel-h"><span class="hico" aria-hidden="true">②</span><h2 id="h-todo">NE で取り込む</h2><span class="sub">NE の「商品一括登録」で取り込みます</span></div>
-      <% for (const e of toDownload) { %>
-      <article class="filecard todo-card exp" data-id="<%= e.export_id %>" data-kind="<%= e.kind %>" data-sha="<%= e.sha256 %>" data-state="<%= e.state %>" aria-label="<%= kindLabel[e.kind] %> <%= e.item_count %> 件の CSV">
-        <div class="fh"><span class="ttl"><%= kindLabel[e.kind] %> <%= e.item_count %> 件の CSV</span><span class="b warn">まだダウンロードしていません</span></div>
-        <div class="acts"><button class="btn pri" type="button" data-act="issue"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-dl"/></svg>ダウンロード</button><% if (e.kind !== 'sets') { %><a class="btn sm" href="https://main.next-engine.com/User_Syohin_Csvupload_Item/upload" target="_blank" rel="noopener noreferrer"><svg class="ic s" aria-hidden="true"><use href="#i-up"/></svg>NE の商品一括登録を開く ↗</a><% } %><span class="hint"><%= when(e.created_at) %> に作った</span></div>
+      <div class="panel-h"><span class="hico" aria-hidden="true">②</span><h2 id="h-todo">NE で取り込む</h2><span class="sub">ファイルごとに ダウンロード → NE で取り込む → 「NE に取り込んだ」</span></div>
+      <%# 🆕 10/24: ファイル 1 つ = カード 1 枚。上から順にすること (ダウンロード → NE のどこで何を選ぶか → 「NE に取り込んだ」)。単品とセットの文は混ぜない %>
+      <% const dlSteps = (e, first) => { const kl = kindLabel[e.kind]; return `
+        <ol class="dlsteps" aria-label="${esc(kl)}の CSV ですること">
+          <li data-step="dl">${first}</li>
+          <li data-step="ne"><span>NE の [商品] → [商品管理の一括登録] で「<b>${esc(NE_PICK[e.kind])}</b>」を選んで取り込む</span>
+            <a class="btn sm" href="${esc(neUrl(e))}" target="_blank" rel="noopener noreferrer" data-ne-link><svg class="ic s" aria-hidden="true"><use href="#i-up"/></svg>NE の商品一括登録を開く ↗</a></li>
+          <li data-step="declare">${e.kind === 'sets'
+            ? '<span><b>取り込んだら「NE に取り込んだ」を押す</b> (セットは必ず押します。押すと翌朝 NE で確かめます)</span>'
+            : '<span>取り込んだら「NE に取り込んだ」を押す (押し忘れても、翌朝 NE に出ていれば自動で確かめます)</span>'}
+            <span class="acts"><button class="btn pri" type="button" data-act="declare-quick" data-result="ok"${e.state === 'issued' ? needDl : ' disabled'}><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>NE に取り込んだ</button>
+            <span class="hint" data-need-dl-hint>${e.state === 'issued' ? `ダウンロードした後に押せます (先に「${esc(kl)}の CSV をダウンロード」)` : '先にダウンロードしてください'}</span></span></li>
+        </ol>`; }; %>
+      <% for (const e of toDownload) { const kl = kindLabel[e.kind]; %>
+      <article class="filecard todo-card exp" data-id="<%= e.export_id %>" data-kind="<%= e.kind %>" data-sha="<%= e.sha256 %>" data-state="<%= e.state %>" data-file-name="<%= e.file_name %>" aria-label="<%= kl %> <%= e.item_count %> 件の CSV">
+        <div class="fh"><span class="ttl"><%= kl %> <%= e.item_count %> 件の CSV</span><span class="b <%= e.kind === 'sets' ? 'vio' : 'mute' %>"><%= kl %></span><span class="b warn" data-dl-badge>まだダウンロードしていません</span></div>
+        <div class="fmeta"><span><%= when(e.created_at) %> に作った</span></div>
+        <%- dlSteps(e, `<button class="btn pri lg" type="button" data-act="issue"${dis}><svg class="ic" aria-hidden="true"><use href="#i-dl"/></svg>${esc(kl)}の CSV をダウンロード</button><span class="hint">ダウンロードしてから 2 時間、もう一度ダウンロードできます</span>`) %>
         <div class="msgline" data-msg-card role="status" aria-live="polite"></div>
       </article>
       <% } %>
-      <% for (const e of toImport) { const notImp = e.items.some((i) => i.last_check && i.last_check.detail && i.last_check.detail.not_imported === true); %>
-      <article class="filecard todo-card exp" data-id="<%= e.export_id %>" data-kind="<%= e.kind %>" data-sha="<%= e.sha256 %>" data-state="<%= e.state %>" aria-label="<%= kindLabel[e.kind] %> <%= e.item_count %> 件の CSV">
-        <div class="fh"><span class="ttl"><%= kindLabel[e.kind] %> <%= e.item_count %> 件の CSV</span><span class="b info"><span class="dot" aria-hidden="true"></span>NE で取り込むのを待っています</span></div>
-        <div class="fmeta"><span><%= when(e.issued_at) %> にダウンロード</span><span class="dotsep" aria-hidden="true"></span><span class="mono" style="font-size:12px"><%= e.file_name %></span></div>
-        <% if (notImp) { %><div class="why-wrn" style="margin-top:6px"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><span>日がたっても NE に出てきません。まだなら NE で取り込んでください (取り込まないなら「これまでの記録」から「使わない」に)</span></div><% } %>
-        <div class="acts">
-          <button class="btn pri" type="button" data-act="declare-quick" data-result="ok"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>NE に取り込んだ</button>
-          <button class="btn sm" type="button" data-act="issue"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-dl"/></svg>もう一度ダウンロード</button>
-          <% if (e.kind !== 'sets') { %><a class="btn sm" href="https://main.next-engine.com/User_Syohin_Csvupload_Item/upload" target="_blank" rel="noopener noreferrer"><svg class="ic s" aria-hidden="true"><use href="#i-up"/></svg>NE の商品一括登録を開く ↗</a><% } %>
-          <span class="hint"><%= e.kind === 'sets' ? 'セットは、NE に取り込んだらこのボタンを押してください (押すと翌朝 NE で確かめます)' : '押さなくても、翌朝 NE に出ていれば自動で確かめます' %></span>
-        </div>
+      <% for (const e of toImport) { const notImp = e.items.some((i) => i.last_check && i.last_check.detail && i.last_check.detail.not_imported === true); const kl = kindLabel[e.kind]; const open2 = dlOpen(e); %>
+      <article class="filecard todo-card exp" data-id="<%= e.export_id %>" data-kind="<%= e.kind %>" data-sha="<%= e.sha256 %>" data-state="<%= e.state %>" data-file-name="<%= e.file_name %>" data-dl-until="<%= e.download_until || '' %>" aria-label="<%= kl %> <%= e.item_count %> 件の CSV">
+        <div class="fh"><span class="ttl"><%= kl %> <%= e.item_count %> 件の CSV</span><span class="b <%= e.kind === 'sets' ? 'vio' : 'mute' %>"><%= kl %></span><span class="b warn" data-dl-badge>このパソコンではまだダウンロードしていません</span></div>
+        <div class="fmeta"><span><%= when(e.issued_at) %> に作った</span><span class="dotsep" aria-hidden="true"></span><span class="mono" style="font-size:12px"><%= e.file_name %></span></div>
+        <% if (notImp) { %><div class="why-wrn" style="margin-top:6px"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><span>日がたっても NE に出てきません。まだなら NE で取り込んでください (取り込まないなら「このファイルを使わない」に)</span></div><% } %>
+        <%- dlSteps(e, open2
+          ? `<button class="btn pri lg" type="button" data-act="download"${dis}><svg class="ic" aria-hidden="true"><use href="#i-dl"/></svg>${esc(kl)}の CSV をダウンロード</button><span class="hint">${esc(when(e.download_until))} までダウンロードできます (作ってから 2 時間)</span>`
+          : `<span class="why-wrn" data-dl-expired><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><span>ダウンロードの期限 (${esc(when(e.download_until))}・作ってから 2 時間) を過ぎました。まだ NE に取り込んでいなければ、このファイルを「使わない」にして、もう一度「NE 登録の CSV を作る」を押してください。</span></span>`
+            + `<button class="btn danger sm" type="button" data-act="open-supersede"${dis}>このファイルを使わない</button>`) %>
         <details class="more"><summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>NE で失敗があったとき (「N件失敗」・全部だめ)</summary>
           <div class="body">
             <div class="f"><label class="lab" for="qm-<%= e.export_id %>">NE のメッセージ</label><div class="ctl"><input class="in w-l" id="qm-<%= e.export_id %>" name="quick_message" maxlength="1000" autocomplete="off" placeholder="例: 3件成功しました。1件失敗しました。"></div></div>
             <div class="acts">
-              <button class="btn" type="button" data-act="declare-quick" data-result="partial"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg>一部失敗した (N件失敗)</button>
-              <button class="btn danger sm" type="button" data-act="declare-quick" data-result="rejected_all"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-x"/></svg>全部だめだった</button>
+              <button class="btn" type="button" data-act="declare-quick" data-result="partial"<%- needDl %>><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg>一部失敗した (N件失敗)</button>
+              <button class="btn danger sm" type="button" data-act="declare-quick" data-result="rejected_all"<%- needDl %>><svg class="ic s" aria-hidden="true"><use href="#i-x"/></svg>全部だめだった</button>
             </div>
             <div class="hint">失敗を知らせると、翌朝、入らなかった商品が「次の CSV」に戻ります (直してからもう一度作れます)。</div>
           </div>
         </details>
+        <% if (canAct) { %><div class="acts skip-dl"><button class="btn ghost sm" type="button" data-act="skip-dl">ダウンロードせずに取り込んだ (別のパソコンで落とした など)</button></div><% } %>
+        <div class="msgline" data-msg-card role="status" aria-live="polite"></div>
+      </article>
+      <% } %>
+      <% for (const e of toCheck) { const kl = kindLabel[e.kind]; const open2 = dlOpen(e); %>
+      <article class="filecard todo-card exp" data-id="<%= e.export_id %>" data-kind="<%= e.kind %>" data-sha="<%= e.sha256 %>" data-state="<%= e.state %>" data-file-name="<%= e.file_name %>" data-dl-until="<%= e.download_until || '' %>" aria-label="<%= kl %> <%= e.item_count %> 件の CSV">
+        <div class="fh"><span class="ttl"><%= kl %> <%= e.item_count %> 件の CSV</span><span class="b <%= e.kind === 'sets' ? 'vio' : 'mute' %>"><%= kl %></span><span class="b info"><span class="dot" aria-hidden="true"></span>「NE に取り込んだ」を記録しました</span></div>
+        <div class="hint" style="margin-top:4px"><%= when(e.declared_at) %> に記録。翌朝の照合で NE と同じか確かめます (何もしなくて大丈夫です)。</div>
+        <%# 本番 #22 (10/24): ダウンロードせずに「NE に取り込んだ」を押した = このまま翌朝「取り込めなかった」になる前に、ここで直せるように %>
+        <div class="why-wrn" data-not-dl hidden style="margin-top:8px"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><span>このパソコンでは、このファイルをまだダウンロードしていません。NE に取り込んでいないときは、<%= open2 ? '下の「もう一度ダウンロード」で落として、NE で取り込んでください' : 'このファイルを「使わない」にして、もう一度「NE 登録の CSV を作る」を押してください' %>。このままだと翌朝「取り込めなかった」になり、その商品は次の日の「次の CSV」に戻ります。</span></div>
+        <div class="acts">
+          <% if (open2) { %><button class="btn sm" type="button" data-act="download"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-dl"/></svg>もう一度ダウンロード</button><span class="hint"><%= when(e.download_until) %> まで</span><% } %>
+          <a class="btn sm" href="<%= neUrl(e) %>" target="_blank" rel="noopener noreferrer" data-ne-link><svg class="ic s" aria-hidden="true"><use href="#i-up"/></svg>NE の商品一括登録を開く ↗</a>
+          <button class="btn danger sm" type="button" data-act="open-supersede" data-not-dl hidden<%= dis %>>このファイルを使わない</button>
+        </div>
         <div class="msgline" data-msg-card role="status" aria-live="polite"></div>
       </article>
       <% } %>
@@ -209,7 +256,7 @@
       <div id="files" style="margin-top:14px">
       <% if (!S.exports.length) { %><div class="empty">まだありません。</div><% } %>
       <% for (const e of S.exports) { const open = e.state !== 'closed'; %>
-      <article class="filecard exp<%= open ? '' : ' closed' %>" data-id="<%= e.export_id %>" data-kind="<%= e.kind %>" data-sha="<%= e.sha256 %>" data-state="<%= e.state %>" aria-labelledby="ft-<%= e.export_id %>">
+      <article class="filecard exp<%= open ? '' : ' closed' %>" data-id="<%= e.export_id %>" data-kind="<%= e.kind %>" data-sha="<%= e.sha256 %>" data-state="<%= e.state %>" data-file-name="<%= e.file_name %>" aria-labelledby="ft-<%= e.export_id %>">
         <div class="fh"><span class="ttl" id="ft-<%= e.export_id %>">ファイル #<%= e.export_id %></span><span class="b <%= e.kind === 'sets' ? 'vio' : 'mute' %>"><%= kindLabel[e.kind] %></span><% if (e.trial) { %><span class="b warn">試し用</span><% } %>
           <span class="b <%= open ? STATE_BADGE[e.state] : (CLOSE_BADGE[e.close_reason] || 'mute') %>"><% if (open) { %><span class="dot" aria-hidden="true"></span><% } %><%= EXPORT_STATES[e.state] || e.state %><%= e.close_reason ? ` (${CLOSE_REASONS[e.close_reason] || e.close_reason})` : '' %></span></div>
         <div class="fmeta">
@@ -247,11 +294,11 @@
             <button class="btn pri" type="button" data-act="issue"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-dl"/></svg>配る (ダウンロード)</button>
           <% } else if (e.state === 'issued') { %>
             <span class="hint"><%= e.kind === 'sets' ? 'セットは、NE に取り込んだら必ず申告してください (翌朝の照合で確かめます)' : 'NE に取り込んで全部成功なら、翌朝の照合で自動で確かめます (申告は要りません)。「N件失敗」・全部だめのときは必ず申告' %></span>
-            <button class="btn" type="button" data-act="issue"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-dl"/></svg>もう一度ダウンロード</button>
+            <% if (dlOpen(e)) { %><button class="btn" type="button" data-act="download"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-dl"/></svg>もう一度ダウンロード</button><% } else { %><span class="hint" data-dl-expired>ダウンロードの期限 (<%= when(e.download_until) %>) を過ぎました</span><% } %>
             <button class="btn sm" type="button" data-act="show-declare" aria-expanded="false" aria-controls="dr-d-<%= e.export_id %>"<%= dis %>>取り込んだと申告 (N件失敗・全部だめのときは必ず)</button>
           <% } else { %>
             <span class="hint">翌朝の照合で NE と同じか確かめます (何もしなくて大丈夫です)</span>
-            <button class="btn sm" type="button" data-act="issue"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-dl"/></svg>もう一度ダウンロード</button>
+            <% if (dlOpen(e)) { %><button class="btn sm" type="button" data-act="download"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-dl"/></svg>もう一度ダウンロード</button><% } else { %><span class="hint" data-dl-expired>ダウンロードの期限 (<%= when(e.download_until) %>) を過ぎました</span><% } %>
             <button class="btn sm" type="button" data-act="show-declare" aria-expanded="false" aria-controls="dr-d-<%= e.export_id %>"<%= dis %>>申告をし直す</button>
           <% } %>
           <span class="spacer"></span>
@@ -323,7 +370,7 @@
     <% } %>
   </div>
   <%- include('_footer') %>
-  <% if (S && S.applied) { %><script src="<%= base %>/public/me-regcsv.js?v=<%= assetV %>" defer></script><% } %>
+  <% if (S && S.applied) { %><script src="<%= base %>/public/me-download.js?v=<%= assetV %>" defer></script><script src="<%= base %>/public/me-regcsv.js?v=<%= assetV %>" defer></script><% } %>
   <% if (canAct && S.dine && Object.values(S.dine).some((d) => d.canGo)) { %><script src="<%= base %>/public/me-draft-in-ne.js?v=<%= assetV %>" defer></script><% } %>
 </body>
 </html>

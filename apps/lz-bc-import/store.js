@@ -315,6 +315,11 @@ export function exportImportState(db, exportId) {
   return {
     last: jobs[0] || null,
     imported,
+    // 🆕 2026-10-24 ボタンで取り込めた回 (エラーの無い取り込み・確かめで「取り込んだ」) = 手の道のダウンロードもさせない (同じ CSV を 2 回取り込まない)。
+    //   見るのは「押した最後の回」だけ (押す前に終わった回 = やめた・期限切れ・押していない は飛ばす)。その後のもう一度 (理由つき) が
+    //   エラー・「取り込んでいない」で終わった = 手の道に戻せる (#Codex R2 Medium: 前の成功がずっとダウンロードを塞がない)
+    importedOk: ((j) => (j && (j.state === 'imported' || (j.state === 'unknown' && j.resolved_outcome === 'imported')) ? j : null))(
+      jobs.find((j) => !['cancelled', 'expired', 'not_executed'].includes(j.state) && !ACTIVE.includes(j.state))),
     unresolved: jobs.find((j) => j.state === 'unknown' && !j.resolved_outcome) || null,
     active: jobs.find((j) => ACTIVE.includes(j.state)) || null,
     downloads: db.prepare('SELECT COUNT(*) AS n, MAX(at) AS last_at FROM bc_downloads WHERE export_id = ?').get(String(exportId)),
@@ -626,6 +631,8 @@ export function recordDownload(db, { exportId, by, now }) {
     if (st.unresolved) fail('import_unresolved', `この CSV の取り込み (#${st.unresolved.job_id}) が「取り込めたか分からない」のままです。ロジザードのインポート履歴を確かめて画面で記してからダウンロードしてください`);
     const act = st.active;
     if (act) fail('import_running', `この CSV はボタンでロジザードに取り込む途中です (#${act.job_id})。手で取り込むなら、先に画面で「やめる」(押す前だけ) か終わるのを待ってください`);
+    // 🆕 2026-10-24 (中原さん「ダウンロードを押しても落ちない」): ボタンで取り込めた CSV = 手でもう一度取り込まない (入らなかった商品があるなら取り消して作り直す)
+    if (st.importedOk) fail('imported_by_button', `この CSV はボタンでロジザードに取り込みました (#${st.importedOk.job_id})。手でもう一度取り込まないでください (ダウンロードできません)`);
     db.prepare('INSERT INTO bc_downloads (export_id, by, at) VALUES (?, ?, ?)').run(String(exportId), String(by || ''), now);
   })();
 }
@@ -696,7 +703,7 @@ export function screenStatus(db, { now, exportIds = [] }) {
     const st = exportImportState(db, id);
     byExport[id] = {
       last: jobView(st.last), imported_job: st.imported ? st.imported.job_id : null, unresolved_job: st.unresolved ? st.unresolved.job_id : null,
-      active_job: st.active ? st.active.job_id : null, downloads: st.downloads.n, count: st.count,
+      active_job: st.active ? st.active.job_id : null, imported_ok_job: st.importedOk ? st.importedOk.job_id : null, downloads: st.downloads.n, count: st.count,
     };
   }
   return {
