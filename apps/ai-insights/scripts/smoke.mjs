@@ -185,6 +185,9 @@ console.log('\n■ 事実層 + 充足判定');
   ok(fba?.value_yen === 5000000 && fba?.week_ago_value_yen === 4500000, '在庫金額 今週/先週', fba);
   ok(inp.facts.mf.available === false, 'MF データなし → available:false', inp.facts.mf);
   ok(inp.facts.po.error != null || inp.facts.po.outstanding_qty != null, '発注残は error か値のどちらか', inp.facts.po);
+  // Amazon の健康状態: この週は sales:amazon が禁止 → 節ごと出さない (出力検査で落ちる論点を作らせない)
+  ok(inp.facts.amazon_health?.status === 'no_data' && /sales:amazon/.test(inp.facts.amazon_health.reason),
+    'amazon_health: sales:amazon 禁止の週は節ごと no_data', inp.facts.amazon_health);
   ok(inp.budget.available === false, '予算未入力 → available:false', inp.budget);
   ok(String(inp.budget.note).includes('生成禁止'), '予算未入力 note に生成禁止の契約', inp.budget);
 }
@@ -415,6 +418,12 @@ console.log('\n■ 月次 report-input + 締め宣言');
   const mi = r.body;
   ok(mi.meta.period_start === '2026-06-01' && mi.meta.period_end === '2026-07-01', '月境界 (排他的)', mi.meta);
   ok(mi.closing.status === 'open', '未宣言月は open', mi.closing);
+  // Amazon の健康状態: この月は Amazon の finance が無い (margin:amazon 禁止) → 節ごと no_data。JSON 全体は今までどおり作れる
+  // (mirror に無い表 = 表が無い・カート価格 = mirror から読める は test-amazon-health.mjs の 9 で試す)
+  const ah = mi.facts.amazon_health;
+  ok(mi.constraints.prohibited_topic_areas.some((a) => a.area === 'margin:amazon')
+    && ah?.status === 'no_data' && /margin:amazon/.test(ah.reason) && ah.period.from === '2026-06-01' && ah.no_data_items.length === 9,
+  'amazon_health (月次): margin:amazon 禁止の月は節ごと no_data', { ah, areas: mi.constraints.prohibited_topic_areas });
   ok(mi.facts.pl.this_month.sales_yen === 10000000, 'PL 売上 1,000万', mi.facts.pl.this_month);
   ok(mi.facts.pl.this_month.gross_profit_yen === 4000000 && mi.facts.pl.this_month.operating_income_yen === 3000000,
     '粗利/営業利益の導出', mi.facts.pl.this_month);

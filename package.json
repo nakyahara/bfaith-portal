@@ -36,7 +36,7 @@
     "test:fba-rules-v3": "node scripts/test-fba-rules-v3.mjs",
     "test:fba-smoothing": "node scripts/test-fba-smoothing.mjs",
     "test:fba-trials": "node scripts/test-fba-trials.mjs",
-    "test:ai-insights": "node apps/ai-insights/scripts/smoke.mjs && node apps/ai-insights/scripts/test-margin-cost-status.mjs",
+    "test:ai-insights": "node apps/ai-insights/scripts/smoke.mjs && node apps/ai-insights/scripts/test-margin-cost-status.mjs && node apps/ai-insights/scripts/test-amazon-health.mjs",
     "test:fba-daily-cap": "node scripts/test-fba-daily-cap.mjs",
     "test:fba-inbound-snapshot": "node scripts/test-fba-inbound-snapshot.mjs",
     "test:fba-planning-history": "node scripts/test-fba-planning-history.mjs",

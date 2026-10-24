@@ -11,6 +11,7 @@
 import crypto from 'node:crypto';
 import { jstDateStr } from '../../lib/jst-date.js';
 import { addDaysYmd, coveredDaysForEntity, INPUT_SCHEMA_VERSION } from './facts.js';
+import { buildAmazonHealthFacts, amazonHealthSuppressReason } from './facts-amazon.js';
 
 const SALES_ENTITY = 'f_sales_by_listing';
 const MALLS = ['amazon', 'rakuten', 'yahoo', 'aupay', 'linegift', 'qoo10'];
@@ -441,6 +442,16 @@ export function buildMonthlyReportInput(db, opts = {}) {
     anomaly_signals: buildAnomalyFacts(db),
     mall_sales: buildMallSalesMonth(db, ym, prevYm, lyYm),
     stock,
+    // Amazon の健康状態 (週次と同じ項目を月の値で。前月と比べ・中央値は前の 3 か月)。項目ごとに ok / no_data (facts-amazon.js)
+    amazon_health: buildAmazonHealthFacts(db, {
+      periodStart, periodEnd, granularity: 'month',
+      prevStart: monthBounds(prevYm).periodStart,
+      baseline: [1, 2, 3].map((k) => {
+        const b = monthBounds(addMonths(ym, -k));
+        return [b.periodStart, b.periodEnd];
+      }),
+      suppressReason: amazonHealthSuppressReason(constraints),
+    }),
     cash_flow_month: (() => {
       const flows = db.prepare(`
         SELECT CASE WHEN movement_date >= ? THEN 'this_month' ELSE 'prev_month' END AS bucket,
