@@ -12,9 +12,10 @@
  * 数え方 (FNSKU ごと。MSKU は見せるだけ):
  *   紛失 = 台帳の Event Type = Adjustments・Reason が LOST_REASONS (M)・数量が負 / 破損 = 同じく DAMAGED_REASONS (E)・数量が負
  *   それを古い順に、次の分で消していく (先入れ先出し。🚨 その日より後に起きた分でしか消さない = 取り始める前の紛失への補てんを今の紛失に当てる誤りは「出さない」側に倒れる):
- *     ① 同じ理由の数量が正の行 (破損の取り消しなど) ② 見つかった (FOUND_REASONS = F・数量が正) = 紛失だけを消す。消す紛失が無ければ「余り」として持つ
+ *     ① 同じ理由の数量が正の行 (破損の取り消しなど) ② 見つかった (FOUND_REASONS = F・数量が正) = 紛失だけを消す。消す相手が無ければ「余り」(日付・種類つき) として持つ
  *     ③ 補てん (Lost_Warehouse / Damaged_Warehouse・現金と在庫の両方 = quantity-reimbursed-total)。同じ種類を先に、無ければ別の種類も
- *     ④ 補てんの取り消し (数量が負) = 先に「見つかった余り」を消す (見つかった → Amazon が補てんを取り消した = 差し引きゼロ)、残りは取り消された補てん (original-reimbursement-id) が消した分を戻す (分からなければ同じ種類の補てん → どれでも、新しい順)
+ *     ④ 補てんの取り消し (数量が負・同じ日の補てんより後) = 取り消された補てん (original-reimbursement-id) が消した塊を戻す (ID が無ければ同じ種類の補てん → どれでも、新しい順)。
+ *        戻す塊は、同じ種類でその発生日より後の「余り」で先に打ち消す (見つかった → Amazon が補てんを取り消した = 差し引きゼロ)
  *   残った分の発生日から: 待つ日数 (紛失 WAIT_DAYS_LOST・破損 WAIT_DAYS_DAMAGED = Amazon の自動の補てん・見つかるのを待つ) より前 = 「待っている」(載せない)
  *                      申請の期限 (発生から CLAIM_DEADLINE_DAYS 日) を過ぎた = 「期限切れの可能性」(件数だけ) / そのあいだ = 候補
  *   見込みの金額 = 個数 × 単価 (① その FNSKU (無ければ SKU) の最後の補てんの単価 amount-per-unit ② 在庫計画の売価 your_price ③ 分からなければ数量だけ)
@@ -137,11 +138,13 @@ export function reimbUnits(row) {
  * @returns {{ open: { date, kind, qty }[], foundSurplus: number }}
  */
 export function matchEvents(events) {
-  const ORDER = { loss: 0, restore: 1, found: 2, reimb: 3 };
-  const evs = [...events].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : ORDER[a.type] - ORDER[b.type]));
+  // 同じ日は 紛失 → 取り消しの戻し → 見つかった → 補てん → 補てんの取り消し の順 (同じ日の補てんとその取り消しを入力の順に頼らない。Codex R2 P2)
+  const ORDER = { loss: 0, restore: 1, found: 2, reimb: 3, reversal: 4 };
+  const typeOf = (e) => (e.type === 'reimb' && Number(e.qty) < 0 ? 'reversal' : e.type);
+  const evs = [...events].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : ORDER[typeOf(a)] - ORDER[typeOf(b)]));
   const open = [];             // 残っている塊 (古い順)
-  const reimbursed = [];       // 補てんで消した塊 (取り消しで戻す。新しい順に戻す)
-  let foundSurplus = 0;
+  const reimbursed = [];       // 補てんで消した塊 { date, kind, qty, id } (取り消しで戻す)
+  const surplus = [];          // 消す相手が無かった「見つかった」「戻し」{ date, kind, qty } (補てんの後に来た分 = 後の取り消しで戻す塊を打ち消す)
   const consume = (n, pred) => {
     const taken = [];
     for (const p of open) {
@@ -155,15 +158,28 @@ export function matchEvents(events) {
     return { taken, rest: n };
   };
   const reopen = (piece) => {
+    // 🚨 余りで打ち消せるのは、同じ種類で、その塊の発生日より後 (同じ日を含む) の余りだけ (前の見つかった分で後の紛失を消さない。Codex R2 P2)
+    let q = piece.qty;
+    for (const s of surplus) {
+      if (q <= 0) break;
+      if (s.qty <= 0 || s.kind !== piece.kind || s.date < piece.date) continue;
+      const k = Math.min(s.qty, q); s.qty -= k; q -= k;
+    }
+    if (q <= 0) return;
     const i = open.findIndex((p) => p.date > piece.date);
-    if (i < 0) open.push({ ...piece }); else open.splice(i, 0, { ...piece });
+    if (i < 0) open.push({ date: piece.date, kind: piece.kind, qty: q }); else open.splice(i, 0, { date: piece.date, kind: piece.kind, qty: q });
   };
   for (const e of evs) {
     const qty = Number(e.qty) || 0;
     if (qty === 0) continue;
     if (e.type === 'loss') { if (qty > 0) open.push({ date: e.date, kind: e.kind, qty }); continue; }
-    if (e.type === 'restore') { if (qty > 0) consume(qty, (p) => p.kind === e.kind); continue; }
-    if (e.type === 'found') { if (qty > 0) foundSurplus += consume(qty, (p) => p.kind === 'lost').rest; continue; }
+    if (e.type === 'restore' || e.type === 'found') {
+      if (qty <= 0) continue;
+      const kind = e.type === 'found' ? 'lost' : e.kind;   // 見つかった = 紛失だけを消す
+      const { rest } = consume(qty, (p) => p.kind === kind);
+      if (rest > 0) surplus.push({ date: e.date, kind, qty: rest });
+      continue;
+    }
     if (e.type === 'reimb') {
       if (qty > 0) {
         const a = consume(qty, (p) => e.kind === 'any' || p.kind === e.kind);
@@ -171,13 +187,9 @@ export function matchEvents(events) {
         for (const p of [...a.taken, ...b.taken]) reimbursed.push({ ...p, id: e.id ?? null });
       } else {
         let n = -qty;
-        const s = Math.min(foundSurplus, n); foundSurplus -= s; n -= s;
-        // 戻す塊: ① 取り消された補てん (original-reimbursement-id) が消した塊 ② 同じ種類の補てんが消した塊 ③ どれでも。それぞれ新しい順 (Codex R1 P2)
-        const pickers = [
-          ...(e.origId ? [(p) => p.id === e.origId] : []),
-          ...(e.kind && e.kind !== 'any' ? [(p) => p.kind === e.kind] : []),
-          () => true,
-        ];
+        // 戻す塊: 取り消された補てんの ID が分かれば、その補てんが消した塊だけ (無ければ戻さない = 台帳の外の紛失への補てん。Codex R2 P2)。
+        //         分からなければ 同じ種類の補てんが消した塊 → どれでも。それぞれ新しい順
+        const pickers = e.origId ? [(p) => p.id === e.origId] : [...(e.kind && e.kind !== 'any' ? [(p) => p.kind === e.kind] : []), () => true];
         for (const pick of pickers) {
           for (let i = reimbursed.length - 1; i >= 0 && n > 0; i--) {
             const p = reimbursed[i];
@@ -191,7 +203,7 @@ export function matchEvents(events) {
       }
     }
   }
-  return { open, foundSurplus };
+  return { open, foundSurplus: surplus.filter((x) => x.kind === 'lost').reduce((a, x) => a + x.qty, 0) };
 }
 
 /**
@@ -239,7 +251,7 @@ export function evaluateReimbGap(db, { today = jstToday(), rules = RULES } = {})
     skuToFnsku.set(k, skuToFnsku.has(k) && skuToFnsku.get(k) !== r.fnsku ? null : r.fnsku);
   }
   const reimbRows = db.prepare(`SELECT approval_date_jst, reimbursement_id, original_reimbursement_id, seller_sku, fnsku, reason, quantity_reimbursed_cash, quantity_reimbursed_inventory, quantity_reimbursed_total, original_reimbursement_type
-    FROM amazon_fba_reimbursements WHERE approval_date_jst >= ? AND approval_date_jst <= ? ORDER BY approval_date_jst`).all(windowFrom, today);
+    FROM amazon_fba_reimbursements WHERE approval_date_jst >= ? AND approval_date_jst <= ? ORDER BY approval_date_jst, approval_date, reimbursement_id`).all(windowFrom, today);
   for (const r of reimbRows) {
     const kind = reimbKind(r, rules);
     if (!kind) continue;

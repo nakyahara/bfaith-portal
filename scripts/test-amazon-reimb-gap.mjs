@@ -130,6 +130,34 @@ await t('🚨 補てんの取り消しは、取り消された補てん (origina
   ]);
   assert.deepEqual(m.open, [{ date: '2026-09-01', kind: 'lost', qty: 1 }]);
 });
+await t('🚨 取り消しの細かい場合 (Codex R2 P2): ID が分かれば別の補てんの塊は戻さない・前の見つかった分で後の紛失の取り消しを消さない・同じ日は補てん → 取り消し・補てんの後の戻しは取り消しを打ち消す', () => {
+  // ① 台帳の外の紛失への補てん A の取り消し = 戻す塊が無い (B の塊は戻さない)
+  let m = matchEvents([
+    { date: '2026-09-01', type: 'reimb', kind: 'lost', qty: 1, id: 'A' },
+    { date: '2026-09-05', type: 'loss', kind: 'lost', qty: 1 }, { date: '2026-09-10', type: 'reimb', kind: 'lost', qty: 1, id: 'B' },
+    { date: '2026-09-20', type: 'reimb', kind: 'lost', qty: -1, origId: 'A' },
+  ]);
+  assert.deepEqual(m.open, []);
+  // ② 前の見つかった分 (F +1) は、後の破損の補てんの取り消しを打ち消さない
+  m = matchEvents([
+    { date: '2026-09-01', type: 'found', qty: 1 },
+    { date: '2026-09-05', type: 'loss', kind: 'damaged', qty: 1 }, { date: '2026-09-10', type: 'reimb', kind: 'damaged', qty: 1, id: 'C' },
+    { date: '2026-09-20', type: 'reimb', kind: 'damaged', qty: -1, origId: 'C' },
+  ]);
+  assert.deepEqual(m.open, [{ date: '2026-09-05', kind: 'damaged', qty: 1 }]);
+  // ③ 同じ日の補てんとその取り消し (取り消しが先に並んでいても) = 紛失が残る
+  m = matchEvents([
+    { date: '2026-09-05', type: 'loss', kind: 'lost', qty: 1 },
+    { date: '2026-09-10', type: 'reimb', kind: 'lost', qty: -1, origId: 'D' }, { date: '2026-09-10', type: 'reimb', kind: 'lost', qty: 1, id: 'D' },
+  ]);
+  assert.deepEqual(m.open, [{ date: '2026-09-05', kind: 'lost', qty: 1 }]);
+  // ④ 破損 → 補てん → 破損の戻し (E +1) → 取り消し = 差し引きゼロ
+  m = matchEvents([
+    { date: '2026-09-05', type: 'loss', kind: 'damaged', qty: 1 }, { date: '2026-09-10', type: 'reimb', kind: 'damaged', qty: 1, id: 'E1' },
+    { date: '2026-09-12', type: 'restore', kind: 'damaged', qty: 1 }, { date: '2026-09-20', type: 'reimb', kind: 'damaged', qty: -1, origId: 'E1' },
+  ]);
+  assert.deepEqual(m.open, []);
+});
 await t('🚨 紛失より前の補てん・見つかった (取り始める前の紛失の分) は、後の紛失に当てない = 候補に出る', () => {
   const db = openDb();
   reimb(db, { date: ago(60), qty: 1 });
