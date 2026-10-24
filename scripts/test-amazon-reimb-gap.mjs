@@ -130,6 +130,22 @@ await t('🚨 補てんの取り消しは、取り消された補てん (origina
   ]);
   assert.deepEqual(m.open, [{ date: '2026-09-01', kind: 'lost', qty: 1 }]);
 });
+await t('🚨 ID の無い取り消しは、消す相手が無かった補てんの余りも減らす = 取り消された補てんで紛失を消したままにしない (Codex round2 P2)', () => {
+  // 紛失 1 → 補てん 2 (1 は余り) → ID の無い取り消し 2 = 補てんは全部取り消された = 紛失 1 が残る
+  const m = matchEvents([
+    { date: '2026-09-01', type: 'loss', kind: 'lost', qty: 1 },
+    { date: '2026-09-05', type: 'reimb', kind: 'lost', qty: 2 },
+    { date: '2026-09-20', type: 'reimb', kind: 'lost', qty: -2 },
+  ]);
+  assert.deepEqual(m.open, [{ date: '2026-09-01', kind: 'lost', qty: 1 }]);
+  // 取り消しが余りの分だけ (1) なら、紛失は補てん済みのまま
+  const m2 = matchEvents([
+    { date: '2026-09-01', type: 'loss', kind: 'lost', qty: 1 },
+    { date: '2026-09-05', type: 'reimb', kind: 'lost', qty: 2 },
+    { date: '2026-09-20', type: 'reimb', kind: 'lost', qty: -1 },
+  ]);
+  assert.deepEqual(m2.open, []);
+});
 await t('🚨 取り消しの細かい場合 (Codex R2 P2): ID が分かれば別の補てんの塊は戻さない・前の見つかった分で後の紛失の取り消しを消さない・同じ日は補てん → 取り消し・補てんの後の戻しは取り消しを打ち消す', () => {
   // ① 台帳の外の紛失への補てん A の取り消し = 戻す塊が無い (B の塊は戻さない)
   let m = matchEvents([

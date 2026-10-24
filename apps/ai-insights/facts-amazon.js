@@ -368,7 +368,7 @@ function listingProblems(db, ctx) {
   const runT = resolveTable(db, TABLES.listingRuns);
   if (runT) snapshot = db.prepare(`SELECT status FROM ${runT} WHERE date_jst = ?`).get(asOf)?.status || null;
   const rows = db.prepare(`SELECT sku_key, seller_sku, asin, item_name, status, is_buyable, suppressed, search_suppressed, error_count
-    FROM ${chk.table} WHERE date_jst = ? AND (is_buyable = 0 OR suppressed = 1 OR error_count > 0)`).all(asOf);
+    FROM ${chk.table} WHERE date_jst = ? AND (is_buyable = 0 OR suppressed = 1 OR search_suppressed = 1 OR error_count > 0)`).all(asOf);   // 検索に出ない (買えるが見つからない) も問題 (Codex round2 P2)
   const total = db.prepare(`SELECT COUNT(*) AS n FROM ${chk.table} WHERE date_jst = ?`).get(asOf)?.n || 0;
   const sales = salesBySku(db, addDays(ctx.refDay, -(SALES_LOOKBACK_DAYS - 1)), addDays(ctx.refDay, 1), ctx.memo);
   const issueT = resolveTable(db, TABLES.listingIssue);
@@ -381,7 +381,7 @@ function listingProblems(db, ctx) {
     const v = salesValue(sales, String(r.sku_key).toLowerCase());
     return {
       sku: r.seller_sku, asin: r.asin, product_name: cutName(r.item_name),
-      listing_status: r.status, is_buyable: r.is_buyable === 1, suppressed: r.suppressed === 1, error_count: r.error_count,
+      listing_status: r.status, is_buyable: r.is_buyable === 1, suppressed: r.suppressed === 1, search_suppressed: r.search_suppressed === 1, error_count: r.error_count,
       top_error: topIssue.get(r.sku_key) || null,
       sales_28d_yen: yen(v),   // null = 売上が分からない (出どころが無い・その SKU の売上の列が NULL)
     };

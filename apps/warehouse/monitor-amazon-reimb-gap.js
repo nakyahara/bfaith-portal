@@ -203,6 +203,13 @@ export function matchEvents(events) {
         // 戻す塊: 取り消された補てんの ID が分かれば、その補てんが消した塊だけ (無ければ戻さない = 台帳の外の紛失への補てん。Codex R2 P2)。
         //         分からなければ 同じ種類の補てん (補てんの種類で選ぶ。Codex R3 P2) が消した塊 → どれでも。それぞれ新しい順
         //         ID の分かる補てんが塊を消していなければ (消す相手が無かった補てん) その余りを減らすだけ
+        if (!e.origId) {
+          // ID の無い取り消しも、先に消す相手が無かった補てんの余りを減らす (同じ種類 → どれでも・新しい順)。
+          // 減らさないと、戻した塊を reopen() がその余りで覆い直し、取り消された補てんで紛失が消えたままになる (Codex round2 P2)
+          for (const pick of [...(e.kind && e.kind !== 'any' ? [(u) => u.rkind === e.kind] : []), () => true]) {
+            for (let i = unpaired.length - 1; i >= 0 && n > 0; i--) { const u = unpaired[i]; if (u.qty <= 0 || !pick(u)) continue; const k = Math.min(u.qty, n); u.qty -= k; n -= k; }
+          }
+        }
         if (e.origId) {
           for (const u of unpaired) { if (n <= 0) break; if (u.id !== e.origId || u.qty <= 0) continue; const k = Math.min(u.qty, n); u.qty -= k; n -= k; }
         }

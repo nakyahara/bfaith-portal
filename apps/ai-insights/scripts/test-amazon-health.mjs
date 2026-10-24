@@ -259,6 +259,11 @@ let normal;
     '出品: 問題 2 SKU (うち売れ筋 1)・買えない 1', lp);
   ok(lp.items.length === 1 && lp.items[0].sku === 'SKU-A' && lp.items[0].sales_28d_yen === 714000 && lp.items[0].top_error?.code === '90220' && lp.items[0].suppressed === true,
     '売れ筋の SKU-A (28 日 71.4 万・ERROR 90220・停止)', lp.items[0]);
+  // 買えるが検索に出ない (search_suppressed) も問題に数える (Codex round2 P2)
+  db.prepare("UPDATE amazon_listing_status_daily SET search_suppressed = 1 WHERE sku_key = 'sku-c' AND date_jst = ?").run(REF);
+  const lp2 = buildAmazonHealthFacts(db, weekly()).listing_problems;
+  ok(lp2.problem_skus_total === 3, '出品: 検索に出ない SKU-C も問題に数える (2 → 3)', lp2);
+  db.prepare("UPDATE amazon_listing_status_daily SET search_suppressed = 0 WHERE sku_key = 'sku-c' AND date_jst = ?").run(REF);
 
   const bb = o.buybox_lost;
   ok(bb.as_of === REF && bb.lost_now_skus === 1 && bb.items[0].sku === 'SKU-B' && bb.items[0].lost_days === 3 && bb.items[0].seen_days === 7
