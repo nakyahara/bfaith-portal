@@ -1011,12 +1011,16 @@ await ta('[R-0061] 下書きの保存で要る欄 (2026-10-08 中原さん): 単
       { ownership: ALL_COMPANY, open: true, now: NOW, shippingRates: RATES })), 400, 'invalid_input');
     assert.equal(e.extra.field, field, label);
   }
-  // セット: 推奨保有月数が無い = 400 / 売上分類 (上書き) は要らない (構成品から導ける)
-  const eSet = await rejectsWith(asEditor(() => R.registerNewSku(db, { actor: 'naka@test', requestId: uuid(), kind: 'set', code: 'r61-set-x',
+  // 🆕 2026-10-26 中原さん: セットは推奨保有月数を聞かない (構成品で発注する) = 送らない / 空 = 0 (持たない) で登録する (DB の関数は数を求めるまま)。
+  //   売上分類 (上書き)・セット自身の取扱も要らない (構成品から導ける・送らない = 取扱中)
+  const rSet0 = await asEditor(() => R.registerNewSku(db, { actor: 'naka@test', requestId: uuid(), kind: 'set', code: 'r61-set-x',
     values: { name: 'x', standard_price: '1000', shipping_code: 'S01', components: [{ code: 's001', qty: 1 }] }, card: { create: false } },
-  { ownership: ALL_COMPANY, open: true, now: NOW, shippingRates: RATES })), 400, 'invalid_input');
-  assert.equal(eSet.extra.field, 'reorder_months');
-  assert.equal(await skuId('r61-x'), undefined); assert.equal(await skuId('r61-set-x'), undefined);
+  { ownership: ALL_COMPANY, open: true, now: NOW, shippingRates: RATES }));
+  assert.equal(rSet0.ok, true);
+  assert.deepEqual(await one('select reorder_months::float8 as m, set_sales_class_override as o, handling_own as h from core.skus where sku_id = $1', [rSet0.sku_id]), { m: 0, o: null, h: 'active' });
+  const rSetBlank = await reg('set', 'r61-set-blank', { name: '推奨保有月数が空のセット', standard_price: '1000', shipping_code: 'S01', reorder_months: ' ', components: [{ code: 's001', qty: 1 }] }, { create: false });
+  assert.equal((await one('select reorder_months::float8 as m from core.skus where sku_id = $1', [rSetBlank.sku_id])).m, 0);
+  assert.equal(await skuId('r61-x'), undefined);
   // 通る: 有効期限の管理 = あり / 入荷日の管理なし (null = 不明)・推奨保有月数 0 (持たない)・売上分類 4
   const r1 = await reg('single', 'r61-ok-1', { ...base, name: '必須の試験 1', sales_class: '4', expiry_managed: '1', reorder_months: '0' }, { create: false });
   assert.deepEqual(await one(`select p.sales_class, p.expiry_managed, p.inbound_date_managed, s.reorder_months::float8 as m from core.skus s join core.products p on p.product_id = s.product_id where s.sku_id = $1`, [r1.sku_id]),
@@ -1696,7 +1700,10 @@ await ta('[H1] 新商品の画面 (単品・セット): 描画・画面の JS・
   assert.match(r.text, /id="cost-jpy"/); assert.match(r.text, /<span class="hint">今日から · 入力なしにしても、NE 登録の CSV の前に要ります<\/span>/); assert.match(r.text, /id="reason"/);
   assert.ok(!r.text.includes('id="cost-reason"') && !r.text.includes('原価の理由'), '単品の画面に原価の理由の欄がある');
   assert.ok(!/cost-reason/.test(newJs), '画面の JS が原価の理由を読んでいる');
-  assert.match(newJs, /values\.cost = \{ jpy: val\('cost-jpy'\) \}/); assert.match(newJs, /values\.exception_cost = \{ jpy: val\('xcost-jpy'\) \}/);
+  assert.match(newJs, /values\.cost = \{ jpy: val\('cost-jpy'\) \}/);
+  // 🆕 2026-10-26 中原さん: セットは推奨保有月数・セット自身の取扱・売上分類の上書き・例外原価を送らない
+  assert.ok(!/values\.exception_cost|xcost-jpy|set_sales_class_override|handling_own/.test(newJs), '画面の JS がセットの例外の欄を送っている');
+  assert.match(newJs, /var keys = isSet \? \['name', 'standard_price', 'shipping_code'\]/);
   // 🆕 0061 (2026-10-08 中原さん「下書き保存時にわかる内容だから必須にする」): 売上分類 (「あとで」は無い)・推奨保有月数・ロジザードの有効期限の管理 (初めは選んでいない) = 必須で ①。入荷日の管理は今までどおり
   const segOf = (id) => (new RegExp('<div class="seg" role="group" id="' + id + '"[^>]*>([\\s\\S]*?)</div>').exec(r.text) || [])[0] || '';
   assert.match(r.text, /id="lab-f-sales_class">売上分類<span class="req">必須<\/span>/);
@@ -1714,11 +1721,12 @@ await ta('[H1] 新商品の画面 (単品・セット): 描画・画面の JS・
   assert.match(newJs, /if \(!isSet\) list\.push\(\{ id: 'expiry_managed'/);
   r = await call('GET', '/apps/master-edit/new?kind=set');
   await checkScripts(r.text, 0);
-  assert.match(r.text, /id="xcost-jpy"/);
-  assert.ok(!r.text.includes('id="xcost-reason"') && !r.text.includes('例外原価の理由'), 'セットの画面に例外原価の理由の欄がある');
+  // 🆕 2026-10-26 中原さん: セットの画面に セット自身の取扱・売上分類の上書き・例外原価・推奨保有月数 の行を出さない (構成品から・構成品で発注する)
+  for (const row of ['handling_own', 'set_sales_class_override', 'exception_cost', 'reorder_months']) assert.ok(!r.text.includes(`data-row="${row}"`), 'セットの画面に ' + row + ' の行がある');
+  assert.ok(!/id="xcost-jpy"|id="f-set_sales_class_override"|id="handling-own"|id="f-reorder_months"|例外のとき|推奨保有月数/.test(r.text), 'セットの画面に例外の欄・推奨保有月数が残っている');
+  assert.match(r.text, /id="set-derived-note">取扱・売上分類・原価は構成品から決まります/);
   assert.match(r.text, /id="comp-rows"/); assert.ok(!r.text.includes('セット商品を作るか'), 'セットに「セット商品を作るか」を出さない');
   assert.ok(!r.text.includes('有効期限の管理'), 'セットにロジザードの欄を出さない');
-  assert.match(r.text, /for="f-reorder_months">推奨保有月数<span class="req">必須<\/span>/, 'セットも推奨保有月数は必須 (0061)');
   assert.ok(!r.text.includes('id="f-sales_class"'), 'セットに売上分類の切り替えは無い (構成品から・例外のときだけ上書き)');
   delete process.env.MASTER_EDIT_OPEN;
   r = await call('GET', '/apps/master-edit/new?kind=single');
@@ -2708,8 +2716,8 @@ const regEvents = async (code) => q(`select e.reason from ops.master_registratio
 await ta('[BL1] 入力なしの決まり (lib): 種類ごとの項目と並び・カードを作らない = カードの欄は数えない・発注の設定は欄が出るときだけ・値と入力なしの両方 / どちらでもない / 知らない名前 = 400・古い画面の印なし・理由に残す・長すぎる理由', async () => {
   const single = blankBody('bl-lib');
   // 🆕 0084: メーカー (原価の次 = 画面の上からの順)。missingBlankKeys は渡さない = 数える (サーバーの checkRegisterBlanks は makerApplicable のときだけ)
-  assert.deepEqual(BLK.missingBlankKeys('single', single), ['cost', 'maker', 'shipping_code', 'inbound_date_managed', 'card.official_url', 'card.amazon', 'card.reference_urls', 'card.set_decision',
-    'card.yahoo.price', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path']);
+  // 🆕 2026-10-26 中原さん: Yahoo! の欄は任意 (数えない)
+  assert.deepEqual(BLK.missingBlankKeys('single', single), ['cost', 'maker', 'shipping_code', 'inbound_date_managed', 'card.official_url', 'card.amazon', 'card.reference_urls', 'card.set_decision']);
   // 🆕 2026-10-24 中原さん「この項目は任意にして商品登録の必須要件にしないで」: ケース・容量 (ケースロット・ケースグループ・容量/個) は数えない
   assert.deepEqual(BLK.missingBlankKeys('single', single, { orderApplicable: true }).slice(2, 6), ['order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'shipping_code']);
   for (const k of ['order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit']) {
@@ -2718,8 +2726,15 @@ await ta('[BL1] 入力なしの決まり (lib): 種類ごとの項目と並び�
   }
   assert.deepEqual(BLK.missingBlankKeys('single', { ...single, card: { create: false } }), ['cost', 'maker', 'shipping_code', 'inbound_date_managed'], 'カードを作らない = カードの欄は数えない');
   assert.deepEqual(BLK.missingBlankKeys('single', { ...single, card: { create: false } }, { makerApplicable: false }), ['cost', 'shipping_code', 'inbound_date_managed'], '0084 の欄が無い = メーカーは数えない');
-  assert.deepEqual(BLK.missingBlankKeys('set', { kind: 'set', values: {}, card: {} }, { orderApplicable: true }), ['exception_cost', 'shipping_code', 'card.official_url', 'card.amazon', 'card.reference_urls',
-    'card.yahoo.price', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path'], 'セットに発注の設定は無い');
+  // 🆕 2026-10-26 中原さん: セットの例外原価・Yahoo! の欄は数えない
+  assert.deepEqual(BLK.missingBlankKeys('set', { kind: 'set', values: {}, card: {} }, { orderApplicable: true }), ['shipping_code', 'card.official_url', 'card.amazon', 'card.reference_urls'], 'セットに発注の設定は無い');
+  const YK = ['card.yahoo.price', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path'];
+  for (const kind of ['single', 'set', 'variation']) {
+    for (const k of [...YK, 'exception_cost']) {
+      assert.ok(!BLK.BLANK_KEYS[kind].includes(k), kind + ' の ' + k + ' は「値か入力なし」に数えない');
+      assert.ok(!Object.prototype.hasOwnProperty.call(BLK.blankLabelsOf(kind), k), kind + ' の ' + k + ' の名前を画面に渡さない');
+    }
+  }
   // 値があれば数えない (原価 = jpy・Amazon = URL か ASIN・参考 URL = 1 つ以上・発注条件 = 選んだか新しく作る)
   const filled = { ...single, values: { ...single.values, cost: { jpy: '300' }, shipping_code: 'S01', inbound_date_managed: '1', maker: '1' },
     card: { create: true, asin: 'B0TEST0001', official_url: 'https://x.example', reference_urls: ['', 'https://r.example'], set_decision: { decision: 'hold' }, yahoo: { price: '1', price_sagawa: '2', delivery_label: 'x', category_id: '3', path: 'p' } },
@@ -2740,7 +2755,25 @@ await ta('[BL1] 入力なしの決まり (lib): 種類ごとの項目と並び�
   assert.deepEqual(BLK.checkRegisterBlanks('variation', { children: [{ code: 'a-1', jan: '4901234567894' }], values: { cost: { jpy: '1' } }, card: { official_url: 'u', amazon_url: 'a', reference_urls: ['r'] },
     blanks: ['shipping_code', 'inbound_date_managed', ...oldCase] }, { only: 'main' }), ['shipping_code', 'inbound_date_managed']);
   assert.equal(BLK.blankReasonOf('single', null, ['cost', ...oldCase]), '新商品の登録 · 入力なし: 原価');
+  // 🆕 2026-10-26: 前の版の画面が Yahoo! (単品・セット)・例外原価 (セット) に付けた「入力なし」の印 = 断らない。値が無い欄の印は前と同じ並びで理由に残す
+  //   (前の版の画面で保存した要求の送り直し = 同じ理由・同じハッシュ)。値と印の両方 = 印を使わない・カードを作らない = カードの欄の印は使わない
+  assert.deepEqual(BLK.checkRegisterBlanks('single', { ...single, blanks: [...YK, ...all] }, { makerApplicable: true, only: 'main' }), [...all, ...YK]);
+  assert.equal(BLK.blankReasonOf('single', null, BLK.checkRegisterBlanks('single', { ...single, card: {}, blanks: ['cost', 'card.yahoo.path', 'maker', 'shipping_code', 'inbound_date_managed', 'card.official_url', 'card.amazon', 'card.reference_urls', 'card.set_decision', 'card.yahoo.price'] }, { makerApplicable: true, only: 'main' })),
+    '新商品の登録 · 入力なし: 原価・メーカー・発送方法・入荷日の管理・公式ページURL・Amazon・参考URL・セット商品・Yahoo!売価・Yahoo!path');
+  assert.deepEqual(BLK.checkRegisterBlanks('single', { ...single, card: { yahoo: { price: '980' } }, blanks: [...all, ...YK] }, { makerApplicable: true, only: 'main' }), [...all, ...YK.slice(1)], 'Yahoo!売価に値と印の両方 = 印を使わない (断らない)');
+  assert.deepEqual(BLK.checkRegisterBlanks('single', { ...single, card: { create: false }, blanks: ['cost', 'maker', 'shipping_code', 'inbound_date_managed', ...YK] }, { makerApplicable: true, only: 'main' }), ['cost', 'maker', 'shipping_code', 'inbound_date_managed']);
+  const OK3 = ['order_settings.order_lot', 'order_settings.condition', 'order_settings.material'];
+  assert.deepEqual(BLK.checkRegisterBlanks('single', { ...single, blanks: [...all, ...YK, ...OK3] }, { makerApplicable: true, orderApplicable: true, only: 'order' }), OK3, '発注の設定だけを数えるときは前の版の印を足さない');
+  const setOld = { kind: 'set', values: {}, card: {}, blanks: ['exception_cost', 'shipping_code', 'card.official_url', 'card.amazon', 'card.reference_urls', ...YK] };
+  assert.deepEqual(BLK.checkRegisterBlanks('set', setOld, { only: 'main' }), setOld.blanks, 'セットの前の版の画面の印 = 前と同じ並び');
+  assert.equal(BLK.blankReasonOf('set', null, BLK.checkRegisterBlanks('set', setOld, { only: 'main' })),
+    '新商品の登録 · 入力なし: 例外原価・発送方法・公式ページURL・Amazon・参考URL・Yahoo!売価・Yahoo!売価(佐川)・Yahoo!配送方法・Yahoo!カテゴリID・Yahoo!path');
+  assert.deepEqual(BLK.checkRegisterBlanks('set', { ...setOld, values: { exception_cost: { jpy: '500' } } }, { only: 'main' }), setOld.blanks.slice(1), '例外原価に値と印の両方 = 印を使わない');
+  assert.deepEqual(BLK.checkRegisterBlanks('set', { kind: 'set', values: {}, card: {}, blanks: ['shipping_code', 'card.official_url', 'card.amazon', 'card.reference_urls'] }, { only: 'main' }),
+    ['shipping_code', 'card.official_url', 'card.amazon', 'card.reference_urls'], '今の画面のセット = 例外原価・Yahoo! の印なしで受ける');
   const err = (fn) => { try { fn(); } catch (e) { return e; } assert.fail('断らなかった'); };
+  // まとまりに Yahoo! の印 = 前から無い項目 = 断る (まとまりの画面に Yahoo! の欄は無い)
+  assert.equal(err(() => BLK.checkRegisterBlanks('variation', { children: [], values: {}, card: {}, blanks: ['card.yahoo.price'] })).reason, 'blank_unknown');
   let e = err(() => BLK.checkRegisterBlanks('single', { ...single, blanks: all.filter((k) => k !== 'shipping_code') }));
   assert.deepEqual([e.status, e.reason, e.extra.field, e.extra.blank_key, e.extra.screen_outdated], [400, 'blank_unmarked', 'shipping_code', 'shipping_code', undefined]);
   assert.match(e.message, /「発送方法」は、値を入れるか「入力なし」を選んでください。何も保存していません/);
@@ -2799,7 +2832,8 @@ await ta('[BL2] 登録の API (単品): 印の無い項目 = 400 (どの項目�
   assert.equal(r.status, 200, r.text);
   assert.equal(r.j.state, 'draft');
   const ev = await regEvents('bl-web-1');
-  assert.equal(ev[0].reason, '10 月の新商品 · 入力なし: 原価・メーカー・発送方法・入荷日の管理・公式ページURL・Amazon・参考URL・セット商品・Yahoo!売価・Yahoo!売価(佐川)・Yahoo!配送方法・Yahoo!カテゴリID・Yahoo!path');
+  // 🆕 2026-10-26: Yahoo! の欄は数えない = 空のまま (印なし) で通る・理由に足さない
+  assert.equal(ev[0].reason, '10 月の新商品 · 入力なし: 原価・メーカー・発送方法・入荷日の管理・公式ページURL・Amazon・参考URL・セット商品');
   // 入荷日の管理を入力なし = 不明のまま (null)・発送方法なし
   assert.deepEqual(await one("select p.inbound_date_managed, s.shipping_code from core.products p join core.skus s on s.product_id = p.product_id where s.code = 'bl-web-1'"), { inbound_date_managed: null, shipping_code: null });
   // 同じ request_id の押し直し = 前の結果 (理由も同じ = 要求のハッシュが同じ)
@@ -2808,6 +2842,18 @@ await ta('[BL2] 登録の API (単品): 印の無い項目 = 400 (どの項目�
   // 印を変えた同じ request_id = 中身が違う (409)
   const diff = await call('POST', '/apps/master-edit/api/new', { body: { ...body, reason: '10 月の新商品', values: { ...body.values, cost: { jpy: '100' } }, blanks: all.filter((k) => k !== 'cost') }, blanks: 'raw' });
   assert.deepEqual([diff.status, diff.j.reason], [409, 'request_id_reused'], diff.text);
+  // 🆕 2026-10-26: 前の版の画面 (Yahoo! の欄ごとに「入力なし」) の印 = 断らない・前と同じ理由 (前と同じ要求のハッシュ = 押し直しも前の答え)
+  const YK = ['card.yahoo.price', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path'];
+  const oldScreen = { ...blankBody('bl-web-old'), reason: '前の画面', blanks: [...all, ...YK] };
+  r = await call('POST', '/apps/master-edit/api/new', { body: oldScreen, blanks: 'raw' });
+  assert.equal(r.status, 200, r.text);
+  assert.equal((await regEvents('bl-web-old'))[0].reason, '前の画面 · 入力なし: 原価・メーカー・発送方法・入荷日の管理・公式ページURL・Amazon・参考URL・セット商品・Yahoo!売価・Yahoo!売価(佐川)・Yahoo!配送方法・Yahoo!カテゴリID・Yahoo!path');
+  const oldAgain = await call('POST', '/apps/master-edit/api/new', { body: oldScreen, blanks: 'raw' });
+  assert.deepEqual([oldAgain.status, oldAgain.j.replayed], [200, true], oldAgain.text);
+  // Yahoo! の値を入れたとき = 形は今までどおり確かめる (売価 0 = 400・何も書かない)
+  r = await call('POST', '/apps/master-edit/api/new', { body: { ...blankBody('bl-web-y0'), card: { create: true, yahoo: { price: '0' } }, blanks: all }, blanks: 'raw' });
+  assert.deepEqual([r.status, r.j.field], [400, 'card.yahoo.price'], r.text);
+  assert.equal(await skuId('bl-web-y0'), undefined);
   // 古い画面でも全部に値があれば受ける (理由はそのまま)。🆕 0084: メーカーも値 (名簿に足したメーカー)
   const mk = await call('POST', '/apps/master-edit/api/makers', { body: { request_id: uuid(), name: '全部入れた製作所' } });
   assert.equal(mk.status, 200, mk.text);
@@ -2829,13 +2875,38 @@ await ta('[BL2] 登録の API (単品): 印の無い項目 = 400 (どの項目�
 });
 
 await ta('[BL3] 登録の API (セット・発注の設定): セットは例外原価・発送方法・カードの欄 / 発注アプリに書ける人だけ発注の設定の 3 つも聞く (ケース・容量は聞かない) (書けない人 = 聞かない)・発注条件グループの「なし」= 入力なし', async () => {
-  const setBody = { request_id: uuid(), kind: 'set', code: 'bl-set-1', values: { name: '入力なしのセット', standard_price: '2000', reorder_months: '1', shipping_code: 'S01', components: [{ code: 's001', qty: 2 }] }, card: { create: true } };
+  // 🆕 2026-10-26 中原さん: 今の画面のセット = 推奨保有月数・セット自身の取扱・売上分類の上書き・例外原価を送らない・Yahoo! の印も無い
+  const setBody = { request_id: uuid(), kind: 'set', code: 'bl-set-1', values: { name: '入力なしのセット', standard_price: '2000', shipping_code: 'S01', components: [{ code: 's001', qty: 2 }] }, card: { create: true } };
   let r = await call('POST', '/apps/master-edit/api/new', { body: setBody, blanks: 'raw' });
-  assert.deepEqual([r.status, r.j.reason, r.j.field], [400, 'blank_unmarked', 'exception_cost'], r.text);
+  assert.deepEqual([r.status, r.j.reason, r.j.field], [400, 'blank_unmarked', 'card.official_url'], r.text);
+  assert.deepEqual(BLK.missingBlankKeys('set', setBody), ['card.official_url', 'card.amazon', 'card.reference_urls']);
   r = await call('POST', '/apps/master-edit/api/new', { body: { ...setBody, blanks: BLK.missingBlankKeys('set', setBody) }, blanks: 'raw' });
   assert.equal(r.status, 200, r.text);
   // 🆕 2026-10-21: セットの発送方法は必須 = 入力なしの項目に無い
-  assert.match((await regEvents('bl-set-1'))[0].reason, /^新商品の登録 · 入力なし: 例外原価・公式ページURL・Amazon・参考URL・Yahoo!売価/);
+  assert.equal((await regEvents('bl-set-1'))[0].reason, '新商品の登録 · 入力なし: 公式ページURL・Amazon・参考URL');
+  // 導く値: 取扱 = 構成品から (取扱中)・売上分類 = 構成品から (s001 = 3)・原価 = 構成品の合計 (100 × 2)・推奨保有月数 = 0・上書きなし
+  assert.deepEqual([r.j.handling, r.j.cost], ['active', { jpy: 200, source: 'set_calc' }], r.text);
+  assert.deepEqual(await one(`select handling, handling_own, set_sales_class_override as o, reorder_months::float8 as m from core.skus where code = 'bl-set-1'`), { handling: 'active', handling_own: 'active', o: null, m: 0 });
+  assert.deepEqual(await one(`select c.cost_jpy::int as jpy, c.cost_source as src, c.cost_status as st from core.sku_costs c join core.skus k on k.sku_id = c.sku_id where k.code = 'bl-set-1'`), { jpy: 200, src: 'set_calc', st: 'COMPLETE' });
+  // 構成品が 1 つでも中止 = セットも中止 (セット自身の取扱は送らない = 取扱中)
+  const SR = await import('../lib/master-set-rules.js');
+  const dStop = SR.deriveSetCdb([{ code: 'a', qty: 1, tax_rate: 0.1, sales_class: 3, handling: 'active', cost_jpy: 10 }, { code: 'b', qty: 1, tax_rate: 0.1, sales_class: 1, handling: 'discontinued', cost_jpy: 20 }],
+    { handlingOwn: 'active', newEntry: true });
+  assert.deepEqual([dStop.handling, dStop.salesClass, dStop.cost, dStop.blockers], ['discontinued', 1, { status: 'COMPLETE', jpy: 30 }, []]);
+  // 導けない = 登録の画面に無い欄 (上書き・例外原価) を案内しない
+  const dBad = SR.deriveSetCdb([{ code: 'a', qty: 1, tax_rate: 0.1, sales_class: 4, handling: 'active', cost_jpy: null }, { code: 'b', qty: 1, tax_rate: 0.1, sales_class: 1, handling: 'active', cost_jpy: 20 }], { handlingOwn: 'active', newEntry: true });
+  assert.ok(dBad.blockers.length === 2 && !/上書き|例外原価/.test(dBad.blockers.join(' ')), dBad.blockers.join(' / '));
+  // 🆕 2026-10-26: 前の版の画面のセット (例外原価・Yahoo! の欄ごとに「入力なし」・推奨保有月数・取扱・上書きの欄を送る) = 断らない・前と同じ理由・押し直しも前の答え
+  const oldSet = { request_id: uuid(), kind: 'set', code: 'bl-set-old', reason: null,
+    values: { name: '前の画面のセット', standard_price: '2000', shipping_code: 'S01', reorder_months: '2', handling_own: 'active', set_sales_class_override: '', components: [{ code: 's001', qty: 1 }] },
+    card: { create: true, yahoo: { price: '', price_sagawa: '', delivery_label: '', category_id: '', path: '' } },
+    blanks: ['exception_cost', 'card.official_url', 'card.amazon', 'card.reference_urls', 'card.yahoo.price', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path'] };
+  r = await call('POST', '/apps/master-edit/api/new', { body: oldSet, blanks: 'raw' });
+  assert.equal(r.status, 200, r.text);
+  assert.equal((await regEvents('bl-set-old'))[0].reason, '新商品の登録 · 入力なし: 例外原価・公式ページURL・Amazon・参考URL・Yahoo!売価・Yahoo!売価(佐川)・Yahoo!配送方法・Yahoo!カテゴリID・Yahoo!path');
+  assert.deepEqual(await one(`select handling_own, reorder_months::float8 as m from core.skus where code = 'bl-set-old'`), { handling_own: 'active', m: 2 }, '前の版の画面が送った推奨保有月数はそのまま');
+  const oldSetAgain = await call('POST', '/apps/master-edit/api/new', { body: oldSet, blanks: 'raw' });
+  assert.deepEqual([oldSetAgain.status, oldSetAgain.j.replayed], [200, true], oldSetAgain.text);
   // 発注アプリの権限が無い人 (editor) = 発注の設定の項目は聞かない (上の BL2 で通っている)・書ける人 (po-editor) = 6 つも聞く
   const po = blankBody('bl-po-1', { card: { create: false } });
   r = await call('POST', '/apps/master-edit/api/new', { body: { ...po, blanks: ['cost', 'maker', 'shipping_code', 'inbound_date_managed'] }, session: 'po-editor', blanks: 'raw' });
@@ -2868,10 +2939,12 @@ await ta('[BL4] 画面とつかいかた: 新商品の画面に「入力なし�
   const nonesOf = (html) => [...html.matchAll(/<input type="checkbox" data-none="([^"]+)"/g)].map((m) => m[1]);
   const pageOf = (html) => JSON.parse((/<script type="application\/json" id="me-new">([\s\S]*?)<\/script>/.exec(html) || [])[1] || 'null');
   let r = await call('GET', '/apps/master-edit/new?kind=single');
-  assert.deepEqual(nonesOf(r.text), ['cost', 'maker', 'shipping_code', 'inbound_date_managed', 'card.official_url', 'card.amazon', 'card.reference_urls', 'card.set_decision',
-    'card.yahoo.price', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path']);
+  // 🆕 2026-10-26 中原さん: Yahoo! の欄は任意 = 「入力なし」を出さない (空 = 入れない)
+  assert.deepEqual(nonesOf(r.text), ['cost', 'maker', 'shipping_code', 'inbound_date_managed', 'card.official_url', 'card.amazon', 'card.reference_urls', 'card.set_decision']);
   assert.deepEqual(pageOf(r.text).blankKeys, [...BLK.BLANK_KEYS.single]);
-  for (const part of ['cost', 'shipping_code', 'inbound_date_managed', 'card.official_url', 'card.amazon', 'card.reference_urls', 'card.set_decision', 'card.yahoo.path']) assert.ok(r.text.includes(`data-none-part="${part}"`), part);
+  for (const part of ['cost', 'shipping_code', 'inbound_date_managed', 'card.official_url', 'card.amazon', 'card.reference_urls', 'card.set_decision']) assert.ok(r.text.includes(`data-none-part="${part}"`), part);
+  assert.ok(!/data-none(-part)?="card\.yahoo/.test(r.text), 'Yahoo! の欄に「入力なし」が残っている');
+  assert.ok(r.text.includes('<span class="b mute" id="yahoo-sum">ふだんは空のまま</span>') && r.text.includes('楽天と同じなら空のまま (入れなくても登録できます)'), 'Yahoo! の欄は空のままでよいと出す');
   assert.ok(!r.text.includes('まだ決めない</button>'), '「まだ決めない」は「入力なし」に');
   assert.ok(!r.text.includes('data-none-all') && !r.text.includes('空の欄を全部'), 'まとめて入力なしにするボタンは置かない (中原さん 10/13: 1 つずつ押す)');
   assert.ok(r.text.indexOf('/public/me-none.js') < r.text.indexOf('/public/me-new.js'), 'me-none.js を先に読む');
@@ -2883,7 +2956,10 @@ await ta('[BL4] 画面とつかいかた: 新商品の画面に「入力なし�
   for (const id of ['po-cond-mode', 'po-mat-mode']) assert.match((new RegExp('<div class="seg" role="group" id="' + id + '"[^>]*>').exec(r.text) || [''])[0], /data-value=""/, id + ' は初めは選ばない形');
   r = await call('GET', '/apps/master-edit/new?kind=set');
   // 🆕 2026-10-21: セットの発送方法は必須 = 「入力なし」のチェックを置かない・必須の印を出す
-  assert.deepEqual(nonesOf(r.text), ['exception_cost', 'card.official_url', 'card.amazon', 'card.reference_urls', 'card.yahoo.price', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path']);
+  // 🆕 2026-10-26 中原さん: セットの例外原価・Yahoo! の欄は「入力なし」を出さない
+  assert.deepEqual(nonesOf(r.text), ['card.official_url', 'card.amazon', 'card.reference_urls']);
+  assert.deepEqual(pageOf(r.text).blankKeys, [...BLK.BLANK_KEYS.set]);
+  assert.match(r.text, /id="y-price"/, 'セットにも Yahoo! の欄はある (任意)');
   assert.ok(r.text.includes('<label class="lab" for="shipping">発送方法<span class="req">必須</span>') && r.text.includes('セットは必須 (利益の計算'), 'セットの発送方法は必須と出す');
   assert.ok(!r.text.includes('セット商品を作るか'), 'セットに単品だけの項目の名前を出さない');
   // 商品の画面の発注の設定には入力なしを出さない (新商品の登録だけ)

@@ -976,7 +976,7 @@ await ta('[23] 詳細検索の長い条件 (#1620 Codex R1 M2): 本物の HTTP �
 /** 🆕 0061 (2026-10-08 中原さん): 下書きの保存で要る欄 = 単品の売上分類・ロジザードの有効期限の管理・推奨保有月数 / セットの推奨保有月数 */
 const fillReq = async (p, { set = false } = {}) => {
   if (!set) { await p.click('#f-sales_class button[data-v="3"]'); await p.click('#f-expiry button[data-v="0"]'); }
-  await p.fill('#f-reorder_months', '1');
+  if (!set) await p.fill('#f-reorder_months', '1');   // 🆕 2026-10-26: セットは推奨保有月数を聞かない
   // 🆕 2026-10-21: セットの発送方法は必須 = 空なら送料の表の先頭を選ぶ (単品は今までどおり任意)
   if (set && (await p.locator('#shipping').count()) && !(await p.inputValue('#shipping'))) {
     const first = await p.evaluate(() => [...document.querySelectorAll('#shipping option')].map((o) => o.value).find(Boolean));
@@ -1011,9 +1011,9 @@ await ta('[35] 新商品の登録 (単品・10/5): あと N つ (① がそろ�
   assert.equal(await dirty(p), 0);
   // 🆕 2026-10-13 (入力なし): 必須 8 + 必須でない 18 (原価・Amazon・公式ページ・発送方法・セット商品・発注の設定 6・入荷日の管理・参考 URL・Yahoo! 5) = 26
   //   🆕 0080: + ロジザードのバーコード (必須 = 値か空欄) = 27 / 🆕 0084: + メーカー (値か入力なし) = 28
-  assert.match(await p.textContent('#remain'), /あと\s*25\s*つ/);
+  assert.match(await p.textContent('#remain'), /あと\s*20\s*つ/);   // 🆕 2026-10-26: Yahoo! の 5 つは数えない (任意) = 20
   assert.equal(await p.isDisabled('#save'), true);
-  assert.match(await p.textContent('#save'), /あと 25 つ: 商品コード/);
+  assert.match(await p.textContent('#save'), /あと 20 つ: 商品コード/);
   await p.fill('#reason', '理由だけ');
   assert.equal(await dirty(p), 0, '保存の理由は数えない');
   await p.click('#checklist button:has-text("税率")');
@@ -1038,19 +1038,19 @@ await ta('[35] 新商品の登録 (単品・10/5): あと N つ (① がそろ�
   await p.waitForSelector('#code-msg.ok');
   await p.fill('#f-name', 'UI 新商品 1');
   await p.fill('#f-standard_price', '1280');
-  assert.match(await p.textContent('#save'), /あと 22 つ: 税率/);
+  assert.match(await p.textContent('#save'), /あと 17 つ: 税率/);
   await p.click('#f-tax_rate button[data-v="0.08"]');
   // 2026-10-08 中原さん: 代表の仕入先は ① (必須)・発送方法は ③ (あとでも可) = 発送方法を選んでも保存できない
   await p.selectOption('#shipping', 'S02');
-  assert.match(await p.textContent('#save'), /あと 20 つ: 代表の仕入先/);
+  assert.match(await p.textContent('#save'), /あと 15 つ: 代表の仕入先/);
   assert.equal(await p.isDisabled('#save'), true, '代表の仕入先が無い = 押せない');
   await p.selectOption('#f-primary_supplier', '0001');
   // 🆕 0061: 売上分類・推奨保有月数・ロジザードの有効期限の管理もそろうまで押せない
-  assert.match(await p.textContent('#save'), /あと 19 つ: 売上分類/);
+  assert.match(await p.textContent('#save'), /あと 14 つ: 売上分類/);
   assert.equal(await p.isDisabled('#save'), true);
   await fillReq(p);
   // 🆕 2026-10-13: 必須がそろっても、必須でない項目が「値」も「入力なし」も無いうちは押せない
-  assert.match(await p.textContent('#save'), /あと 15 つ: 原価/);
+  assert.match(await p.textContent('#save'), /あと 10 つ: 原価/);
   assert.equal(await p.isDisabled('#save'), true);
   // 出品カードを作らない = ③ と Yahoo! を数えない (product-hub につながない)
   await p.click('#card-create button[data-v="0"]');
@@ -1091,7 +1091,7 @@ await ta('[35b] 新商品の登録 (2026-10-08 中原さん): 発送方法を選
   await p.fill('#f-name', '発送方法なしの単品');
   await p.fill('#f-standard_price', '990');
   await p.click('#f-tax_rate button[data-v="0.1"]');
-  assert.match(await p.textContent('#save'), /あと 21 つ: 代表の仕入先/);
+  assert.match(await p.textContent('#save'), /あと 16 つ: 代表の仕入先/);
   assert.equal(await p.isDisabled('#save'), true);
   await p.selectOption('#f-primary_supplier', '0001');
   await fillReq(p);
@@ -1127,7 +1127,7 @@ await ta('[36] 新商品の登録 (セット・10/5): 空の行は数えない�
   await pg.query("update core.products set sales_class = null where display_code = 'ui-new-1'");
   await p.goto(B + '/new?kind=set');
   assert.equal(await dirty(p), 0, '空の 2 行は数えない');
-  assert.match(await p.textContent('#remain'), /あと\s*15\s*つ/, '必須 5 + 必須でない 10 (例外原価・発送方法・Amazon・公式・参考 URL・Yahoo! 5)');
+  assert.match(await p.textContent('#remain'), /あと\s*8\s*つ/, '必須 5 (構成・コード・名前・売価・発送方法) + 必須でない 3 (Amazon・公式・参考 URL)。🆕 2026-10-26: 推奨保有月数・例外原価・Yahoo! は数えない');
   const rows = p.locator('#comp-rows tr.comp-row');
   await rows.nth(0).locator('.c-code').fill('s001');
   await rows.nth(0).locator('.c-code').press('Enter');
@@ -1141,32 +1141,18 @@ await ta('[36] 新商品の登録 (セット・10/5): 空の行は数えない�
   assert.equal(await dirty(p), 1, '構成は 1 件 (中身どうし)');
   await rows.nth(1).locator('button[data-act="up"]').click();
   assert.equal(await rows.nth(0).locator('.c-qty').getAttribute('aria-label'), '1 行目 (s003) の数');
-  assert.match(await p.textContent('#remain'), /あと\s*14\s*つ/);
+  assert.match(await p.textContent('#remain'), /あと\s*7\s*つ/);
   assert.equal(await p.isDisabled('#save'), true);
-  // 売上分類の上書き (#1628 Codex R1 M2): 構成品から導ける (3 と 1 = 1) 間は押せない
-  const ovr = p.locator('#f-set_sales_class_override');
-  assert.equal(await ovr.isDisabled(), true, '導ける間は上書きを押せない');
-  assert.match(await p.textContent('#override-hint'), /導けるので、上書きはできません/);
-  // 売上分類が未入力の構成品 (ui-new-1 = [35] で分類を入れずに登録) = 導けない = 上書きで決める
+  // 🆕 2026-10-26 中原さん: セットに セット自身の取扱・売上分類の上書き・例外原価・推奨保有月数 の欄は無い (構成品から・構成品で発注する)
+  assert.equal(await p.locator('#f-set_sales_class_override, #xcost-jpy, #handling-own, #f-reorder_months, [data-row="handling_own"], [data-row="exception_cost"], [data-row="reorder_months"]').count(), 0, 'セットに例外の欄・推奨保有月数が残っている');
+  assert.ok(!/例外原価|推奨保有月数|売上分類の上書き|Yahoo!/.test(await p.textContent('#checklist')), '右の一覧に例外の欄・推奨保有月数・Yahoo! を数えている');
+  // 売上分類が未入力の構成品 (ui-new-1 = 上で分類を空にした) = 導けない = 構成品の値を直すよう出す (上書きの欄は案内しない)
   await rows.nth(0).locator('.c-code').fill('ui-new-1');
   await rows.nth(0).locator('.c-code').press('Tab');
   await p.waitForFunction(() => /UI 新商品 1/.test(document.querySelectorAll('#comp-rows .c-name')[0].textContent));
-  assert.equal(await ovr.isDisabled(), false, '導けないときは上書きできる');
-  assert.match(await p.textContent('#t-sales'), /決まりません/);
-  await p.click('#sec-comp details.more > summary');
-  await ovr.selectOption('2');
-  assert.match(await p.textContent('#t-sales'), /2\s*取引先限定[\s\S]*導けないので/);
-  // 導ける構成に戻す = サーバーが断る形 = ① で止める (保存のボタンも)
-  await rows.nth(0).locator('.c-code').fill('s003');
-  await rows.nth(0).locator('.c-code').press('Tab');
-  await p.waitForFunction(() => /単品 3/.test(document.querySelectorAll('#comp-rows .c-name')[0].textContent));
-  assert.match(await p.textContent('#t-sales'), /上書きできません/);
-  assert.match(await p.textContent('#checklist'), /売上分類の上書きを空にする/);
-  assert.equal(await ovr.isDisabled(), false, '入れてある上書きは空にできる');
-  await ovr.selectOption('');
-  assert.equal(await ovr.isDisabled(), true);
-  assert.ok(!/売上分類の上書きを空にする/.test(await p.textContent('#checklist')));
-  // 照合中は保存しない (#1628 Codex R2 M1): 導けない構成 + 上書き (保存できる) から、導ける構成品へ打ち直した直後 = 古い答えで保存しない
+  assert.match(await p.textContent('#t-sales'), /決まりません[\s\S]*先に単品の売上分類を/);
+  assert.ok(!/上書き/.test(await p.textContent('#t-sales')));
+  // 照合中は保存しない (#1628 Codex R2 M1): 保存できる形から、構成品を打ち直した直後 = 古い答えで保存しない
   const newCalls = [];
   p.on('request', (rq) => { if (/\/api\/new$/.test(rq.url())) newCalls.push(rq.url()); });
   await p.fill('#code', 'ui-set-race');
@@ -1176,21 +1162,14 @@ await ta('[36] 新商品の登録 (セット・10/5): 空の行は数えない�
   await p.selectOption('#shipping', 'S02');
   await fillReq(p, { set: true });
   await noneRest(p);
-  await rows.nth(0).locator('.c-code').fill('ui-new-1');
-  await rows.nth(0).locator('.c-code').press('Tab');
-  await p.waitForFunction(() => /UI 新商品 1/.test(document.querySelectorAll('#comp-rows .c-name')[0].textContent));
-  await ovr.selectOption('2');
-  assert.equal(await p.isDisabled('#save'), false, '導けない構成 + 上書き = 保存できる');
+  assert.equal(await p.isDisabled('#save'), false, '構成・コード・名前・売価・発送方法・カードの欄 = 保存できる (推奨保有月数・例外原価・Yahoo! は聞かない)');
   await rows.nth(0).locator('.c-code').fill('s003');   // 欄を離れない (照合は打つのが止まってから)
   assert.equal(await p.isDisabled('#save'), true, '打ち直した直後 = 照合中 = 押せない');
   assert.match(await p.textContent('#checklist'), /構成品を確かめています/);
   await p.keyboard.press('Control+s');
   await p.waitForFunction(() => /単品 3/.test(document.querySelectorAll('#comp-rows .c-name')[0].textContent));
   assert.deepEqual(newCalls, [], '照合中の Ctrl+S で送らない');
-  assert.match(await p.textContent('#checklist'), /売上分類の上書きを空にする/, '照合の後は導ける = 上書きを空にするまで止める');
-  assert.equal(await p.isDisabled('#save'), true);
-  await ovr.selectOption('');
-  assert.equal(await p.isDisabled('#save'), false, '上書きを空にすれば保存できる');
+  assert.equal(await p.isDisabled('#save'), false, '照合の後 = 保存できる');
 });
 
 await ta('[40] 新商品の登録 (#1628 Codex R2 M2): カードを作らないでも値の残る欄は隠さない (保存のときに確かめる)・カードの欄の誤りは開いてその欄へ・空にすると畳む', async (p) => {
@@ -2613,7 +2592,7 @@ await ta('[64] 入力なし (単品・1440): 必須がそろっても押せな�
   await p.goto(B + '/new?kind=single');
   await fillSingleReq(p, 'ui-none-1');
   assert.equal(await p.isDisabled('#save'), true, '必須だけでは押せない');
-  assert.match(await p.textContent('#save'), /あと 16 つ: 原価/);
+  assert.match(await p.textContent('#save'), /あと 11 つ: 原価/);
   assert.match(await p.textContent('#checklist'), /④ そのほかの項目/);
   // 原価: 値を入れてから「入力なし」= 値を消す・印
   await p.fill('#cost-jpy', '300');
@@ -2651,12 +2630,15 @@ await ta('[64] 入力なし (単品・1440): 必須がそろっても押せな�
   for (const t of ['ケースロット', 'ケースグループ', '容量']) assert.ok(!ckText.includes(t), t + ' が右の一覧にある');
   assert.equal(await p.locator('[data-none="order_settings.case_lot"], [data-none="order_settings.case_group"], [data-none="order_settings.capacity_per_unit"]').count(), 0);
   assert.equal(await p.locator('[data-none-all], .nonebulk').count(), 0, 'まとめて入力なしにするボタンがある');
-  assert.match(await p.textContent('#sec-yahoo'), /欄ごとに「入力なし」を押します/);
+  // 🆕 2026-10-26 中原さん: Yahoo! の欄は任意 = 「入力なし」は無い・右の一覧に数えない・入れた値はそのまま送る
+  assert.match(await p.textContent('#sec-yahoo'), /楽天と同じなら空のまま/);
+  assert.equal(await p.locator('#sec-yahoo .nonechk, #sec-yahoo [data-none]').count(), 0, 'Yahoo! の欄に「入力なし」がある');
+  assert.ok(!/Yahoo!/.test(await p.textContent('#checklist')), '右の一覧に Yahoo! を数えている');
+  const before = await p.textContent('#remain');
   await p.click('#sec-yahoo > summary');
   await p.fill('#y-price', '1500');
-  for (const k of ['card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path']) await p.click(`[data-row="${k}"] .nonechk`);
-  assert.deepEqual(await p.evaluate(() => ['card.yahoo.price', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path'].map((k) => document.querySelector(`[data-none="${k}"]`).checked)), [false, true, true, true, true]);
-  assert.equal(await p.inputValue('#y-price'), '1500', 'ほかの欄の入力なしで値は消えない');
+  assert.equal(await p.textContent('#remain'), before, 'Yahoo!売価を入れても「あと N つ」は変わらない');
+  assert.match(await p.textContent('#yahoo-sum'), /Yahoo!売価 1,500 円/);
   // 押す所は 44px 以上
   const small = await p.evaluate(() => [...document.querySelectorAll('.nonechk')].filter((x) => x.offsetParent !== null).map((x) => x.getBoundingClientRect()).filter((r) => r.height < 44 || r.width < 44).length);
   assert.equal(small, 0, '入力なしの押す所が 44px より小さい');
@@ -2687,9 +2669,10 @@ await ta('[64] 入力なし (単品・1440): 必須がそろっても押せな�
   assert.match(await p.innerText('#sec-lzbc'), /X00UIN0001/);
   // 送る印 = サーバーと同じ並び (lib/master-register-blanks.mjs の BLANK_KEYS)
   assert.deepEqual(bodies[0].blanks, ['maker', 'order_settings.order_lot', 'order_settings.condition', 'order_settings.material',
-    'shipping_code', 'inbound_date_managed', 'card.official_url', 'card.reference_urls', 'card.set_decision', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path']);
+    'shipping_code', 'inbound_date_managed', 'card.official_url', 'card.reference_urls', 'card.set_decision']);
+  assert.deepEqual(bodies[0].card.yahoo, { price: '1500', price_sagawa: '', delivery_label: '', category_id: '', path: '' }, 'Yahoo! は入れた値だけ (空 = 入れない)');
   // 発注の設定の入力なしは理由の後ろの一言 (要求のハッシュに入らない・#1706 Codex R2 M)
-  assert.equal(await regReason('ui-none-1'), '新商品の登録 · 入力なし: メーカー・発送方法・入荷日の管理・公式ページURL・参考URL・セット商品・Yahoo!売価(佐川)・Yahoo!配送方法・Yahoo!カテゴリID・Yahoo!path · 発注の設定の入力なし: 発注ロット・発注条件グループ・原料グループ');
+  assert.equal(await regReason('ui-none-1'), '新商品の登録 · 入力なし: メーカー・発送方法・入荷日の管理・公式ページURL・参考URL・セット商品 · 発注の設定の入力なし: 発注ロット・発注条件グループ・原料グループ');
   assert.deepEqual(await skuRow('ui-none-1'), { name: '入力なしの試験 ui-none-1', price: 1200, tax: 0.1, shipping_code: null });
 });
 
@@ -2713,7 +2696,7 @@ await ta('[65] 入力なし (スマホ 390): 横にはみ出さない・押す�
   assert.match(await regReason('ui-none-390'), /入力なし: 原価・/);
 }, { width: 390, height: 844 });
 
-await ta('[66] 入力なし (セット): 例外原価 (例外のときの欄) も 値か入力なし・カードを作らない = カードの欄は数えない・記録に残る', async (p) => {
+await ta('[66] 入力なし (セット): 🆕 2026-10-26 例外原価・推奨保有月数は聞かない・カードを作らない = カードの欄は数えない = 必須だけで保存できる・送る本文に例外の欄が無い・導く値', async (p) => {
   await p.goto(B + '/new?kind=set');
   const rows = p.locator('#comp-rows tr.comp-row');
   await rows.nth(0).locator('.c-code').fill('s001'); await rows.nth(0).locator('.c-code').press('Tab');
@@ -2724,14 +2707,19 @@ await ta('[66] 入力なし (セット): 例外原価 (例外のときの欄) �
   await p.fill('#f-standard_price', '2400');
   await fillReq(p, { set: true });
   await p.click('#card-create button[data-v="0"]');
-  // 🆕 2026-10-21: セットの発送方法は必須 (fillReq が選んだ) = 入力なしのチェックは無い・残りは例外原価の 1 つ
+  // 🆕 2026-10-21: セットの発送方法は必須 (fillReq が選んだ) = 入力なしのチェックは無い。🆕 2026-10-26: 例外原価・推奨保有月数は聞かない = カードを作らない = 必須だけで保存できる
   assert.equal(await p.locator('[data-row="shipping_code"] .nonechk').count(), 0, 'セットの発送方法に「入力なし」は無い');
-  assert.match(await p.textContent('#save'), /あと 1 つ: 例外原価/, 'カードを作らない = 例外原価の 1 つ');
-  await p.click('#sec-comp details.more > summary');
-  await p.click('[data-row="exception_cost"] .nonechk');
+  assert.equal(await p.locator('.nonechk').count() - await p.locator('#card-fields .nonechk').count(), 0, 'カードの欄のほかに「入力なし」がある');
   assert.match(await p.textContent('#remain'), /下書きを保存できます/);
+  const bodies = [];
+  p.on('request', (rq) => { if (/\/api\/new$/.test(rq.url())) bodies.push(JSON.parse(rq.postData())); });
   await Promise.all([p.waitForURL(/\/sku\/ui-none-set$/), p.click('#save')]);
-  assert.equal(await regReason('ui-none-set'), '新商品の登録 · 入力なし: 例外原価');
+  assert.deepEqual(Object.keys(bodies[0].values).sort(), ['components', 'name', 'shipping_code', 'standard_price'], '送る値 = 推奨保有月数・取扱・上書き・例外原価なし');
+  assert.deepEqual(bodies[0].blanks, []);
+  assert.equal(await regReason('ui-none-set'), '新商品の登録');
+  // 導く値: 取扱 = 取扱中 (構成品から)・上書きなし・推奨保有月数 0・原価 = 構成品の合計 (s001 = 100 円 × 1)
+  assert.deepEqual((await pg.query("select handling, handling_own, set_sales_class_override as o, reorder_months::float8 as m from core.skus where code = 'ui-none-set'")).rows[0], { handling: 'active', handling_own: 'active', o: null, m: 0 });
+  assert.deepEqual((await pg.query("select c.cost_jpy::int as jpy, c.cost_source as src from core.sku_costs c join core.skus k on k.sku_id = c.sku_id where k.code = 'ui-none-set'")).rows, [{ jpy: 100, src: 'set_calc' }]);
 });
 
 await ta('[61] Amazon SKU の新しい対応 (10/13): 開くと構成の 1 行目 (空のコード・数 1・代表) とコードの欄にフォーカス・未保存 0・構成 → 名前 (社内) の順 (Tab も)・「足す」は空の行があれば足さない・コード → 名前が入る・2 行目を足せる (空の行は数えない)・元に戻す・保存', async (p) => {

@@ -133,7 +133,7 @@ await ta('① 左の列の「下書き」→ セットとして登録する → 
   const rows = await p.locator('#comp-rows tr.comp-row').count();
   if (rows > 1) await p.locator('#comp-rows tr.comp-row').nth(1).locator('button[data-act="del"]').click();
   await p.fill('#f-standard_price', '5800');
-  await p.fill('#f-reorder_months', '1');
+  // 🆕 2026-10-26 中原さん: セットは推奨保有月数を聞かない (欄が無い)
   await noneRest(p);
   assert.equal(await p.isDisabled('#save'), false, await p.textContent('#save'));
   await Promise.all([p.waitForURL(/\/sku\/ui-take-2$/), p.click('#save')]);
@@ -156,7 +156,6 @@ await ta('② 構成が違う = 断る (理由の 1 行・product-hub でカー�
   const rows = await p.locator('#comp-rows tr.comp-row').count();
   if (rows > 1) await p.locator('#comp-rows tr.comp-row').nth(1).locator('button[data-act="del"]').click();
   await p.fill('#f-standard_price', '8000');
-  await p.fill('#f-reorder_months', '1');
   await noneRest(p);
   await p.waitForSelector('#code-msg.ok');
   await p.click('#save');
@@ -188,7 +187,6 @@ await ta('④ 手で作ったセットのカード (product-hub の「セット�
   const rows = await p.locator('#comp-rows tr.comp-row').count();
   if (rows > 1) await p.locator('#comp-rows tr.comp-row').nth(1).locator('button[data-act="del"]').click();
   await p.fill('#f-standard_price', '8000');
-  await p.fill('#f-reorder_months', '1');
   await noneRest(p);
   await p.waitForSelector('#code-msg.ok');
   await p.click('#save');
