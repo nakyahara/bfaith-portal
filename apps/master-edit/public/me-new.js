@@ -390,7 +390,7 @@
     if (how === 'composing' || !codeLike) return;
     tr.__lookupTimer = setTimeout(function () { tr.__lookupTimer = null; lookup(tr); }, 500);
   }
-  /** 構成品の名前の横の「コピー」「名前に使う」: 引き当てた単品の行だけ出す。「名前に使う」はセットの名前が空・数が 2〜999 (作るセットの個数と同じ決まり) のときだけ押せる */
+  /** 構成品の名前の横の「コピー」「名前に使う」: 引き当てた単品の行だけ出す。「名前に使う」はセットの名前が空・数が 2〜10,000 (作るセットの個数と同じ決まり) のときだけ押せる */
   function compTools() {
     if (!isSet) return;
     var nameEmpty = !val('f-name');
@@ -400,7 +400,7 @@
       if (box.hidden !== !ok) box.hidden = !ok;
       var use = $('[data-act="use-name"]', tr); if (!use || !ok || !canSave || saved) return;
       var q = spQty($('.c-qty', tr).value);
-      var why = !nameEmpty ? '名前が空のときだけ使えます (コピーして直せます)' : q == null ? '数が ' + SP_MIN + '〜' + SP_QMAX + ' のときだけ使えます' : '';
+      var why = !nameEmpty ? '名前が空のときだけ使えます (コピーして直せます)' : q == null ? '数が ' + SP_MIN + '〜' + SP_QMAX.toLocaleString('ja-JP') + ' のときだけ使えます' : '';
       use.disabled = !!why;
       if (why) use.title = why; else use.removeAttribute('title');
     });
@@ -557,12 +557,12 @@
   var spRowEl = $('#row-set-plans');
   var SP_MAX = spRowEl ? Number(spRowEl.getAttribute('data-max')) || 10 : 10;
   var SP_MIN = spRowEl ? Number(spRowEl.getAttribute('data-qty-min')) || 2 : 2;
-  var SP_QMAX = spRowEl ? Number(spRowEl.getAttribute('data-qty-max')) || 999 : 999;
+  var SP_QMAX = spRowEl ? Number(spRowEl.getAttribute('data-qty-max')) || 10000 : 10000;
   var SP_NMAX = spRowEl ? Number(spRowEl.getAttribute('data-name-max')) || 255 : 255;
   /** 初めのコード・名前 (lib/set-plan.mjs の defaultSetCode / defaultSetName と同じ = 名前は半角の空白 1 つ・2026-10-17 中原さん) */
   function spDefCode(q) { return $('#code').value.trim() + '-' + q; }
   function spDefName(q) { return (val('f-name') + ' ' + q + '個セット').trim(); }
-  function spQty(v) { var t = half(v).trim(); if (!/^\d{1,3}$/.test(t)) return null; var n = Number(t); return n >= SP_MIN && n <= SP_QMAX ? n : null; }
+  function spQty(v) { var t = half(v).trim(); if (!/^\d{1,5}$/.test(t)) return null; var n = Number(t); return n >= SP_MIN && n <= SP_QMAX ? n : null; }
   /** 行 → { tr, qty (数か null), qtyRaw, code, name } (入れた順) */
   function setPlanRows() {
     return $$('#set-plan-rows tr.sp-row').map(function (tr) { var raw = $('.sp-qty', tr).value; return { tr: tr, qty: spQty(raw), qtyRaw: raw.trim(), code: $('.sp-code', tr).value, name: $('.sp-name', tr).value.trim() }; });
@@ -572,7 +572,7 @@
   function spKey(code) { return code + '|' + $('#code').value.trim(); }
   /** 行ごとの形の一言 (問題が無ければ '')。重なり = 上の行と同じ個数・同じコード (大文字小文字は同じと見る・後の行に印 = サーバーと同じ)・単品のコードと同じ */
   function spProblem(r, rows) {
-    if (r.qty == null) return '個数は ' + SP_MIN + '〜' + SP_QMAX + ' の整数';
+    if (r.qty == null) return '個数は ' + SP_MIN + '〜' + SP_QMAX.toLocaleString('ja-JP') + ' の整数';
     if (rows.slice(0, rows.indexOf(r)).some(function (x) { return x.qty === r.qty; })) return r.qty + '個セットが 2 行あります';
     var shape = codeShape(r.code);
     if (shape) return shape.replace(/^商品コード/, 'セット商品コード');
@@ -638,7 +638,7 @@
   function addSetPlanRow(qty) {
     var tpl = $('#set-plan-tpl'); if (!tpl) return null;
     var used = setPlanRows().map(function (r) { return r.qty; });
-    // 個数 = 決まりの中 (2〜999) で使っていない数 (望みの数から上へ・無ければ下から = Codex R2 Low)
+    // 個数 = 決まりの中 (2〜10,000) で使っていない数 (望みの数から上へ・無ければ下から = Codex R2 Low)
     var free = function (n) { return n >= SP_MIN && n <= SP_QMAX && used.indexOf(n) < 0; };
     var q = qty; while (!free(q) && q < SP_QMAX) q++;
     if (!free(q)) { q = SP_MIN; while (!free(q) && q < SP_QMAX) q++; }

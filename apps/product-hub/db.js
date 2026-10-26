@@ -447,13 +447,16 @@ export function migrateLpSpecsKindCheck(db) {
   return { migrated: true };
 }
 
-// ─── 作るセットの行の表 (新商品の登録 (単品) の「作るセット」・2026-10-17)。初回作成と、個数の CHECK を広げる作り直し (migrateSetPlanQtyCheck) の両方で使う ───
-// 個数 = lib/set-plan.mjs の SET_QTY_MIN〜SET_QTY_MAX (2026-10-26 中原さん: 100 個セットも作る = 99 → 999。セットの構成品の数 draft_set_members と同じ上限)
+// ─── セットの個数の表 (CHECK を広げる作り直し (migrateSetQtyChecks) と初回作成の両方で使う) ───
+// 🆕 2026-10-26 中原さん: 「10000 個まで上限上げて」= セットの構成品の数・作るセットの個数の上限は 10,000
+//   (lib/master-write.mjs の MAX_QTY・lib/set-plan.mjs の SET_QTY_MAX・NE 登録の CSV (lib/master-reg-csv.mjs・Company DB の ops.ne_reg_canonical)・
+//    登録の関数 (ops.new_set_derivation・0102) と同じ)。
+// 作るセットの行 (新商品の登録 (単品) の「作るセット」・2026-10-17): 個数 = lib/set-plan.mjs の SET_QTY_MIN〜SET_QTY_MAX
 const SET_PLAN_ITEMS_DDL = (name) => `
     CREATE TABLE IF NOT EXISTS ${name} (
       request_id    TEXT NOT NULL REFERENCES ph_cdb_set_plans(request_id),
       sort          INTEGER NOT NULL,
-      qty           INTEGER NOT NULL CHECK (qty BETWEEN 2 AND 999),
+      qty           INTEGER NOT NULL CHECK (qty BETWEEN 2 AND 10000),
       code          TEXT NOT NULL,
       code_key      TEXT NOT NULL,
       name          TEXT NOT NULL,
@@ -462,69 +465,97 @@ const SET_PLAN_ITEMS_DDL = (name) => `
       outcome_note  TEXT,
       PRIMARY KEY (request_id, sort)
     );`;
-const SET_PLAN_ITEMS_COLS = 'request_id, sort, qty, code, code_key, name, set_draft_id, outcome, outcome_note';
 const SET_PLAN_ITEMS_INDEXES = [
   'CREATE INDEX IF NOT EXISTS idx_ph_cdb_set_plan_items_code ON ph_cdb_set_plan_items(code_key);',
   'CREATE INDEX IF NOT EXISTS idx_ph_cdb_set_plan_items_draft ON ph_cdb_set_plan_items(set_draft_id);',
 ];
-/** 2026-10-17〜10-26 の定義 (個数 2〜99)。"AND 999)" には当たらない */
-const OLD_SET_PLAN_QTY_CHECK = /CHECK \(qty BETWEEN 2 AND 99\)/;
+// セット商品の構成 (2026-08-23)。工程「セット商品作成検討」で単品から派生させたとき、
+// 「何を何個まとめたセットか」を持つ。AI に説明文を書かせるときの文脈にも使う
+// (これが無いと単品のコピーみたいなタイトルになる)
+const DRAFT_SET_MEMBERS_DDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      set_draft_id   INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      member_ne_code TEXT NOT NULL,
+      qty            INTEGER NOT NULL DEFAULT 1 CHECK (qty BETWEEN 1 AND 10000),
+      sort           INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (set_draft_id, member_ne_code)
+    );`;
+/**
+ * 作り直す表の決まり。old = 旧い定義の CHECK (どれかに当たれば作り直す。"AND 10000)" には当たらない)
+ *   ph_cdb_set_plan_items: 2026-10-17〜 2〜99 / 2026-10-26 午前 (このブランチの前のコミット・未出荷) 2〜999
+ *   draft_set_members:     2026-08-23〜 1〜999
+ */
+const SET_QTY_TABLES = [
+  { name: 'ph_cdb_set_plan_items', ddl: SET_PLAN_ITEMS_DDL, indexes: SET_PLAN_ITEMS_INDEXES, label: '作るセットの行', want: '2〜10000',
+    cols: 'request_id, sort, qty, code, code_key, name, set_draft_id, outcome, outcome_note', order: 'request_id, sort',
+    old: /CHECK \(qty BETWEEN 2 AND 999?\)/ },
+  { name: 'draft_set_members', ddl: DRAFT_SET_MEMBERS_DDL, indexes: [], label: 'セットの構成', want: '1〜10000',
+    cols: 'set_draft_id, member_ne_code, qty, sort', order: 'set_draft_id, member_ne_code',
+    old: /CHECK \(qty BETWEEN 1 AND 999\)/ },
+];
 
 /**
- * 作るセットの行の表 (ph_cdb_set_plan_items) の個数の CHECK を 2〜99 から 2〜999 に広げる (2026-10-26・100 個セット)。
+ * 1 つの表の個数の CHECK を広げる (2026-10-26・100 個 → 10,000 個のセット)。
  * 表は CREATE TABLE IF NOT EXISTS なので、本番 (Render) の DB は旧い CHECK のまま = 作り直す以外に手がない。
  * migrateLpSpecsKindCheck と同じ公式手順 (新しい表を作る → 行をコピー → 旧表を DROP → 改名 → 索引を作り直す) を 1 つの取引で行う。
  *   - BEGIN IMMEDIATE (書き込みの鍵を先に取る) で、取引の中でもう一度定義を見る = 2 つのプロセスが同時に起動しても作り直しは 1 回・後の方は何もしない
- *   - 列が思っていたものと違う (あとで ALTER で足した列がある)・この表を使うトリガー / ビューがある = 作り直さずに例外 (行や定義を落とさない。呼び手がログに出して起動は続ける)
- *   - 行は全部の列を明示してコピーし、前と後で全部の行 (並びも中身も) が同じか・外部キーの不整合が増えていないかを確かめる。違えば例外で ROLLBACK (旧い表のまま)
- *   - この表を参照する表は無い (子の側)。DROP / 改名の間だけ foreign_keys を切る (トランザクションの外でしか変えられない)
+ *   - 列が思っていたものと違う (あとで ALTER で足した列がある)・この表を使うトリガー / ビュー / この表を参照する外部キーがある
+ *     = 作り直さずに例外 (行や定義を落とさない。呼び手がログに出して起動は続ける)
+ *   - 行は rowid ごと全部の列を明示してコピーし (並びも保つ)、前と後で全部の行 (rowid・中身) が同じか・外部キーの不整合が増えていないかを確かめる。
+ *     違えば例外で ROLLBACK (旧い表のまま)
+ *   - DROP / 改名の間だけ foreign_keys を切る (トランザクションの外でしか変えられない。ON DELETE CASCADE を起こさない)
  *   二度目以降は定義が新しいので何もしない (冪等)
  * @returns {{migrated: boolean}}
  */
-export function migrateSetPlanQtyCheck(db) {
-  const name = 'ph_cdb_set_plan_items';
+export function migrateSetQtyCheck(db, name) {
+  const t = SET_QTY_TABLES.find((x) => x.name === name);
+  if (!t) throw new Error(`知らない表: ${name}`);
   const sqlOf = () => db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(name)?.sql || '';
-  if (!OLD_SET_PLAN_QTY_CHECK.test(sqlOf())) return { migrated: false };
+  if (!t.old.test(sqlOf())) return { migrated: false };
   const fkWas = db.pragma('foreign_keys', { simple: true });
   db.pragma('foreign_keys = OFF');   // DROP/改名の間だけ。トランザクションの外でしか変えられない
   let migrated = false;
   try {
     db.transaction(() => {
-      if (!OLD_SET_PLAN_QTY_CHECK.test(sqlOf())) return;   // 鍵を待つ間に、ほかのプロセスが作り直した
-      const want = SET_PLAN_ITEMS_COLS.split(', ');
+      if (!t.old.test(sqlOf())) return;   // 鍵を待つ間に、ほかのプロセスが作り直した
+      const want = t.cols.split(', ');
       const have = db.pragma(`table_info(${name})`).map((c) => c.name);
       if (have.length !== want.length || have.some((c) => !want.includes(c))) {
         throw new Error(`${name} の列が思っていたものと違う (${have.join(', ')}) ので作り直さない`);
       }
       const users = db.prepare("SELECT type, name FROM sqlite_master WHERE type IN ('trigger', 'view') AND (tbl_name = ? OR sql LIKE ?)").all(name, `%${name}%`);
       if (users.length) throw new Error(`${name} を使うトリガー / ビューがある (${users.map((u) => `${u.type} ${u.name}`).join(', ')}) ので作り直さない`);
+      const refs = db.prepare("SELECT m.name FROM sqlite_master m, pragma_foreign_key_list(m.name) f WHERE m.type = 'table' AND m.name <> ? AND f.\"table\" = ?").all(name, name);
+      if (refs.length) throw new Error(`${name} を参照する表がある (${refs.map((r) => r.name).join(', ')}) ので作り直さない`);
       // 決まった索引のほかに張った索引 (あれば) も張り直す (DROP TABLE で道連れになる)
-      const known = new Set(['idx_ph_cdb_set_plan_items_code', 'idx_ph_cdb_set_plan_items_draft']);
+      const known = new Set(t.indexes.map((ix) => /INDEX IF NOT EXISTS (\S+)/.exec(ix)[1]));
       const extraIndexes = db.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL").all(name)
         .filter((r) => !known.has(r.name)).map((r) => r.sql);
-      const rowsOf = (t) => JSON.stringify(db.prepare(`SELECT ${SET_PLAN_ITEMS_COLS} FROM ${t} ORDER BY request_id, sort`).raw().all());
+      const rowsOf = (x) => JSON.stringify(db.prepare(`SELECT rowid, ${t.cols} FROM ${x} ORDER BY ${t.order}`).raw().all());
       const fkBefore = db.pragma(`foreign_key_check(${name})`).length;
       const before = rowsOf(name);
       const tmp = `${name}__new`;
       db.exec(`DROP TABLE IF EXISTS ${tmp}`);
-      db.exec(SET_PLAN_ITEMS_DDL(tmp));
-      db.exec(`INSERT INTO ${tmp} (${SET_PLAN_ITEMS_COLS}) SELECT ${SET_PLAN_ITEMS_COLS} FROM ${name}`);
+      db.exec(t.ddl(tmp));
+      db.exec(`INSERT INTO ${tmp} (rowid, ${t.cols}) SELECT rowid, ${t.cols} FROM ${name}`);
       db.exec(`DROP TABLE ${name}`);
       db.exec(`ALTER TABLE ${tmp} RENAME TO ${name}`);
-      for (const ix of SET_PLAN_ITEMS_INDEXES) db.exec(ix);
+      for (const ix of t.indexes) db.exec(ix);
       for (const ix of extraIndexes) db.exec(ix);
       if (rowsOf(name) !== before) throw new Error(`${name} の作り直しで行が変わった`);
       const fkAfter = db.pragma(`foreign_key_check(${name})`).length;
       if (fkAfter > fkBefore) throw new Error(`${name} の作り直しで外部キーの不整合が増えた (${fkBefore} → ${fkAfter} 件)`);
-      if (OLD_SET_PLAN_QTY_CHECK.test(sqlOf())) throw new Error(`${name} の作り直しの後も旧い定義のまま`);
+      if (t.old.test(sqlOf())) throw new Error(`${name} の作り直しの後も旧い定義のまま`);
       migrated = true;
     }).immediate();
   } finally {
     db.pragma(`foreign_keys = ${fkWas ? 'ON' : 'OFF'}`);
   }
-  if (migrated) console.log(`[product-hub] 作るセットの表 (${name}) の個数の CHECK を 2〜999 に広げた`);
+  if (migrated) console.log(`[product-hub] ${t.label}の表 (${name}) の個数の CHECK を ${t.want} に広げた`);
   return { migrated };
 }
+/** 作るセットの行の表 (前のコミットの名前・smoke が呼ぶ) */
+export const migrateSetPlanQtyCheck = (db) => migrateSetQtyCheck(db, 'ph_cdb_set_plan_items');
 
 // 「自社商品」の重要度は own_brand チェックと連動する (2026-08-24 中原さん要望)
 export const OWN_BRAND_IMAGE_PRIORITY = '自社商品（重要度：高）';
@@ -1437,16 +1468,8 @@ export function initProductHubDB() {
     CREATE INDEX IF NOT EXISTS idx_dms_mall ON draft_mall_status(mall, state);
     CREATE INDEX IF NOT EXISTS idx_dms_assignee ON draft_mall_status(assignee_id, state);
 
-    -- セット商品の構成 (2026-08-23)。工程「セット商品作成検討」で単品から派生させたとき、
-    -- 「何を何個まとめたセットか」を持つ。AI に説明文を書かせるときの文脈にも使う
-    -- (これが無いと単品のコピーみたいなタイトルになる)
-    CREATE TABLE IF NOT EXISTS draft_set_members (
-      set_draft_id   INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
-      member_ne_code TEXT NOT NULL,
-      qty            INTEGER NOT NULL DEFAULT 1 CHECK (qty BETWEEN 1 AND 999),
-      sort           INTEGER NOT NULL DEFAULT 0,
-      PRIMARY KEY (set_draft_id, member_ne_code)
-    );
+    -- セット商品の構成 (2026-08-23・定義は DRAFT_SET_MEMBERS_DDL = 個数の CHECK を広げる作り直し (migrateSetQtyCheck) と同じ)
+    ${DRAFT_SET_MEMBERS_DDL('draft_set_members')}
 
     -- セットの画像の引き継ぎ計画 (2026-09-04 要件定義 §4.7)。
     -- 中原さん: 「詳細画像の既定は『作らない』ではなく、単品の詳細画像の**何枚目を修正**みたいな形で
@@ -1981,12 +2004,17 @@ export function initProductHubDB() {
   `);
   // items の定義は個数の CHECK を広げる作り直し (migrateSetPlanQtyCheck) と同じものを使う
   db.exec(SET_PLAN_ITEMS_DDL('ph_cdb_set_plan_items'));
-  // 🆕 2026-10-26: 個数の CHECK を 2〜99 → 2〜999 に広げる (100 個セット)。既に新しい定義なら何もしない。索引は作り直しのあと (作り直しが張り直す・新しい DB はここで張る)。
-  // 🚨 失敗しても起動は止めない。旧い定義のままだと、100 個以上の作るセットだけが書けない (登録の画面は「作るセットを product-hub に残せない」で止まる = 単品も登録しない)
-  try {
-    migrateSetPlanQtyCheck(db);
-  } catch (e) {
-    console.error('[product-hub] 作るセットの表 (ph_cdb_set_plan_items) の作り直しに失敗 (旧い定義のまま動く。100 個以上の作るセットは書けない):', e.message);
+  // 🆕 2026-10-26: 個数の CHECK を広げる (作るセットの行 2〜99 → 2〜10000・セットの構成 1〜999 → 1〜10000)。既に新しい定義なら何もしない。
+  //   索引は作り直しのあと (作り直しが張り直す・新しい DB はここで張る)。表ごとに別の取引 (片方が落ちても、もう片方は広げる)
+  // 🚨 失敗しても起動は止めない。旧い定義のままだと、
+  //   作るセットの行 = 100 個以上の作るセットが書けない (登録の画面は「作るセットを product-hub に残せない」で止まる = 単品も登録しない)・
+  //   セットの構成 = 1000 個以上のセットの下書き / カードの構成が書けない (下書きを作れない・取り込みで構成が入らない)
+  for (const t of SET_QTY_TABLES) {
+    try {
+      migrateSetQtyCheck(db, t.name);
+    } catch (e) {
+      console.error(`[product-hub] ${t.label}の表 (${t.name}) の作り直しに失敗 (旧い定義のまま動く。大きい個数は書けない):`, e.message);
+    }
   }
   for (const ix of SET_PLAN_ITEMS_INDEXES) db.exec(ix);
   // 🆕 2026-10-21: セットの登録 (マスタの入力) が引き継ぐ「作るセットの下書き」の予約 (services/cdb-set-plan.js の reserveSetCardTakeover)。

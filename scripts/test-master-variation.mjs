@@ -911,7 +911,10 @@ await ta('[S2] 本文の差: 0067 が置き換えた関数は前の最後の版�
     assert.deepEqual(d, { removed: want.removed, added: want.added }, `${name}: ${prev} との差`);
     // 例外は名指しの 1 つ: 🆕 10/20 (0097 仮番号・reg_csv_one_file) が ops.ne_reg_build を 0067 の版から写す = その差は下の [S4] が確かめる
     const oneFile = (x) => name === 'ops.ne_reg_build' && /^\d{4}_reg_csv_one_file\.sql$/.test(x);
-    for (const later of MIG_FILES.filter((x) => x > F0067 && !oneFile(x))) assert.equal(fnDefIn(later, name), null, `${later} も ${name} を作り直している = 0067 の試験の元を見直す`);
+    //   🆕 10/26 (0102 仮番号・set_component_qty_10000) が ops.ne_reg_canonical を 0067 の版から写す (セットの構成品の数量の止め 999 → 10,000 だけ) = その差は
+    //   scripts/test-master-reg-csv.mjs の [V2] が 0067 との差で確かめる
+    const qty10k = (x) => name === 'ops.ne_reg_canonical' && /^\d{4}_set_component_qty_10000\.sql$/.test(x);
+    for (const later of MIG_FILES.filter((x) => x > F0067 && !oneFile(x) && !qty10k(x))) assert.equal(fnDefIn(later, name), null, `${later} も ${name} を作り直している = 0067 の試験の元を見直す`);
   }
   // 形の版の決まり = variation-v1 の 1 行 (buildable / why) だけ
   const sr = lineDiff(fnDefIn('0065_ne_reg_csv_versions.sql', 'ops.ne_reg_schema_rule').split('\n'), fnDefIn(F0067, 'ops.ne_reg_schema_rule').split('\n'));

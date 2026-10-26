@@ -655,8 +655,9 @@ await ta('[7] 形の誤り (400): 名前・売価・税率・分類・月数・�
   await b('set001', { tax_rate: '10' }, /セットでは直せません/);
   await b('set001', { components: [] }, /1〜20/);
   await b('set001', { components: Array.from({ length: 21 }, (_, i) => ({ code: `x${i}`, qty: 1 })) }, /1〜20/);
-  await b('set001', { components: [{ code: 's001', qty: 0 }] }, /1〜999/);
-  await b('set001', { components: [{ code: 's001', qty: 1000 }] }, /1〜999/);
+  // 🆕 2026-10-26 中原さん「10000 個まで上限上げて」: 構成品の数は 1〜10,000 (1000 は通る形・10,001 は断る)
+  await b('set001', { components: [{ code: 's001', qty: 0 }] }, /1〜10,000/);
+  await b('set001', { components: [{ code: 's001', qty: 10001 }] }, /1〜10,000/);
   await b('set001', { components: [{ code: 's001', qty: 1 }, { code: 'S001', qty: 2 }] }, /2 回/);
   await b('set001', { components: [{ code: 'set001', qty: 1 }] }, /セット自身/);
   await b('set001', { components: [{ code: 'set004', qty: 1 }] }, /入れ子/);
@@ -808,6 +809,9 @@ await ta('[11] 構成を変える = 依頼だけ (core は変えない)。NE で
   assert.deepEqual((await q('select status, close_reason from ops.sku_component_requests order by component_request_id')).map((x) => [x.status, x.close_reason]), [['cancelled', 'superseded'], ['cancelled', 'withdrawn']]);
   const re = await save('set001', { components: [{ code: 's002', qty: 1 }, { code: 's001', qty: 2 }] });
   assert.ok(re.ne_steps.some((s) => /並びを s002 → s001/.test(s)), JSON.stringify(re.ne_steps));
+  // 🆕 2026-10-26: 構成品 10,000 個の依頼も残せる (lib の MAX_QTY = 10,000・DB の ops.component_request_rows_ok は 1〜99,999 のまま)
+  await save('set001', { components: [{ code: 's001', qty: 10000 }, { code: 's002', qty: 1 }] });
+  assert.deepEqual((await q("select rows from ops.sku_component_requests where status = 'open'"))[0].rows.map((x) => [x.code, x.qty]), [['s001', 10000], ['s002', 1]]);
   await save('set001', { components: [{ code: 's001', qty: 2 }, { code: 's002', qty: 1 }] });
   await assert.rejects(() => pg.query(`update ops.sku_component_requests set rows = '[{"sku_id":1,"qty":1,"sort":1}]'::jsonb`), /書き換えない|閉じた依頼/);
   await assert.rejects(() => pg.query('delete from ops.sku_component_requests'), /消さない/);

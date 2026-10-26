@@ -86,7 +86,7 @@
             </table></div>
             <% if (canSave) { %><div class="csug" id="comp-suggest" role="listbox" aria-label="構成品の候補 (単品)" hidden></div><div class="sr" id="comp-suggest-status" role="status" aria-live="polite"></div><% } %>
             <template id="comp-tpl"><%- compRow(0) %></template>
-            <div style="display:flex;gap:12px;align-items:center;margin:6px 0 14px;flex-wrap:wrap"><button class="btn sm" type="button" id="comp-add"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-plus"/></svg>構成品を足す</button><span class="hint">コード・名前・JAN を <%= locals.COMPONENT_SEARCH_MIN || 2 %> 文字から打つと候補 (単品) が出ます (↑↓ と Enter で選ぶ) · 1〜<%= MAX_COMPONENTS %> 品 · 数は 1〜999 · 同じ品は 1 行 · セットは入れられません · 並びも入れたとおり</span></div>
+            <div style="display:flex;gap:12px;align-items:center;margin:6px 0 14px;flex-wrap:wrap"><button class="btn sm" type="button" id="comp-add"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-plus"/></svg>構成品を足す</button><span class="hint">コード・名前・JAN を <%= locals.COMPONENT_SEARCH_MIN || 2 %> 文字から打つと候補 (単品) が出ます (↑↓ と Enter で選ぶ) · 1〜<%= MAX_COMPONENTS %> 品 · 数は 1〜10,000 · 同じ品は 1 行 · セットは入れられません · 並びも入れたとおり</span></div>
           </div>
           <div class="tiles" id="set-tiles" aria-live="polite">
             <div class="tile" id="t-tax"><div class="tl2">税率<span class="est">見込み</span></div><div class="tv">—</div><div class="tr">構成品を入れると出ます</div></div>
@@ -224,7 +224,7 @@
             <%# 🆕 2026-10-17 中原さん: 「作る」のときは何個セットを作るかも聞いて、セット商品コードと名前をここで作る (lib/set-plan.mjs の決まり・画面の動き = public/me-new.js)。
                 コード = 単品のコード-個数・名前 = 単品の名前 個数個セット (どちらも直せる)。保存すると product-hub に「セットの下書き」ができる
                 (NE に登録して取り込まれるまで出品しない・Company DB にはまだ作らない) %>
-            <% const spl = locals.setPlanLimits || { max: 10, qtyMin: 2, qtyMax: 999, nameMax: 255, alertDays: 3 }; %>
+            <% const spl = locals.setPlanLimits || { max: 10, qtyMin: 2, qtyMax: 10000, nameMax: 255, alertDays: 3 }; %>
             <div class="f" data-row="card.sets" id="row-set-plans" hidden style="align-items:start" data-max="<%= spl.max %>" data-qty-min="<%= spl.qtyMin %>" data-qty-max="<%= spl.qtyMax %>" data-name-max="<%= spl.nameMax %>">
               <div class="lab" id="lab-set-plans" style="padding-top:8px">作るセット</div>
               <div class="ctl col" style="gap:0">
@@ -237,7 +237,7 @@
                   <td><input class="in sp-name" style="width:100%;min-width:220px" maxlength="<%= spl.nameMax %>" autocomplete="off" aria-label="セット商品名"<%= dis %>></td>
                   <td class="acts"><button type="button" class="iconbtn del" data-sp-del aria-label="このセットを外す"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-trash"/></svg></button></td></tr></template>
                 <div style="display:flex;gap:12px;align-items:center;margin:6px 0 4px;flex-wrap:wrap"><button class="btn sm" type="button" id="set-plan-add"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-plus"/></svg>セットを足す</button>
-                  <span class="hint"><%= spl.qtyMin %>〜<%= spl.qtyMax %> 個 · <%= spl.max %> セットまで · コード = 単品のコード-個数・名前 = 単品の名前 個数個セット (直せます) · 使ったことのないコード (打つとその場で確かめます)</span></div>
+                  <span class="hint"><%= spl.qtyMin %>〜<%= Number(spl.qtyMax).toLocaleString('ja-JP') %> 個 · <%= spl.max %> セットまで · コード = 単品のコード-個数・名前 = 単品の名前 個数個セット (直せます) · 使ったことのないコード (打つとその場で確かめます)</span></div>
                 <span class="hint">保存すると product-hub に「セットの下書き」ができます (構成 = この単品 × 個数・売価の初めの値 = 単品の売価 × 個数)。NE にセット商品を登録して取り込まれるまで、どのモールにも出品しません。<%= spl.alertDays %> 日たっても NE に無いと product-hub のボードに ⚠ が出ます</span>
               </div></div>
             <div class="f" id="row-set-reason" hidden><label class="lab" for="set-reason">作らない理由・メモ</label>

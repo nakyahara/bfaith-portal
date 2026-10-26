@@ -11,6 +11,7 @@
  * buildItemPayload が provisional_code=1 を見て出品を止める (出品直前ゲート)。
  */
 import { getDB, logEvent } from '../db.js';
+import { COMPONENT_QTY_MAX } from '../../../lib/set-plan.mjs';
 import { ensureProgress, setStepState, IMAGE_RAKUTEN_STAGE } from '../lib/workflow-progress.js';
 import { SET_NE_STEP_CODE } from '../lib/set-decision.js';
 // 画像の引き継ぎ計画 (§4.7)。枠の数え方・語彙・「制作が要るか」の判定は lib 側が正
@@ -21,7 +22,7 @@ import {
 } from '../lib/set-image-plan.js';
 import { resolveVariationGroup } from '../lib/variation.js';
 // 売価の初期値 (§4.4 決⑦)。作成時に入れる値と画面に出す「由来」で同じ計算を使う
-import { setPriceFromMembers, describeSetPrice } from '../lib/set-price.js';
+import { setPriceFromMembers, describeSetPrice, SET_PRICE_MAX } from '../lib/set-price.js';
 // 判断の語彙・理由・表示名は lib 側が正 (カードを組み立てる workflow-progress.js も同じものを使う)
 import {
   SET_DECISIONS, SET_DECISIONS_CLOSING, SET_DECISION_REASONS, NE_STATE_LABELS, describeSetDecision,
@@ -118,7 +119,7 @@ export function createSetDraft(parentDraftId, opts, actor, ctx = { isAdmin: fals
     // 丸めてから整数判定すると 1.5 が黙って 2 個になる (Codex R5)。小数はそのまま弾く
     const qty = Number(m?.qty);
     if (!code) throw badRequest('構成の商品コードが空です');
-    if (!Number.isInteger(qty) || qty < 1 || qty > 999) throw badRequest(`「${code}」の個数が不正です (1〜999の整数)`);
+    if (!Number.isInteger(qty) || qty < 1 || qty > COMPONENT_QTY_MAX) throw badRequest(`「${code}」の個数が不正です (1〜${COMPONENT_QTY_MAX.toLocaleString('ja-JP')}の整数)`);
     const key = code.toLowerCase();
     if (seen.has(key)) throw badRequest(`構成に「${code}」が重複しています`);
     seen.add(key);
@@ -304,7 +305,9 @@ function afterSetDraftRows(db, setId, parent, { memberText, dropped, priceInit, 
   logEvent(db, setId, 'price_prefilled',
     priceInit.total != null
       ? `売価の初期値 ${describeSetPrice(priceInit)} を入れました (税込。送料・値引きは含みません)`
-      : `売価の初期値は入れていません (単価が引けない商品: ${priceInit.missing.filter(Boolean).join(', ') || '不明'})`,
+      : priceInit.tooLarge
+        ? `売価の初期値は入れていません (単価 × 個数の合計 ${Number(priceInit.sum).toLocaleString()}円 が売価の上限 ${SET_PRICE_MAX.toLocaleString()}円 を超えます)`
+        : `売価の初期値は入れていません (単価が引けない商品: ${priceInit.missing.filter(Boolean).join(', ') || '不明'})`,
     actor);
   // 画像の引き継ぎ計画 (§4.7)。親の全枠を「そのまま使う」で作り、その画像をコピーする。
   // 直したい枠は作成後に画像タブで変える (変えると制作工程が戻る)

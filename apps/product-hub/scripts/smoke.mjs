@@ -4028,6 +4028,10 @@ let wfSetParentId = null;
   let qtyErr = null;
   try { sd.createSetDraft(parentId, { mode: 'ai', members: [{ ne_code: 'X', qty: 0 }] }, 'smoke'); } catch (e) { qtyErr = e; }
   check('個数を検証する', qtyErr?.status === 400);
+  // 🆕 2026-10-26 中原さん「10000 個まで上限上げて」: 1〜10,000 (10,001 = 400)
+  let bigErr = null;
+  try { sd.createSetDraft(parentId, { mode: 'ai', members: [{ ne_code: 'X', qty: 10001 }] }, 'smoke'); } catch (e) { bigErr = e; }
+  check('個数の上限は 10,000 (10,001 = 400・一言に 1〜10,000)', bigErr?.status === 400 && /1〜10,000の整数/.test(bigErr.message), bigErr?.message || '例外が出ていない');
   // 🚨 未指定 (親×2 の既定) と「空を明示」を区別する。API だけ黙って別の構成に化けさせない
   let emptyErr = null;
   try { sd.createSetDraft(parentId, { mode: 'ai', members: [] }, 'smoke'); } catch (e) { emptyErr = e; }
@@ -14895,7 +14899,7 @@ for (const [name, file, data] of renders) {
   }
 }
 
-// ─── 🆕 2026-10-26: 作るセットの行の表 (ph_cdb_set_plan_items) の個数の CHECK を 2〜99 → 2〜999 に広げる作り直し (migrateSetPlanQtyCheck) ───
+// ─── 🆕 2026-10-26: 作るセットの行の表 (ph_cdb_set_plan_items) の個数の CHECK を 2〜99 → 2〜10000 に広げる作り直し (migrateSetQtyCheck) ───
 // 本番 (Render) の DB は 10-17〜10-26 の定義 (2〜99) で行が入っている。行をそのまま保って作り直せること・100 を書けること・二度目は何もしないことを、
 // 旧い DDL を写した別の DB で確かめる
 {
@@ -14938,9 +14942,10 @@ for (const [name, file, data] of renders) {
   const m1 = dbmod.migrateSetPlanQtyCheck(mdb);
   check('個数の作り直し: 旧い定義 (2〜99) = 作り直す', m1.migrated === true, JSON.stringify(m1));
   check('個数の作り直し: 行は全部そのまま (並び・中身・作った下書き・skipped の理由)', JSON.stringify(rowsOf()) === before, JSON.stringify(rowsOf()));
-  check('個数の作り直し: 新しい定義は 2〜999',
-    /CHECK \(qty BETWEEN 2 AND 999\)/.test(mdb.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ph_cdb_set_plan_items'").get().sql));
-  check('個数の作り直し: 100・999 を書ける / 1000・1 は断る', ins100(2, 100) === 'ok' && ins100(3, 999) === 'ok' && ins100(4, 1000) === 'check' && ins100(5, 1) === 'check');
+  check('個数の作り直し: 新しい定義は 2〜10000',
+    /CHECK \(qty BETWEEN 2 AND 10000\)/.test(mdb.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ph_cdb_set_plan_items'").get().sql));
+  check('個数の作り直し: 100・999・1000・10000 を書ける / 10001・1 は断る', ins100(2, 100) === 'ok' && ins100(3, 999) === 'ok' && ins100(6, 1000) === 'ok' && ins100(7, 10000) === 'ok'
+    && ins100(4, 10001) === 'check' && ins100(5, 1) === 'check');
   check('個数の作り直し: 索引が張り直されている', mdb.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'index' AND name IN ('idx_ph_cdb_set_plan_items_code', 'idx_ph_cdb_set_plan_items_draft')").get().n === 2);
   check('個数の作り直し: 主キー (request_id, sort) が効く', ins100(0, 120) !== 'ok');
   check('個数の作り直し: 外部キーは有効のまま・不整合なし・作るセットの表 (親) は触らない',
@@ -14950,7 +14955,7 @@ for (const [name, file, data] of renders) {
   check('個数の作り直し: 作業用の表 (__new) が残っていない', mdb.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE name LIKE '%__new'").get().n === 0);
   check('個数の作り直し: 二度目は何もしない (冪等)', dbmod.migrateSetPlanQtyCheck(mdb).migrated === false);
   check('個数の作り直し: 本番の init で作った (新しい定義の) DB でも何もしない', dbmod.migrateSetPlanQtyCheck(db).migrated === false
-    && /CHECK \(qty BETWEEN 2 AND 999\)/.test(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ph_cdb_set_plan_items'").get().sql));
+    && /CHECK \(qty BETWEEN 2 AND 10000\)/.test(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ph_cdb_set_plan_items'").get().sql));
   mdb.close();
   try { fs.unlinkSync(mpath); } catch { /* 無ければ無視 */ }
   // init の配線: 本番 (Render) の DB と同じく旧い定義 (2〜99) の表で起動 = init (initProductHubDB) が作り直す・行と索引はそのまま
@@ -14969,8 +14974,8 @@ for (const [name, file, data] of renders) {
     check('個数の作り直し (init): 前提 = 旧い定義', /BETWEEN 2 AND 99\)/.test(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ph_cdb_set_plan_items'").get().sql));
     dbmod._resetInitForTest();
     dbmod.initProductHubDB();
-    check('個数の作り直し (init): 起動で 2〜999 に作り直す・行はそのまま・索引 2 つ・foreign_keys は ON',
-      /CHECK \(qty BETWEEN 2 AND 999\)/.test(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ph_cdb_set_plan_items'").get().sql)
+    check('個数の作り直し (init): 起動で 2〜10000 に作り直す・行はそのまま・索引 2 つ・foreign_keys は ON',
+      /CHECK \(qty BETWEEN 2 AND 10000\)/.test(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ph_cdb_set_plan_items'").get().sql)
       && JSON.stringify(db.prepare('SELECT * FROM ph_cdb_set_plan_items ORDER BY request_id, sort').all()) === was
       && db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'index' AND name IN ('idx_ph_cdb_set_plan_items_code', 'idx_ph_cdb_set_plan_items_draft')").get().n === 2
       && db.pragma('foreign_keys', { simple: true }) === 1);
@@ -15039,7 +15044,7 @@ for (const [name, file, data] of renders) {
     } });
     const r2 = dbmod.migrateSetPlanQtyCheck(late);
     check('個数の作り直し (2 つの接続): 鍵を待つ間にほかが作り直した = 何もしない (行はそのまま・新しい定義)', r2.migrated === false
-      && /CHECK \(qty BETWEEN 2 AND 999\)/.test(b.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ph_cdb_set_plan_items'").get().sql)
+      && /CHECK \(qty BETWEEN 2 AND 10000\)/.test(b.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ph_cdb_set_plan_items'").get().sql)
       && JSON.stringify(b.prepare('SELECT * FROM ph_cdb_set_plan_items ORDER BY request_id, sort').all()) === rowsBefore
       && b.pragma('foreign_keys', { simple: true }) === 1, JSON.stringify(r2));
     a.close(); b.close();
@@ -15047,25 +15052,119 @@ for (const [name, file, data] of renders) {
   }
 }
 
-// ─── 🆕 2026-10-26: 作るセットの個数 100 / 999 (中原さん: tbbk-100 = 100 個セット) を残して、セットの下書きを作れる (services/cdb-set-plan.js) ───
+// ─── 🆕 2026-10-26: セットの構成の表 (draft_set_members) の個数の CHECK を 1〜999 → 1〜10000 に広げる作り直し (migrateSetQtyCheck・中原さん「10000 個まで上限上げて」) ───
+// 本番 (Render) の DB は 2026-08-23 の定義 (1〜999) で行が入っている。rowid・行・外部キー (ON DELETE CASCADE) をそのまま保って作り直せること
+{
+  const Database = (await import('better-sqlite3')).default;
+  const OLD_MEMBERS_DDL = `
+    CREATE TABLE draft_set_members (
+      set_draft_id   INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      member_ne_code TEXT NOT NULL,
+      qty            INTEGER NOT NULL DEFAULT 1 CHECK (qty BETWEEN 1 AND 999),
+      sort           INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (set_draft_id, member_ne_code)
+    );`;
+  const mk = () => {
+    const x = new Database(':memory:');
+    x.pragma('foreign_keys = ON');
+    x.exec(`CREATE TABLE product_drafts (id INTEGER PRIMARY KEY AUTOINCREMENT, ne_code TEXT NOT NULL UNIQUE, name TEXT NOT NULL);
+      INSERT INTO product_drafts (id, ne_code, name) VALUES (1, 'tbbk', '歯ブラシ'), (2, 'tbbk-700', '700 個セット'), (3, 'mix-2', '組み合わせ');` + OLD_MEMBERS_DDL + `
+      INSERT INTO draft_set_members (set_draft_id, member_ne_code, qty, sort) VALUES (2, 'tbbk', 700, 0), (3, 'b', 1, 1), (3, 'a', 999, 0), (3, 'zz', 5, 2);
+      DELETE FROM draft_set_members WHERE member_ne_code = 'zz';
+      INSERT INTO draft_set_members (set_draft_id, member_ne_code, qty, sort) VALUES (3, 'c', 2, 3);`);
+    x.pragma('foreign_keys = OFF');   // 消した下書きの構成 (孤児) = 前からある不整合。作り直しで増やさない・消さない
+    x.prepare("INSERT INTO draft_set_members (set_draft_id, member_ne_code, qty, sort) VALUES (99, 'gone', 3, 0)").run();
+    x.pragma('foreign_keys = ON');
+    return x;
+  };
+  const mdb = mk();
+  const rowsOf = (x) => JSON.stringify(x.prepare('SELECT rowid, * FROM draft_set_members ORDER BY rowid').all());
+  const sqlOf = (x) => x.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'draft_set_members'").get()?.sql || '';
+  const put = (x, id, code, qty) => { try { x.prepare('INSERT INTO draft_set_members (set_draft_id, member_ne_code, qty, sort) VALUES (?, ?, ?, 9)').run(id, code, qty); return 'ok'; } catch (e) { return /CHECK/.test(e.message) ? 'check' : /FOREIGN KEY/.test(e.message) ? 'fk' : e.message; } };
+  const before = rowsOf(mdb);
+  const fkBefore = mdb.pragma('foreign_key_check').length;
+  check('構成の作り直し: 移行前は 1000 を CHECK で断る (前提の確認)', put(mdb, 1, 'x', 1000) === 'check' && fkBefore === 1);
+  const m1 = dbmod.migrateSetQtyCheck(mdb, 'draft_set_members');
+  check('構成の作り直し: 旧い定義 (1〜999) = 作り直す', m1.migrated === true, JSON.stringify(m1));
+  check('構成の作り直し: 行は rowid ごと全部そのまま (消した行の後の rowid・孤児も)', rowsOf(mdb) === before, rowsOf(mdb));
+  check('構成の作り直し: 新しい定義は 1〜10000 (既定 1・主キー・外部キー ON DELETE CASCADE も同じ)',
+    /CHECK \(qty BETWEEN 1 AND 10000\)/.test(sqlOf(mdb)) && /DEFAULT 1/.test(sqlOf(mdb)) && /PRIMARY KEY \(set_draft_id, member_ne_code\)/.test(sqlOf(mdb))
+    && /REFERENCES product_drafts\(id\) ON DELETE CASCADE/.test(sqlOf(mdb)), sqlOf(mdb));
+  check('構成の作り直し: 10000 を書ける / 10001・0 は断る / 親の無い行は外部キーで断る',
+    put(mdb, 1, 'x', 10000) === 'ok' && put(mdb, 1, 'y', 10001) === 'check' && put(mdb, 1, 'z', 0) === 'check' && put(mdb, 77, 'w', 2) === 'fk');
+  check('構成の作り直し: 外部キーは有効のまま・不整合は増えない (孤児 1 件は前から)', mdb.pragma('foreign_keys', { simple: true }) === 1 && mdb.pragma('foreign_key_check').length === fkBefore);
+  mdb.prepare('DELETE FROM product_drafts WHERE id = 3').run();
+  check('構成の作り直し: 下書きを消すと構成も消える (ON DELETE CASCADE が効く)', mdb.prepare('SELECT COUNT(*) AS n FROM draft_set_members WHERE set_draft_id = 3').get().n === 0
+    && mdb.prepare('SELECT COUNT(*) AS n FROM draft_set_members WHERE set_draft_id = 2').get().n === 1);
+  check('構成の作り直し: 作業用の表 (__new) が残っていない・二度目は何もしない (冪等)',
+    mdb.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'draft_set_members__new'").get().n === 0 && dbmod.migrateSetQtyCheck(mdb, 'draft_set_members').migrated === false);
+  mdb.close();
+  // 途中で落ちた = ROLLBACK (旧い定義・行のまま・foreign_keys は ON)。この表を参照する表がある = 作り直さない
+  {
+    const x = mk();
+    const was = rowsOf(x), sqlWas = sqlOf(x);
+    const boom = new Proxy(x, { get(t, k) {
+      if (k === 'exec') return (sql) => { if (/RENAME TO/.test(sql)) throw new Error('注入した失敗'); return t.exec(sql); };
+      const v = t[k]; return typeof v === 'function' ? v.bind(t) : v;
+    } });
+    let err = null;
+    try { dbmod.migrateSetQtyCheck(boom, 'draft_set_members'); } catch (e) { err = e; }
+    check('構成の作り直し: 改名で落ちた = ROLLBACK (旧い定義・行のまま・__new なし・foreign_keys は ON)', !!err && /注入/.test(err.message) && sqlOf(x) === sqlWas && rowsOf(x) === was
+      && x.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'draft_set_members__new'").get().n === 0 && x.pragma('foreign_keys', { simple: true }) === 1 && !x.inTransaction, String(err && err.message));
+    x.exec('CREATE TABLE refs_members (a INTEGER, b TEXT, FOREIGN KEY (a, b) REFERENCES draft_set_members(set_draft_id, member_ne_code))');
+    err = null;
+    try { dbmod.migrateSetQtyCheck(x, 'draft_set_members'); } catch (e) { err = e; }
+    check('構成の作り直し: この表を参照する表がある = 作り直さずに例外 (定義も行もそのまま)', !!err && /参照する表がある/.test(err.message) && sqlOf(x) === sqlWas && rowsOf(x) === was, String(err && err.message));
+    x.close();
+  }
+  // init の配線: 本番と同じく旧い定義 (1〜999) の表で起動 = init が作り直す・行 (rowid も) はそのまま
+  {
+    db.pragma('foreign_keys = OFF');
+    const keep = db.prepare('SELECT rowid AS r, * FROM draft_set_members ORDER BY rowid').all();
+    db.exec('DROP TABLE draft_set_members');
+    db.exec(OLD_MEMBERS_DDL);
+    const ins = db.prepare('INSERT INTO draft_set_members (rowid, set_draft_id, member_ne_code, qty, sort) VALUES (?, ?, ?, ?, ?)');
+    for (const r of keep) ins.run(r.r, r.set_draft_id, r.member_ne_code, r.qty, r.sort);
+    db.pragma('foreign_keys = ON');
+    const was = rowsOf(db);
+    check('構成の作り直し (init): 前提 = 旧い定義・行がある', /BETWEEN 1 AND 999\)/.test(sqlOf(db)) && keep.length > 0, String(keep.length));
+    dbmod._resetInitForTest();
+    dbmod.initProductHubDB();
+    check('構成の作り直し (init): 起動で 1〜10000 に作り直す・行 (rowid も) はそのまま・foreign_keys は ON',
+      /CHECK \(qty BETWEEN 1 AND 10000\)/.test(sqlOf(db)) && rowsOf(db) === was && db.pragma('foreign_keys', { simple: true }) === 1);
+  }
+}
+
+// ─── 🆕 2026-10-26: 作るセットの個数 100 / 10,000 (中原さん: tbbk-100 = 100 個セット → 「10000 個まで上限上げて」) を残して、セットの下書きを作れる (services/cdb-set-plan.js) ───
 {
   const sp = await import('../services/cdb-set-plan.js');
   const parent = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('SMK-QTY', 'インスタント歯ブラシ', 'smoke')`).run().lastInsertRowid);
   const rid = '00000000-0000-4000-8000-0000000a0100';
   const rh = 'c'.repeat(64);
   sp.writeSetPlan({ requestId: rid, requestHash: rh, parentCode: 'SMK-QTY', parentName: 'インスタント歯ブラシ',
-    sets: [{ qty: 100, code: 'SMK-QTY-100', name: 'インスタント歯ブラシ 100個セット' }, { qty: '９９９', code: 'SMK-QTY-999', name: 'インスタント歯ブラシ 999個セット' }], actor: 'smoke' });
-  check('作るセット 100 / 999: 表に残る (個数は数)', JSON.stringify(sp.readSetPlan(rid).items.map((x) => x.qty)) === '[100,999]');
+    sets: [{ qty: 100, code: 'SMK-QTY-100', name: 'インスタント歯ブラシ 100個セット' }, { qty: '１００００', code: 'SMK-QTY-10000', name: 'インスタント歯ブラシ 10000個セット' }], actor: 'smoke' });
+  check('作るセット 100 / 10000: 表に残る (個数は数)', JSON.stringify(sp.readSetPlan(rid).items.map((x) => x.qty)) === '[100,10000]');
   const out = db.transaction(() => sp.applySetPlanInTx(db, { requestId: rid, requestHash: rh, parentCode: 'SMK-QTY', parentDraftId: parent, skuId: null }))();
-  check('作るセット 100 / 999: セットの下書きを 2 枚作る', out && out.created.length === 2 && out.skipped.length === 0, JSON.stringify(out));
+  check('作るセット 100 / 10000: セットの下書きを 2 枚作る', out && out.created.length === 2 && out.skipped.length === 0, JSON.stringify(out));
   const members = out.created.map((c) => db.prepare('SELECT member_ne_code AS code, qty FROM draft_set_members WHERE set_draft_id = ?').all(c.draft_id));
-  check('作るセット 100 / 999: 構成 = 単品 × 100 / × 999', JSON.stringify(members) === JSON.stringify([[{ code: 'SMK-QTY', qty: 100 }], [{ code: 'SMK-QTY', qty: 999 }]]), JSON.stringify(members));
-  check('作るセット 100 / 999: 下書きは仮のコード (NE で確かめるまで出さない)・名前はそのまま',
+  check('作るセット 100 / 10000: 構成 = 単品 × 100 / × 10000 (draft_set_members の CHECK も 1〜10000)', JSON.stringify(members) === JSON.stringify([[{ code: 'SMK-QTY', qty: 100 }], [{ code: 'SMK-QTY', qty: 10000 }]]), JSON.stringify(members));
+  check('作るセット 100 / 10000: 下書きは仮のコード (NE で確かめるまで出さない)・名前はそのまま',
     out.created.every((c) => db.prepare('SELECT provisional_code FROM product_drafts WHERE id = ?').get(c.draft_id).provisional_code === 1)
     && db.prepare('SELECT name FROM product_drafts WHERE id = ?').get(out.created[0].draft_id).name === 'インスタント歯ブラシ 100個セット');
   let e1000 = null;
-  try { sp.writeSetPlan({ requestId: '00000000-0000-4000-8000-0000000a1000', requestHash: rh, parentCode: 'SMK-QTY', parentName: 'x', sets: [{ qty: 1000, code: 'SMK-QTY-1000', name: 'x' }], actor: 'smoke' }); } catch (e) { e1000 = e; }
-  check('作るセット 1000 = 400 (2〜999 の整数)・残さない', e1000 && e1000.status === 400 && /2〜999/.test(e1000.message) && sp.readSetPlan('00000000-0000-4000-8000-0000000a1000') === null, String(e1000 && e1000.message));
+  try { sp.writeSetPlan({ requestId: '00000000-0000-4000-8000-0000000a1000', requestHash: rh, parentCode: 'SMK-QTY', parentName: 'x', sets: [{ qty: 10001, code: 'SMK-QTY-10001', name: 'x' }], actor: 'smoke' }); } catch (e) { e1000 = e; }
+  check('作るセット 10001 = 400 (2〜10,000 の整数)・残さない', e1000 && e1000.status === 400 && /2〜10,000 の整数/.test(e1000.message) && sp.readSetPlan('00000000-0000-4000-8000-0000000a1000') === null, String(e1000 && e1000.message));
+  // Codex R1 Medium: 売価の初期値 (単品の売価 × 個数) が売価の上限 (1 兆円 = product_drafts.price の CHECK) を超える = 初期値は入れずに下書きは作る (理由を記録)
+  const sdv = await import('../services/set-derive.js');
+  const sprice = await import('../lib/set-price.js');
+  const big = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, price, created_by) VALUES ('SMK-BIGP', '高い単品', 100000001, 'smoke')`).run().lastInsertRowid);
+  const calc = sprice.setPriceFromMembers(db, [{ ne_code: 'SMK-BIGP', qty: 10000 }]);
+  check('売価の初期値: 上限を超える = total なし・tooLarge', calc.total === null && calc.tooLarge === true && calc.sum === 1000000010000, JSON.stringify(calc));
+  check('売価の初期値: 上限の内側は入る (100,000,001 円 × 9,999 = 999,900,009,999 円)', sprice.setPriceFromMembers(db, [{ ne_code: 'SMK-BIGP', qty: 9999 }]).total === 999900009999);
+  const bigOut = db.transaction(() => sdv.createPlannedSetDraft(db, big, { qty: 10000, code: 'SMK-BIGP-10000', name: '高い単品 10000個セット' }, 'smoke'))();
+  const bigRow = bigOut.draftId ? db.prepare('SELECT price, provisional_code FROM product_drafts WHERE id = ?').get(bigOut.draftId) : null;
+  const bigEv = bigOut.draftId ? db.prepare("SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'price_prefilled'").get(bigOut.draftId) : null;
+  check('売価の初期値: 上限を超えても 10,000 個のセットの下書きはできる (売価は空・理由を記録)', !!bigRow && bigRow.price === null && bigRow.provisional_code === 1 && /売価の上限/.test(bigEv?.detail || ''), JSON.stringify({ bigOut, bigRow, bigEv }));
 }
 
 // ─── 🆕 2026-10-21: セットの登録 (マスタの入力) が作るセットの下書きを引き継げるか (services/cdb-set-plan.js の plannedSetCardCheck・読むだけ) ───
