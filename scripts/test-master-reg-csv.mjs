@@ -838,6 +838,23 @@ await ta('[C11] 🆕 0099: セットの版 ne-reg-set-v2 は試し用の門な�
   assert.equal((await q("select 1 from ops.ne_csv_verified where kind = 'sets' and verified_by <> 'ne_compare'")).length, 0, 'セットの実機の確かめを人が押すことは無い');
 });
 
+await ta('[C19] 🆕 0102 (2026-10-26 中原さん「10000 個まで上限上げて」): 構成品 10,000 個のセット = 登録できる (DB の ops.new_set_derivation)・NE 登録の CSV の suryo = 10000 (lib と DB の ops.ne_reg_canonical が同じ)・10,001 個 = 400 / DB も断る', async () => {
+  await reg('set', 'new-10k', { name: '一万個セット', standard_price: '9000', shipping_code: 'S02', components: [{ code: 's001', qty: 10000 }, { code: 's002', qty: 1 }] });
+  const r = await build('sets', ['new-10k']);
+  const f = Buffer.from((await one('select file_bytes from ops.ne_reg_exports where export_id = $1', [r.export.export_id])).file_bytes).toString('utf8');
+  assert.equal(f, 'set_syohin_code,set_syohin_name,set_baika_tnk,tax_rate,syohin_code,suryo\r\nnew-10k,一万個セット,9000,8,s001,10000\r\nnew-10k,一万個セット,9000,8,s002,1\r\n');
+  await supersede(r.export.export_id);
+  // 10,001 個 = 画面の API の形の検査 (lib/master-write.mjs の MAX_QTY) で 400・何も作らない
+  const e = await rejectsWith(reg('set', 'new-10k1', { name: '一万一個セット', standard_price: '9000', shipping_code: 'S02', components: [{ code: 's001', qty: 10001 }] }), 400);
+  assert.match(e.message, /1〜10,000 の整数/);
+  assert.equal((await q("select 1 from core.skus where code = 'new-10k1'")).length, 0);
+  // DB の登録の関数の確かめ (lib を通さずに呼んでも): 10,000 = 通る・10,001 / 0 = 断る
+  const s1 = (await one("select sku_id::text as id from core.skus where code = 's001'")).id;
+  const der = (n) => one("select ops.new_set_derivation($1::jsonb, 'active', current_date) as d", [JSON.stringify([{ sku_id: Number(s1), code: 's001', qty: n, sort: 1 }])]);
+  assert.deepEqual((await der(10000)).d.rows, [{ sku_id: Number(s1), code: 's001', qty: 10000, sort: 1 }]);
+  for (const n of [10001, 0, 99999]) await assert.rejects(der(n), /qty \(1〜10,000\)/, String(n));
+});
+
 await ta('[C12] DB の守り: 中身は変えない・消さない・一方向・生きているファイルは SKU ごとに 1 つ', async () => {
   const id = (await one('select export_id::text as id from ops.ne_reg_exports order by export_id limit 1')).id;
   await pgErr(pg.query('update ops.ne_reg_exports set sha256 = $2 where export_id = $1', [id, 'c'.repeat(64)]), /中身は書き換えない/);
@@ -1390,8 +1407,16 @@ await ta('[V2] 0065 の関数の作り直し: 0065 より前の最後の版と�
     const allowLater = ['ops.ne_reg_canonical', 'ops.ne_reg_build'].includes(name) ? ['0067_variation_groups.sql'] : name === 'ops.ne_reg_issue' ? ['0082_new_entry_no_gap.sql'] : [];
     //   🆕 10/20 (0097 仮番号・reg_csv_one_file): ops.ne_reg_build を 0067 の版から写す = 差は scripts/test-master-variation.mjs の [S4] が 0067 との差で確かめる
     const oneFile = (x) => name === 'ops.ne_reg_build' && /^\d{4}_reg_csv_one_file\.sql$/.test(x);
-    for (const later of MIG_FILES.filter((x) => x > F0065 && !allowLater.includes(x) && !oneFile(x))) assert.equal(fnDefIn(later, name), null, `${later} も ${name} を作り直している = 0065 の試験の元を見直す`);
+    //   🆕 10/26 (0102 仮番号・set_component_qty_10000): ops.ne_reg_canonical を 0067 の版から写す = 差は下で確かめる (セットの構成品の数量の止め 999 → 10,000 だけ)
+    const qty10k = (x) => name === 'ops.ne_reg_canonical' && /^\d{4}_set_component_qty_10000\.sql$/.test(x);
+    for (const later of MIG_FILES.filter((x) => x > F0065 && !allowLater.includes(x) && !oneFile(x) && !qty10k(x))) assert.equal(fnDefIn(later, name), null, `${later} も ${name} を作り直している = 0065 の試験の元を見直す`);
   }
+  // 🆕 0102 (仮番号): ops.ne_reg_canonical の 0067 との差 = セットの構成品の数量の止めだけ (1〜999 → 1〜10,000・中原さん 10/26)
+  const F10K = MIG_FILES.find((x) => /^\d{4}_set_component_qty_10000\.sql$/.test(x));
+  assert.ok(F10K, '0102 の file');
+  assert.deepEqual(lineDiff(fnDefIn('0067_variation_groups.sql', 'ops.ne_reg_canonical').split('\n'), fnDefIn(F10K, 'ops.ne_reg_canonical').split('\n')), {
+    removed: ["if r.qty is null or r.qty <> pg_catalog.trunc(r.qty) or r.qty not between 1 and 999 then v_blk := v_blk || ('構成品 ' || r.code || ' の数量'); end if;"],
+    added: ["if r.qty is null or r.qty <> pg_catalog.trunc(r.qty) or r.qty not between 1 and 10000 then v_blk := v_blk || ('構成品 ' || r.code || ' の数量'); end if;"] }, '0102 の ops.ne_reg_canonical と 0067 との差');
   // 🆕 0082: ops.ne_reg_issue の 0065 との差 = NE のコードの回の確かめだけ (許可の回か、それより新しい照合の回の印も通す)
   assert.deepEqual(lineDiff(fnDefIn(F0065, 'ops.ne_reg_issue').split('\n'), fnDefIn('0082_new_entry_no_gap.sql', 'ops.ne_reg_issue').split('\n')), {
     removed: ['if v_mark is distinct from v_run then'],

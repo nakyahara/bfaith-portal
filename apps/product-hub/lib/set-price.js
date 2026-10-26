@@ -88,6 +88,9 @@ export function unitPriceOf(db, neCode) {
  *   subtotal: number|null, source: 'draft'|'sku'|'ne'|null}>, missing: string[]}}
  *   total は全件の単価が引けたときだけ入る。missing = 引けなかった商品コード
  */
+/** 売価の上限 (product_drafts.price の CHECK と同じ 1 兆円)。初期値がこれを超えたら入れない (🆕 2026-10-26・10,000 個のセット = Codex R1 Medium) */
+export const SET_PRICE_MAX = 1_000_000_000_000;
+
 export function setPriceFromMembers(db, members) {
   const lines = [];
   const missing = [];
@@ -102,11 +105,13 @@ export function setPriceFromMembers(db, members) {
     }
     lines.push({ code, qty, unit: hit.value, subtotal: hit.value * qty, source: hit.source });
   }
-  const total = (lines.length > 0 && missing.length === 0)
+  const sum = (lines.length > 0 && missing.length === 0)
     // 円未満は出さない (楽天の売価は整数)。四捨五入は最後に 1 回だけ
     ? Math.round(lines.reduce((s, l) => s + l.subtotal, 0))
     : null;
-  return { total, lines, missing };
+  // 🆕 2026-10-26: 上限を超える (単品の売価 × 10,000 個など) = 初期値を入れない (表の CHECK で下書きそのものを作れなくしない)・tooLarge で理由を言う
+  const tooLarge = sum != null && !(Number.isSafeInteger(sum) && sum <= SET_PRICE_MAX);
+  return { total: tooLarge ? null : sum, lines, missing, ...(tooLarge ? { tooLarge: true, sum } : {}) };
 }
 
 /** 「単品 1,980 × 2 = 3,960円」のような 1 行。画面とイベントで同じ言葉を使う */

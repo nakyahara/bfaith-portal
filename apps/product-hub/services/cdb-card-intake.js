@@ -26,6 +26,7 @@
  * 🚨 Drive の画像フォルダの自動作成など外への呼び出しはしない (知らせの取り込みは何度でも流せる形にする)
  */
 import { getDB, logEvent, upsertDraftYahoo } from '../db.js';
+import { COMPONENT_QTY_MAX } from '../../../lib/set-plan.mjs';
 import { SHIPPING_METHOD_GROUPS } from '../lib/shipping-groups.js';
 import { SET_DECISION_REASONS } from '../lib/set-decision.js';
 import { applySetPlanInTx, skipSetPlanInTx, plannedSetCardCheck, sameSetMembers, setCardTakeoverOf } from './cdb-set-plan.js';
@@ -231,7 +232,9 @@ export function applyCdbCardEvent(event, { db = getDB() } = {}) {
 }
 
 /**
- * セットの構成品をカードに (同じ品は 1 行・並び = 入れた順)。前からある行は消さない (INSERT OR IGNORE)
+ * セットの構成品をカードに (同じ品は 1 行・並び = 入れた順)。前からある行は消さない (同じ品の行がもうある = 何もしない)
+ * 🆕 2026-10-26 (Codex R1 High): INSERT OR IGNORE は CHECK の違反 (旧い定義の表の個数 1〜999 など) も黙って無視し、構成品の欠けたカードを
+ *   できたことにしていた = 重なり (主キー) だけを ON CONFLICT DO NOTHING で無視し、CHECK の違反は例外 = 取り込みの取引ごと戻る (知らせは failed で残り、もう一度で入る)
  * 🆕 0064 (#1667 Codex R1 Medium): 構成品のコードは原文 (Company DB の SKU の code) で入れる。同じ品かは小文字で見る (services/set-derive.js と同じ)
  */
 function writeSetMembers(db, draftId, components) {
@@ -240,9 +243,9 @@ function writeSetMembers(db, draftId, components) {
   list.forEach((c, i) => {
     const code = String(c?.code ?? '').trim();
     const qty = Number(c?.qty);
-    if (!code || !Number.isInteger(qty) || qty < 1 || qty > 999 || seen.has(code.toLowerCase())) return;
+    if (!code || !Number.isInteger(qty) || qty < 1 || qty > COMPONENT_QTY_MAX || seen.has(code.toLowerCase())) return;   // 🆕 2026-10-26: 999 → 10,000 (Company DB の構成と同じ上限)
     seen.add(code.toLowerCase());
-    db.prepare('INSERT OR IGNORE INTO draft_set_members (set_draft_id, member_ne_code, qty, sort) VALUES (?, ?, ?, ?)').run(draftId, code, qty, i);
+    db.prepare('INSERT INTO draft_set_members (set_draft_id, member_ne_code, qty, sort) VALUES (?, ?, ?, ?) ON CONFLICT (set_draft_id, member_ne_code) DO NOTHING').run(draftId, code, qty, i);
   });
 }
 
