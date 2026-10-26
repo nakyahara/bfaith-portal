@@ -3377,6 +3377,18 @@ await ta('[77] 新商品 (2026-10-17 中原さん): 「セット商品を作る�
   assert.deepEqual([await rows.nth(0).locator('.sp-qty').inputValue(), await rows.nth(0).locator('.sp-code').inputValue(), await rows.nth(0).locator('.sp-name').inputValue()],
     ['2', 'ui-sp-1-2', 'UI ネームタグ 【100枚】 2個セット']);
   await p.waitForSelector('#set-plan-rows .sp-msg.ok');
+  // 🆕 2026-10-26 (中原さん: tbbk-100 = 100 個セット): 個数は 2〜999。1000 = 一言で止める・100 = 初めのコードと名前が付いていく (使えます)
+  const r0 = rows.nth(0);
+  await r0.locator('.sp-qty').fill('1000');
+  await p.waitForFunction(() => document.querySelector('#set-plan-rows tr.sp-row .sp-msg').textContent === '個数は 2〜999 の整数');
+  assert.match(await p.textContent('#checklist'), /作るセットを直す \(1 行\)/);
+  await r0.locator('.sp-qty').fill('100');
+  assert.deepEqual([await r0.locator('.sp-code').inputValue(), await r0.locator('.sp-name').inputValue()], ['ui-sp-1-100', 'UI ネームタグ 【100枚】 100個セット']);
+  await p.waitForFunction(() => { const m = document.querySelector('#set-plan-rows tr.sp-row .sp-msg'); return m.classList.contains('ok') && m.textContent === '使えます'; });
+  assert.doesNotMatch(await p.textContent('#checklist'), /作るセットを直す/);
+  await r0.locator('.sp-qty').fill('2');
+  assert.equal(await r0.locator('.sp-code').inputValue(), 'ui-sp-1-2');
+  await p.waitForFunction(() => document.querySelector('#set-plan-rows tr.sp-row .sp-msg').classList.contains('ok'));
   // 直していない行は単品の名前に付いていく
   await p.fill('#f-name', 'UI ネームタグ 【50枚】');
   assert.equal(await rows.nth(0).locator('.sp-name').inputValue(), 'UI ネームタグ 【50枚】 2個セット');
@@ -3864,7 +3876,9 @@ await ta('[85] 新商品の登録 (セット・10/21 中原さん): 構成品の
   // 名前に使う: 数が 1 = 押せない → 3 = 押せる → 名前 3個セット (半角の空白 1 つ) → 名前があるので押せない
   const use = row.locator('[data-act="use-name"]');
   assert.equal(await use.isDisabled(), true, '数が 1 = 押せない');
-  assert.match(await use.getAttribute('title'), /数が 2〜99/);
+  assert.match(await use.getAttribute('title'), /数が 2〜999 のときだけ/);
+  await row.locator('.c-qty').fill('1000');
+  assert.equal(await use.isDisabled(), true, '数が 1000 = 押せない (2〜999・2026-10-26)');
   await row.locator('.c-qty').fill('3');
   assert.equal(await use.isDisabled(), false);
   await use.click();

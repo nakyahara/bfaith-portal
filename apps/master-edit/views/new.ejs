@@ -224,7 +224,7 @@
             <%# 🆕 2026-10-17 中原さん: 「作る」のときは何個セットを作るかも聞いて、セット商品コードと名前をここで作る (lib/set-plan.mjs の決まり・画面の動き = public/me-new.js)。
                 コード = 単品のコード-個数・名前 = 単品の名前 個数個セット (どちらも直せる)。保存すると product-hub に「セットの下書き」ができる
                 (NE に登録して取り込まれるまで出品しない・Company DB にはまだ作らない) %>
-            <% const spl = locals.setPlanLimits || { max: 10, qtyMin: 2, qtyMax: 99, nameMax: 255, alertDays: 3 }; %>
+            <% const spl = locals.setPlanLimits || { max: 10, qtyMin: 2, qtyMax: 999, nameMax: 255, alertDays: 3 }; %>
             <div class="f" data-row="card.sets" id="row-set-plans" hidden style="align-items:start" data-max="<%= spl.max %>" data-qty-min="<%= spl.qtyMin %>" data-qty-max="<%= spl.qtyMax %>" data-name-max="<%= spl.nameMax %>">
               <div class="lab" id="lab-set-plans" style="padding-top:8px">作るセット</div>
               <div class="ctl col" style="gap:0">

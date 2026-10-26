@@ -3070,13 +3070,18 @@ const setsOf = (parentId) => ph.prepare('SELECT * FROM product_drafts WHERE pare
 const evOf = (sid) => one(`select o.event_id::text as event_id, o.sku_id::text as sku_id, o.payload, o.request_id::text as request_id, r.result ->> 'request_payload_hash' as request_hash
     from ops.product_hub_outbox o left join ops.master_edit_requests r on r.request_id = o.request_id where o.sku_id = $1`, [sid]);
 
-await ta('[SP1] 決まり (lib/set-plan.mjs): 初めのコード = 単品-個数・名前 = 単品の名前 + 半角の空白 + N個セット・個数 2〜99・同じ個数 / コード (大文字小文字) / 単品と同じ / set- / 長さ / 知らない欄 / 11 行 = 断る', async () => {
+await ta('[SP1] 決まり (lib/set-plan.mjs): 初めのコード = 単品-個数・名前 = 単品の名前 + 半角の空白 + N個セット・個数 2〜999 (2026-10-26: 100 個セット)・同じ個数 / コード (大文字小文字) / 単品と同じ / set- / 長さ / 知らない欄 / 11 行 = 断る', async () => {
   assert.equal(SP.defaultSetCode('u60e-05', 2), 'u60e-05-2');
   assert.equal(SP.defaultSetName('ボトルキープ ネームタグ 【100枚】', 2), 'ボトルキープ ネームタグ 【100枚】 2個セット');
   assert.deepEqual(SP.parseSetPlans([{ qty: '２', code: 'Ab-2', name: ' x 2個セット ' }, { qty: 3, code: 'ab-3', name: 'y' }], { parentCode: 'ab' }),
     [{ qty: 2, code: 'Ab-2', name: 'x 2個セット' }, { qty: 3, code: 'ab-3', name: 'y' }]);
   const no = (rows, re, parentCode = 'ab') => assert.throws(() => SP.parseSetPlans(rows, { parentCode }), (e) => e instanceof SP.SetPlanShapeError && re.test(e.message));
-  no([{ qty: 1, code: 'ab-1', name: 'x' }], /2〜99/); no([{ qty: 100, code: 'ab-100', name: 'x' }], /2〜99/); no([{ qty: '1.5', code: 'ab-2', name: 'x' }], /2〜99/);
+  // 🆕 2026-10-26: 100 個セット (tbbk-100) も作る = 2〜999 (セットの構成品の数の上限と同じ)。全角・3 桁の文字も受ける
+  assert.equal(SP.SET_QTY_MAX, 999);
+  assert.deepEqual(SP.parseSetPlans([{ qty: 100, code: 'ab-100', name: 'x 100個セット' }, { qty: '９９９', code: 'ab-999', name: 'y' }, { qty: ' 120 ', code: 'ab-120', name: 'z' }], { parentCode: 'ab' }).map((x) => x.qty), [100, 999, 120]);
+  assert.equal(SP.defaultSetCode('tbbk', 100), 'tbbk-100'); assert.equal(SP.defaultSetName('インスタント歯ブラシ', 100), 'インスタント歯ブラシ 100個セット');
+  assert.equal(SP.setQtyOf('0100'), null); assert.equal(SP.setQtyOf(999.5), null); assert.equal(SP.setQtyOf('99'), 99);
+  no([{ qty: 1, code: 'ab-1', name: 'x' }], /2〜999/); no([{ qty: 1000, code: 'ab-1000', name: 'x' }], /2〜999/); no([{ qty: '1000', code: 'ab-1000', name: 'x' }], /2〜999/); no([{ qty: '1.5', code: 'ab-2', name: 'x' }], /2〜999/);
   no([{ qty: 2, code: 'ab-2', name: 'x' }, { qty: 2, code: 'ab-22', name: 'y' }], /2個セットが 2 行/);
   no([{ qty: 2, code: 'ab-2', name: 'x' }, { qty: 3, code: 'AB-2', name: 'y' }], /2 行あります/);
   no([{ qty: 2, code: 'AB', name: 'x' }], /単品のコードと同じ/); no([{ qty: 2, code: 'set-ab-2', name: 'x' }], /set-/);
@@ -3246,7 +3251,8 @@ await ta('[SP7] 新商品の画面: 「作るセット」の表 (はじめは隠
   assert.equal(r.status, 200);
   const sc = await checkScripts(r.text, 0);
   const js = sc.find((x) => x.includes('me-new.js — 新商品の登録の画面')) || '';
-  assert.match(r.text, /<div class="f" data-row="card\.sets" id="row-set-plans" hidden[^>]*data-max="10" data-qty-min="2" data-qty-max="99"/);
+  assert.match(r.text, /<div class="f" data-row="card\.sets" id="row-set-plans" hidden[^>]*data-max="10" data-qty-min="2" data-qty-max="999"/);
+  assert.match(js, /function spQty\(v\) \{ var t = half\(v\)\.trim\(\); if \(!\/\^\\d\{1,3\}\$\/\.test\(t\)\)/, '画面も 3 桁の個数 (100〜999) を読む (2026-10-26)');
   assert.match(r.text, /<template id="set-plan-tpl"><tr class="sp-row">/);
   assert.match(r.text, /id="set-plan-add"/); assert.match(r.text, /NE にセット商品を登録して取り込まれるまで、どのモールにも出品しません/);
   assert.ok(js.includes("'/api/set-code-check?code='"), '画面が作るセットのコードを確かめない');
@@ -3405,6 +3411,30 @@ async function plannedSet(single, setCode, qty = 2) {
   return d;
 }
 const cardsOf = (code) => ph.prepare('SELECT * FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ? ORDER BY id').all(String(code).toLowerCase());
+
+await ta('[SP9] 2026-10-26 中原さん: 100 個セット・999 個セットも作れる (登録の API → product-hub の表 → セットの下書き 2 枚・構成 = 単品 × 100 / 999・売価 = 単品 × 個数)・1000 個 = 400 (何行目)', async () => {
+  const name100 = SP.defaultSetName('ネームタグ 【100枚】 sp-qty100', 100);
+  assert.equal(name100, 'ネームタグ 【100枚】 sp-qty100 100個セット');
+  const body = spBody('sp-qty100', [{ qty: 100, code: SP.defaultSetCode('sp-qty100', 100), name: name100 }, { qty: '999', code: 'sp-qty100-999', name: '999個セット' }]);
+  const r = await call('POST', '/apps/master-edit/api/new', { body });
+  assert.equal(r.status, 200, r.text);
+  assert.equal(r.j.card.status, 'done');
+  const parent = draftOf('sp-qty100');
+  const sets = setsOf(parent.id);
+  assert.deepEqual(sets.map((d) => [d.ne_code, d.name, d.provisional_code, d.price]),
+    [['sp-qty100-100', name100, 1, 120000], ['sp-qty100-999', '999個セット', 1, 1198800]]);
+  assert.deepEqual(sets.map((d) => ph.prepare('SELECT member_ne_code, qty FROM draft_set_members WHERE set_draft_id = ?').all(d.id)),
+    [[{ member_ne_code: 'sp-qty100', qty: 100 }], [{ member_ne_code: 'sp-qty100', qty: 999 }]]);
+  const plan = SPS.readSetPlan(body.request_id);
+  assert.deepEqual([plan.state, plan.items.map((x) => [x.qty, x.outcome])], ['applied', [[100, 'created'], [999, 'created']]]);
+  // 1000 個 = 形の検査で 400 (何も保存しない)
+  const b2 = spBody('sp-qty1000', [{ qty: 2, code: 'sp-qty1000-2', name: 'x' }, { qty: 1000, code: 'sp-qty1000-1000', name: 'y' }]);
+  const bad = await call('POST', '/apps/master-edit/api/new', { body: b2 });
+  assert.deepEqual([bad.status, bad.j.field, bad.j.index], [400, 'card.sets', 1], bad.text);
+  assert.match(bad.j.error, /2 行目: 個数は 2〜999 の整数/);
+  assert.equal(await skuId('sp-qty1000'), undefined);
+  assert.equal(SPS.readSetPlan(b2.request_id), null);
+});
 
 await ta('[TK1] 同じコード・同じ構成のセットの登録 = 断らない・カードの取り込みがその下書きを引き継ぐ (新しいカードは作らない・Company DB の SKU に結ぶ・仮コードのまま)・押し直し / 届け直しでも 1 枚・product-hub でコードを変えさせない', async () => {
   const planned = await plannedSet('sp-take', 'sp-take-2');
