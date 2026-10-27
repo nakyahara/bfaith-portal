@@ -175,7 +175,7 @@ export function attemptImageFolderCreation(draftId, opts = {}) {
   return p;
 }
 
-async function doAttempt(draftId, { actor = null, driveClient = null } = {}) {
+async function doAttempt(draftId, { actor = null, driveClient = null, sweep = false } = {}) {
   const db = getDB();
   if (isDisabled()) return { outcome: 'disabled' };
 
@@ -184,6 +184,10 @@ async function doAttempt(draftId, { actor = null, driveClient = null } = {}) {
   ).get(draftId);
   if (!draft) return { outcome: 'not_found' };
   if (!isFolderEligibleDraft(draft)) return { outcome: 'skipped_provisional' };
+  // 対象外にしたカードは作らない (見回りが選んだ後に人が対象外にした・Codex)
+  if (draft.status === 'excluded') return { outcome: 'skipped_excluded' };
+  // 見回りは、選んだ後にカードが変わっていても守るカードを触らない (Notion から取り込んだ・自動作成を始める前)
+  if (sweep && (String(draft.source || 'portal') === 'notion_import' || String(draft.created_at || '') < FOLDER_SWEEP_CUTOFF)) return { outcome: 'skipped_protected' };
   if (draft.drive_folder_url && String(draft.drive_folder_url).trim() !== '') return { outcome: 'skipped_has_url' };
   // 出品済みページへの色追加のカード: 足し先のページのフォルダを使う (取込のたびに色ごとのフォルダを増やさない)。
   // 足し先にまだ無ければ待つ (足し先のフォルダができた後の見回りで写す)
@@ -207,7 +211,7 @@ async function doAttempt(draftId, { actor = null, driveClient = null } = {}) {
     // 空のときだけ書く: 作成中に人が貼った URL を上書きしない
     const updated = db.prepare(`
       UPDATE product_drafts SET drive_folder_url = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-       WHERE id = ? AND (drive_folder_url IS NULL OR TRIM(drive_folder_url) = '')
+       WHERE id = ? AND (drive_folder_url IS NULL OR TRIM(drive_folder_url) = '') AND status != 'excluded'
     `).run(folder.url, draftId);
     if (updated.changes === 0) {
       // フォルダ自体は Drive にできている (無害)。カードは人の入力を正とする。
@@ -232,11 +236,11 @@ async function doAttempt(draftId, { actor = null, driveClient = null } = {}) {
  * @param {number[]} draftIds
  * @returns {Promise<{created: number, reused: number, skipped: number, failed: number}>}
  */
-export async function attemptImageFolderCreationBatch(draftIds, { actor = null, driveClient = null } = {}) {
+export async function attemptImageFolderCreationBatch(draftIds, { actor = null, driveClient = null, sweep = false } = {}) {
   const summary = { created: 0, reused: 0, skipped: 0, failed: 0 };
   for (const id of draftIds || []) {
     // 出品済みページへの色追加のカードは doAttempt が足し先のフォルダの URL を写す (新しく作らない・2026-10-27)
-    const r = await attemptImageFolderCreation(id, { actor, driveClient });
+    const r = await attemptImageFolderCreation(id, { actor, driveClient, sweep });
     if (r.outcome === 'created') summary.created += 1;
     else if (r.outcome === 'reused') summary.reused += 1;
     else if (r.outcome === 'failed') summary.failed += 1;
@@ -312,7 +316,7 @@ export function sweepMissingImageFolders({ limit = FOLDER_SWEEP_LIMIT, actor = '
          ORDER BY (d.added_to_draft_id IS NOT NULL), d.id
          LIMIT ?
       `).all(FOLDER_SWEEP_CUTOFF, MAX_RETRY_ATTEMPTS, limit);
-      const summary = await attemptImageFolderCreationBatch(rows.map((r) => r.id), { actor, driveClient });
+      const summary = await attemptImageFolderCreationBatch(rows.map((r) => r.id), { actor, driveClient, sweep: true });
       if (rows.length) console.log(`[product-hub] 画像フォルダの見回り: 対象 ${rows.length} 件 created=${summary.created} reused=${summary.reused} skipped=${summary.skipped} failed=${summary.failed}`);
       return { found: rows.length, ...summary };
     } catch (e) {

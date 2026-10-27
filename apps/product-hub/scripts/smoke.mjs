@@ -8663,6 +8663,12 @@ check('白抜きのみの取込は商品画像を触らず、draft_rakuten の�
     const [a, b] = [dif.sweepMissingImageFolders({ limit: 1, driveClient: fakeDrive([], 'P') }), dif.sweepMissingImageFolders({ limit: 1, driveClient: fakeDrive([], 'Q') })];
     check('見回り: 重なって呼ばれたら 1 本にまとめる', a === b);
     await a;
+    // 🚨 選んだ後に対象外にした・守るカードは、1 枚ずつ作る直前にもう一度見て触らない (Codex)
+    const idLateEx = mk('SWEEP-LATE-EX', { status: 'excluded' });
+    check('見回り: 対象外のカードは作る直前に見て作らない', (await dif.attemptImageFolderCreation(idLateEx, { driveClient: fakeDrive([], 'NO') })).outcome === 'skipped_excluded' && !urlOf(idLateEx));
+    const idLateNotion = mk('SWEEP-LATE-NOTION', { source: 'notion_import' });
+    check('見回り: Notion から取り込んだカードは見回りでは作らない (作る直前にも見る)',
+      (await dif.attemptImageFolderCreation(idLateNotion, { driveClient: fakeDrive([], 'NO'), sweep: true })).outcome === 'skipped_protected' && !urlOf(idLateNotion));
   }
 }
 
