@@ -125,17 +125,17 @@
       var cc = compCheck();
       if (cc.pending.length) list.push({ id: 'comp_pending', sec: 'sec-comp', t: '構成品を確かめています (' + cc.pending.length + ' 行)', ok: false, focus: '#comp-rows tr.comp-row:nth-child(' + (cc.pending[0].sectionRowIndex + 1) + ') .c-code', level: 1 });
       else if (cc.bad.length) list.push({ id: 'comp_bad', sec: 'sec-comp', t: '構成品にできないコードを直す (' + cc.bad.length + ' 行)', ok: false, focus: '#comp-rows tr.comp-row:nth-child(' + (cc.bad[0].sectionRowIndex + 1) + ') .c-code', level: 1 });
-      if (salesFromComp != null && val('f-set_sales_class_override')) list.push({ id: 'override', sec: 'sec-comp', t: '売上分類の上書きを空にする (構成品から導けます)', ok: false, focus: '#f-set_sales_class_override', level: 1 });
     }
     list.push({ id: 'code', sec: 'sec-code', t: '商品コード', ok: !codeShape(code) && !(codeState.code === code && codeState.ok === false), focus: '#code', level: 1 });
     list.push({ id: 'name', sec: 'sec-code', t: '名前', ok: !!val('f-name'), focus: '#f-name', level: 1 });
     list.push({ id: 'standard_price', sec: 'sec-money', t: '売価', ok: priceOk('f-standard_price'), focus: '#f-standard_price', level: 1 });
     if (!isSet) list.push({ id: 'tax_rate', sec: 'sec-tax', t: '税率', ok: !!segVal('f-tax_rate'), focus: '#f-tax_rate button', level: 1 });
     if (!isSet) list.push({ id: 'primary_supplier', sec: 'sec-tax', t: '代表の仕入先', ok: !!val('f-primary_supplier'), focus: '#f-primary_supplier', level: 1 });
-    // 🆕 2026-10-08 中原さん「下書き保存時にわかる内容だから必須にする」: 単品の売上分類・推奨保有月数 (単品もセットも)・単品のロジザードの有効期限の管理は ①。
-    //   セットの売上分類は構成品から導く (導けないときだけ「例外のとき」の上書き = 保存でサーバーが確かめる) = ここには足さない
+    // 🆕 2026-10-08 中原さん「下書き保存時にわかる内容だから必須にする」: 単品の売上分類・推奨保有月数・単品のロジザードの有効期限の管理は ①。
+    //   セットの売上分類は構成品から導く (導けない = 保存でサーバーが断る) = ここには足さない。
+    //   🆕 2026-10-26 中原さん: セットは推奨保有月数を出さない (構成品で発注する・送らない = サーバーが 0)
     if (!isSet) list.push({ id: 'sales_class', sec: 'sec-tax', t: '売上分類', ok: !!segVal('f-sales_class'), focus: '#f-sales_class button', level: 1 });
-    list.push({ id: 'reorder_months', sec: 'sec-ship', t: '推奨保有月数 (0〜60)', ok: monthsOk(), focus: '#f-reorder_months', level: 1 });
+    if (!isSet) list.push({ id: 'reorder_months', sec: 'sec-ship', t: '推奨保有月数 (0〜60)', ok: monthsOk(), focus: '#f-reorder_months', level: 1 });
     if (!isSet) list.push({ id: 'expiry_managed', sec: 'sec-ship', t: 'ロジザードの有効期限の管理', ok: !!segVal('f-expiry'), focus: '#f-expiry button', level: 1 });
     // 🆕 0080: ロジザードのバーコード = 値か「空欄」のどちらかが要る (欄がある = 0080 がある DB だけ)
     if (!isSet && $('#f-lzbc-in')) list.push({ id: 'logizard_barcode', sec: 'sec-ship', t: 'ロジザードのバーコード (値か「空欄」)', ok: !!lzbc().body, focus: '#f-lzbc-in', level: 1 });
@@ -163,8 +163,7 @@
       list.push({ id: 'card.sets', sec: 'sec-card', t: spc.rows === 0 ? '作るセット (個数・コード・名前を 1 つ以上)' : spc.bad ? '作るセットを直す (' + spc.bad + ' 行)' : '作るセット (' + spc.rows + ' 個)',
         ok: spc.rows > 0 && spc.bad === 0, focus: spc.firstBad || '#set-plan-add', level: 3 });
     }
-    // ④ そのほか (画面の上からの順)
-    if (isSet) opt('exception_cost', 'sec-comp', '例外原価 (入力なし = 構成品の合計)', '#xcost-jpy', 4);
+    // ④ そのほか (画面の上からの順)。🆕 2026-10-26: セットの例外原価は出さない (原価 = 構成品の合計)
     // 🆕 0084: メーカー (代表の仕入先のすぐ下・値 = 名簿から選んだ = 打っただけでは値でない)。欄がある (0084 がある DB) ときだけ
     if (!isSet) opt('maker', 'sec-tax', 'メーカー (一覧から選ぶ)', '#f-maker-in', 4);
     // 🆕 0088: ブランドは必須でない (数えない)。打っただけで一覧から選んでいない = 保存を止める (黙って捨てない)
@@ -173,11 +172,8 @@
       ME.orderSettings.items().forEach(function (x) { list.push({ id: x.key, sec: 'sec-order', t: x.t, ok: x.ok, none: x.none, focus: x.focus, level: 4, opt: true }); });
     }
     if (!isSet) opt('inbound_date_managed', 'sec-ship', 'ロジザードの入荷日の管理', '#f-inbound button', 4);
-    if (card) {
-      opt('card.reference_urls', 'sec-card', '参考 URL', '#ref-rows .ref-url', 4);
-      [['card.yahoo.price', 'Yahoo!売価', '#y-price'], ['card.yahoo.price_sagawa', 'Yahoo!売価 (佐川)', '#y-price-sagawa'], ['card.yahoo.delivery_label', 'Yahoo!の配送方法', '#y-delivery'],
-        ['card.yahoo.category_id', 'Yahoo!カテゴリID', '#y-category'], ['card.yahoo.path', 'Yahoo!path', '#y-path']].forEach(function (y) { opt(y[0], 'sec-yahoo', y[1], y[2], 4); });
-    }
+    // 🆕 2026-10-26 中原さん: Yahoo! の欄は任意 (空 = 入れない・「入力なし」は無い・数えない。売価の 0 は保存のときに止める = doSave)
+    if (card) opt('card.reference_urls', 'sec-card', '参考 URL', '#ref-rows .ref-url', 4);
     return list;
   }
   /** 送る「入力なし」の印 = 数えている項目のうち入力なしにしたもの (カードを作らない = カードの欄は送らない) */
@@ -439,43 +435,27 @@
     nameEl.dispatchEvent(new Event('input', { bubbles: true }));
     flash(b, '入れました');
   }
-  /** 構成品から導いた売上分類 (導けない・分からない = null) */
-  var salesFromComp = null;
-  /** 売上分類の上書きの欄: 構成品から導ける間は押せない (入れてあれば空にできるよう開けておく = ① で止める) */
-  function overrideState() {
-    var sel = document.getElementById('f-set_sales_class_override'); if (!sel || !canSave || saved) return;
-    sel.disabled = salesFromComp != null && !sel.value;
-    var hint = document.getElementById('override-hint');
-    if (hint) hint.textContent = salesFromComp != null ? '構成品から ' + salesFromComp + ' (' + (SALES[salesFromComp] || '') + ') を導けるので、上書きはできません' : '構成品から導けないときだけ (未入力・輸出 4 と 1〜3 の混在)';
-  }
   /** 計算で決まる値の見込み (lib/master-set-rules.js deriveSetCdb と同じ決まり: 税率 = 全部同じならそれ・混ざれば低い 8%・未入力があれば決まらない / 売上分類 = 1〜3 の小さい番号 (4 だけなら 4・4 と 1〜3 の混在は決まらない) / 原価 = 原価 × 数の合計 (0・未入力があれば決まらない)) */
   function tiles() {
     if (!isSet) return;
     var rows = $$('#comp-rows tr.comp-row').map(function (tr) { var c = $('.c-code', tr).value.trim(); var f = factOf(tr); return c ? { f: f ? f.item : null, qty: Number(half($('.c-qty', tr).value.trim())) } : null; }).filter(Boolean);
     var put = function (id, tv, tr, bad) { var t = $('#' + id); if (!t) return; t.classList.toggle('bad', !!bad); $('.tv', t).innerHTML = tv; $('.tr', t).textContent = tr; };
-    salesFromComp = null;
-    if (!rows.length) { overrideState(); put('t-tax', '—', '構成品を入れると出ます'); put('t-sales', '—', 'いちばん小さい番号'); put('t-cost', '—', '構成品の原価 × 数'); put('t-price', '—', 'セットの売価とくらべる'); return; }
+    if (!rows.length) { put('t-tax', '—', '構成品を入れると出ます'); put('t-sales', '—', 'いちばん小さい番号'); put('t-cost', '—', '構成品の原価 × 数'); put('t-price', '—', 'セットの売価とくらべる'); return; }
     var known = rows.every(function (r) { return !!r.f; });
-    if (!known) { overrideState(); ['t-tax', 't-sales', 't-cost', 't-price'].forEach(function (id) { put(id, '…', '構成品を引き当て中か、見つからない行があります'); }); return; }
+    if (!known) { ['t-tax', 't-sales', 't-cost', 't-price'].forEach(function (id) { put(id, '…', '構成品を引き当て中か、見つからない行があります'); }); return; }
     var taxes = rows.map(function (r) { return r.f.tax_rate; });
     if (taxes.some(function (t) { return t == null; })) put('t-tax', '決まりません', '税率が未入力の構成品があります (先に単品の税率を)', true);
     else { var uniq = taxes.filter(function (t, i) { return taxes.indexOf(t) === i; }); put('t-tax', (uniq.length > 1 ? 8 : Math.round(uniq[0] * 100)) + '<small>%</small>', uniq.length > 1 ? '8% と 10% が混ざっています (低い方の 8%)' : '構成品が全部 ' + Math.round(uniq[0] * 100) + '%', uniq.length > 1); }
-    // 売上分類: 構成品から導ける間は上書きできない (サーバーが断る = lib/master-register.mjs)。導けない (未入力・輸出 4 と 1〜3 の混在) ときだけ上書きで決める (#1628 Codex R1 M2)
-    var ov = val('f-set_sales_class_override');
+    // 売上分類: 構成品から導く。🆕 2026-10-26 中原さん: 新商品の登録には上書き・例外原価の欄が無い = 導けないときは構成品の値を直す (サーバーも断る = lib/master-register.mjs)
     var sc = rows.map(function (r) { return r.f.sales_class; });
     var four = sc.filter(function (x) { return Number(x) === 4; }).length;
     var missing = sc.some(function (x) { return x == null; });
     var mixed = !missing && four > 0 && four < sc.length;
-    salesFromComp = missing || mixed ? null : Math.min.apply(null, sc.map(Number));
-    if (salesFromComp != null && ov) put('t-sales', '上書きできません', '構成品から ' + salesFromComp + ' (' + (SALES[salesFromComp] || '') + ') を導けます。「売上分類の上書き」を空にしてください', true);
-    else if (ov) put('t-sales', esc(ov) + '<small> ' + esc(SALES[ov] || '') + '</small>', '上書き (構成品から導けないので)');
-    else if (missing) put('t-sales', '決まりません', '売上分類が未入力の構成品があります (「例外のとき」の「売上分類の上書き」で決める)', true);
-    else if (mixed) put('t-sales', '決まりません', '輸出 4 と 1〜3 が混ざっています (「例外のとき」の「売上分類の上書き」で決める)', true);
+    var salesFromComp = missing || mixed ? null : Math.min.apply(null, sc.map(Number));
+    if (missing) put('t-sales', '決まりません', '売上分類が未入力の構成品があります (先に単品の売上分類を)', true);
+    else if (mixed) put('t-sales', '決まりません', '輸出 4 と 1〜3 が混ざっています (このままでは登録できません)', true);
     else put('t-sales', salesFromComp + '<small> ' + esc(SALES[salesFromComp] || '') + '</small>', four ? '全部 輸出' : 'いちばん小さい番号');
-    overrideState();
-    var xc = val('xcost-jpy');
-    if (xc) put('t-cost', esc(yen(half(xc).replace(/,/g, ''))) + '<small> 円</small>', '例外原価 (構成品の合計の代わり)');
-    else if (rows.some(function (r) { return !(r.f.cost_jpy > 0); })) put('t-cost', '決まりません', '原価が無い構成品があります (先に単品の原価か、例外原価を)', true);
+    if (rows.some(function (r) { return !(r.f.cost_jpy > 0); })) put('t-cost', '決まりません', '原価が無い構成品があります (先に単品の原価を)', true);
     else put('t-cost', yen(rows.reduce(function (a, r) { return a + r.f.cost_jpy * (r.qty || 0); }, 0)) + '<small> 円</small>', '構成品の原価 × 数の合計');
     if (rows.some(function (r) { return r.f.standard_price == null; })) put('t-price', '—', '売価の無い構成品があります');
     else {
@@ -521,7 +501,7 @@
       $('.c-code', rowsEl.lastElementChild).focus();
     });
   }
-  ['f-standard_price', 'xcost-jpy', 'f-set_sales_class_override'].forEach(function (id) { var e = document.getElementById(id); if (e) { e.addEventListener('input', tiles); e.addEventListener('change', tiles); } });
+  ['f-standard_price'].forEach(function (id) { var e = document.getElementById(id); if (e) { e.addEventListener('input', tiles); e.addEventListener('change', tiles); } });
 
   /* ---------- 出品カード: 作らない・参考 URL・Amazon URL から ASIN・セット商品を作るか ---------- */
   /** カードの欄に値が残っているか (カードを作らないときも送る = 形が違えば保存で断られる) */
@@ -723,7 +703,7 @@
     if (val('y-delivery')) parts.push('配送 ' + val('y-delivery'));
     if (val('y-category')) parts.push('カテゴリ ' + val('y-category'));
     if (val('y-path')) parts.push('path あり');
-    s.textContent = parts.length ? parts.join(' · ') + ' を入れてあります' : 'ふだんは全部「入力なし」';
+    s.textContent = parts.length ? parts.join(' · ') + ' を入れてあります' : 'ふだんは空のまま';
     s.className = 'b ' + (parts.length ? 'info' : 'mute');
   }
 
@@ -743,16 +723,15 @@
   }
   function collect() {
     var values = {};
-    var keys = isSet ? ['name', 'standard_price', 'shipping_code', 'reorder_months', 'handling_own', 'set_sales_class_override']
+    // 🆕 2026-10-26 中原さん: セットは推奨保有月数・セット自身の取扱・売上分類の上書き・例外原価を送らない (サーバーが 0・取扱中・上書きなし・構成品の合計にする)
+    var keys = isSet ? ['name', 'standard_price', 'shipping_code']
       : ['name', 'standard_price', 'shipping_code', 'tax_rate', 'sales_class', 'primary_supplier', 'reorder_months', 'expiry_managed', 'inbound_date_managed', 'maker'];   // maker = 🆕 0084 (隠した欄 = 名簿の番号・欄が無い = 送らない)
     keys.forEach(function (k) { var v = fieldValue(k); if (v !== undefined && v !== '') values[k] = v; });
     // 🆕 0088: ブランド (隠した欄 = 名簿の番号)・区分・終売の予定日 (欄が無い / 空 = 送らない)
     if (!isSet) ['brand', 'life_stage', 'end_planned_on'].forEach(function (k) { var v = fieldValue(k); if (v !== undefined && v !== '') values[k] = v; });
-    if (isSet) {
-      values.components = components();
-      // 原価の理由は送らない (新規登録では要らない・サーバーが「新商品の登録」を入れる = 2026-10-08 中原さん)
-      if (val('xcost-jpy')) values.exception_cost = { jpy: val('xcost-jpy') };
-    } else if (val('cost-jpy')) values.cost = { jpy: val('cost-jpy') };
+    // 原価の理由は送らない (新規登録では要らない・サーバーが「新商品の登録」を入れる = 2026-10-08 中原さん)
+    if (isSet) values.components = components();
+    else if (val('cost-jpy')) values.cost = { jpy: val('cost-jpy') };
     var card = {
       create: cardOn(),
       official_url: val('official-url'), amazon_url: val('amazon-url'), asin: val('asin'),
