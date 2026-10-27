@@ -5,9 +5,18 @@
  *       「商品コード_商品名」のフォルダを作り、カードの drive_folder_url に貼る。
  *       (これまで人手でやっていた作業の自動化)
  *
+ * 🆕 2026-10-27 中原さん「全部の商品にフォルダを」: 入ってくる商品と入ってこない商品があった。原因は
+ *   ① Company DB の新商品の登録から来るカード (cdb-card-intake / cdb-group-intake = 今の主な入口) が作っていなかった
+ *   ② セット (派生・登録) を対象外にしていた
+ *   ③ 失敗の回収が NE の自動取込 (切替で閉じた) の中でしか動いていなかった
+ *   → 対象を「商品コードが確定したカード全部」(セットも・仮コードのあいだは待つ) にし、見回り (sweepMissingImageFolders) が
+ *     URL の空いたカードを拾って作る (起動 1 分後・その後 10 分おき・ボードを開いたとき・新商品の登録の直後)。
+ *   出品済みページへの色追加のカード (added_to_draft_id) は、足し先のページのフォルダの URL を写す (新しく作らない)。
+ *   Notion から取り込んだ既存カード・取り込み前 (CUTOFF より前) のカード・対象外 (excluded) は触らない
+ *
  * 設計:
- *   - 対象は**単品のみ**: セット派生 (parent_draft_id あり / provisional_code=1) は作らない。
- *     バリエーション代表はセットではないので対象 (楽天1ページ=1フォルダ)
+ *   - 対象は**商品コードが確定したカード** (仮コード provisional_code=1 のセットは、本コードが決まってから作る)。
+ *     バリエーション代表も対象 (楽天1ページ=1フォルダ)
  *   - drive_folder_url が既に入っているカードには触らない (Notion取込・人の手入力を上書きしない)
  *   - 冪等: 親フォルダ直下に同名フォルダがあれば再利用する (二重作成しない)。
  *     さらに同一 draft への同時呼び出しは in-flight Map で1本にまとめる
@@ -87,7 +96,13 @@ export function buildImageFolderName(neCode, name) {
   return folder.replace(/[. ]+$/g, '');
 }
 
-/** セット商品でない = 自動作成の対象。派生セットは仮コード/確定コードに関わらず除外 */
+/** 画像フォルダを自動で作るカードか (2026-10-27): 商品コードが確定している (仮コードのセットは待つ)。セットも対象 */
+export function isFolderEligibleDraft(draft) {
+  if (!draft) return false;
+  return !Number(draft.provisional_code || 0);
+}
+
+/** セット商品でない (白抜きの受信箱が使う。画像フォルダの自動作成の対象かは isFolderEligibleDraft) */
 export function isSingleProductDraft(draft) {
   if (!draft) return false;
   return draft.parent_draft_id == null && !Number(draft.provisional_code || 0);
@@ -160,16 +175,31 @@ export function attemptImageFolderCreation(draftId, opts = {}) {
   return p;
 }
 
-async function doAttempt(draftId, { actor = null, driveClient = null } = {}) {
+async function doAttempt(draftId, { actor = null, driveClient = null, sweep = false } = {}) {
   const db = getDB();
   if (isDisabled()) return { outcome: 'disabled' };
 
   const draft = db.prepare(
-    'SELECT id, ne_code, name, drive_folder_url, parent_draft_id, provisional_code FROM product_drafts WHERE id = ?'
+    'SELECT * FROM product_drafts WHERE id = ?'
   ).get(draftId);
   if (!draft) return { outcome: 'not_found' };
-  if (!isSingleProductDraft(draft)) return { outcome: 'skipped_set' };
+  if (!isFolderEligibleDraft(draft)) return { outcome: 'skipped_provisional' };
+  // 対象外にしたカードは作らない (見回りが選んだ後に人が対象外にした・Codex)
+  if (draft.status === 'excluded') return { outcome: 'skipped_excluded' };
+  // 見回りは、選んだ後にカードが変わっていても守るカードを触らない (Notion から取り込んだ・自動作成を始める前)
+  if (sweep && (String(draft.source || 'portal') === 'notion_import' || String(draft.created_at || '') < FOLDER_SWEEP_CUTOFF)) return { outcome: 'skipped_protected' };
   if (draft.drive_folder_url && String(draft.drive_folder_url).trim() !== '') return { outcome: 'skipped_has_url' };
+  // 出品済みページへの色追加のカード: 足し先のページのフォルダを使う (取込のたびに色ごとのフォルダを増やさない)。
+  // 足し先にまだ無ければ待つ (足し先のフォルダができた後の見回りで写す)
+  if (draft.added_to_draft_id != null) {
+    const target = db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(draft.added_to_draft_id);
+    const url = target && target.drive_folder_url && String(target.drive_folder_url).trim();
+    if (!url) return { outcome: 'skipped_waiting_target' };
+    const r = db.prepare(`UPDATE product_drafts SET drive_folder_url = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+       WHERE id = ? AND (drive_folder_url IS NULL OR TRIM(drive_folder_url) = '')`).run(url, draftId);
+    if (r.changes) logEvent(db, draftId, 'drive_folder_created', `足し先のページ (#${draft.added_to_draft_id}) のフォルダを使う`, actor);
+    return { outcome: r.changes ? 'linked_target' : 'skipped_has_url', url };
+  }
 
   const folderName = buildImageFolderName(draft.ne_code, draft.name);
   try {
@@ -181,7 +211,7 @@ async function doAttempt(draftId, { actor = null, driveClient = null } = {}) {
     // 空のときだけ書く: 作成中に人が貼った URL を上書きしない
     const updated = db.prepare(`
       UPDATE product_drafts SET drive_folder_url = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-       WHERE id = ? AND (drive_folder_url IS NULL OR TRIM(drive_folder_url) = '')
+       WHERE id = ? AND (drive_folder_url IS NULL OR TRIM(drive_folder_url) = '') AND status != 'excluded'
     `).run(folder.url, draftId);
     if (updated.changes === 0) {
       // フォルダ自体は Drive にできている (無害)。カードは人の入力を正とする。
@@ -206,15 +236,11 @@ async function doAttempt(draftId, { actor = null, driveClient = null } = {}) {
  * @param {number[]} draftIds
  * @returns {Promise<{created: number, reused: number, skipped: number, failed: number}>}
  */
-export async function attemptImageFolderCreationBatch(draftIds, { actor = null, driveClient = null } = {}) {
+export async function attemptImageFolderCreationBatch(draftIds, { actor = null, driveClient = null, sweep = false } = {}) {
   const summary = { created: 0, reused: 0, skipped: 0, failed: 0 };
   for (const id of draftIds || []) {
-    // 出品済みページへの色追加のカード (2026-09-25) は、画像を既存ページのフォルダで扱うので
-    // 自動では作らない (取込のたびに「新しい色のコード_商品名」のフォルダが増えるのを避ける)
-    let addedTo = null;
-    try { addedTo = getDB().prepare('SELECT added_to_draft_id FROM product_drafts WHERE id = ?').get(id)?.added_to_draft_id ?? null; } catch (_) { /* 列が無い古い DB */ }
-    if (addedTo != null) { summary.skipped += 1; continue; }
-    const r = await attemptImageFolderCreation(id, { actor, driveClient });
+    // 出品済みページへの色追加のカードは doAttempt が足し先のフォルダの URL を写す (新しく作らない・2026-10-27)
+    const r = await attemptImageFolderCreation(id, { actor, driveClient, sweep });
     if (r.outcome === 'created') summary.created += 1;
     else if (r.outcome === 'reused') summary.reused += 1;
     else if (r.outcome === 'failed') summary.failed += 1;
@@ -244,7 +270,8 @@ export async function retryFailedImageFolders({ limit = MAX_RETRY_PER_RUN, actor
       SELECT d.id FROM product_drafts d
         JOIN draft_events e ON e.draft_id = d.id AND e.event = 'drive_folder_failed'
        WHERE (d.drive_folder_url IS NULL OR TRIM(d.drive_folder_url) = '')
-         AND d.parent_draft_id IS NULL AND COALESCE(d.provisional_code, 0) = 0
+         AND COALESCE(d.provisional_code, 0) = 0
+         AND d.status != 'excluded'   -- 対象外は LIMIT の前に外す (作らないカードで毎回の枠を埋めない・Codex)
        GROUP BY d.id
       HAVING COUNT(e.id) < ?
          AND MAX(e.created_at) <= strftime('%Y-%m-%dT%H:%M:%fZ','now','-${Number(RETRY_BACKOFF_HOURS)} hours')
@@ -257,4 +284,50 @@ export async function retryFailedImageFolders({ limit = MAX_RETRY_PER_RUN, actor
     console.error('[product-hub] 画像フォルダ再試行の走査に失敗:', e && e.message);
     return { retried: 0, created: 0, reused: 0, skipped: 0, failed: 0 };
   }
+}
+
+/**
+ * 🆕 2026-10-27 中原さん: URL の空いたカードを見回って画像フォルダを作る (全部の商品にフォルダを)。
+ * 新商品の登録 (Company DB) から来るカード・セット・色追加のカードも、作り損ねた分 (失敗・入口の作り漏れ) もここで拾う。
+ * 対象: 商品コードが確定・URL が空・対象外 (excluded) でない・Notion から取り込んだカードでない・CUTOFF 以降に作ったカード。
+ *   失敗の多い (MAX_RETRY_ATTEMPTS 回) カードと、前の失敗から RETRY_BACKOFF_HOURS 時間たっていないカードは飛ばす (今までの再試行と同じ決まり)。
+ * 1 回 limit 件まで・直列 (Drive を叩きすぎない)。重なって呼ばれたら後の呼び出しは何もしない。reject しない
+ */
+export const FOLDER_SWEEP_CUTOFF = '2026-08-27';   // 画像フォルダの自動作成を始めた日。これより前のカードは人の運用のまま
+export const FOLDER_SWEEP_LIMIT = 30;
+let sweeping = null;
+export function sweepMissingImageFolders({ limit = FOLDER_SWEEP_LIMIT, actor = 'system:image-folder-sweep', driveClient = null } = {}) {
+  if (sweeping) return sweeping;
+  const run = (async () => {
+    try {
+      const db = getDB();
+      if (isDisabled()) return { found: 0, created: 0, reused: 0, skipped: 0, failed: 0 };
+      if (!driveClient && !process.env.GOOGLE_SERVICE_ACCOUNT_KEY) return { found: 0, created: 0, reused: 0, skipped: 0, failed: 0 };
+      const rows = db.prepare(`
+        SELECT d.id FROM product_drafts d
+          LEFT JOIN (SELECT draft_id, COUNT(*) AS n, MAX(created_at) AS last FROM draft_events WHERE event = 'drive_folder_failed' GROUP BY draft_id) f ON f.draft_id = d.id
+         WHERE (d.drive_folder_url IS NULL OR TRIM(d.drive_folder_url) = '')
+           AND COALESCE(d.provisional_code, 0) = 0
+           AND d.status != 'excluded'
+           AND COALESCE(d.source, 'portal') != 'notion_import'
+           AND d.created_at >= ?
+           -- 色追加のカードは、足し先にフォルダがあるときだけ (無いカードで毎回 LIMIT を食って、ほかのカードが回らなくならないように・Codex)
+           AND (d.added_to_draft_id IS NULL OR EXISTS (SELECT 1 FROM product_drafts t WHERE t.id = d.added_to_draft_id AND TRIM(COALESCE(t.drive_folder_url, '')) <> ''))
+           AND (f.n IS NULL OR (f.n < ? AND f.last <= strftime('%Y-%m-%dT%H:%M:%fZ','now','-${Number(RETRY_BACKOFF_HOURS)} hours')))
+         ORDER BY (d.added_to_draft_id IS NOT NULL), d.id
+         LIMIT ?
+      `).all(FOLDER_SWEEP_CUTOFF, MAX_RETRY_ATTEMPTS, limit);
+      const summary = await attemptImageFolderCreationBatch(rows.map((r) => r.id), { actor, driveClient, sweep: true });
+      if (rows.length) console.log(`[product-hub] 画像フォルダの見回り: 対象 ${rows.length} 件 created=${summary.created} reused=${summary.reused} skipped=${summary.skipped} failed=${summary.failed}`);
+      return { found: rows.length, ...summary };
+    } catch (e) {
+      console.error('[product-hub] 画像フォルダの見回りに失敗:', e && e.message);
+      return { found: 0, created: 0, reused: 0, skipped: 0, failed: 0 };
+    }
+  })();
+  // 🚨 片付けは「覚えた後」に (中で await せずに終わる呼び出し = 鍵が無いなど は、覚える前に終わる。
+  //    中の finally で消すと、終わった約束を覚えたままになり、以後の見回りが全部その答えを返していた)
+  sweeping = run;
+  run.finally(() => { if (sweeping === run) sweeping = null; });
+  return run;
 }

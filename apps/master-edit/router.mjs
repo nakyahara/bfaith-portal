@@ -393,7 +393,21 @@ export function __setCardApplier(fn) { cardApplier = fn || null; }
 async function applyCard(ev) {
   if (cardApplier) return cardApplier(ev);
   const m = await import('../product-hub/services/cdb-card-intake.js');
-  return m.applyCdbCardEvent(ev);
+  const r = m.applyCdbCardEvent(ev);
+  kickImageFolder(r);
+  return r;
+}
+/**
+ * 🆕 2026-10-27 中原さん「全部の商品に画像フォルダを」: 新商品の登録でできたカードの画像フォルダを、登録の直後に裏で作る
+ * (待たない・失敗しても登録は止めない。作れなければ product-hub の見回りが拾う)。
+ */
+function kickImageFolder(r) {
+  // 新しく作ったカードだけ (既にあるカードに結んだ linked は、Notion から取り込んだカードなど見回りが守るカードのことがある。
+  // そちらは見回り = 守る決まりつき に任せる・Codex)
+  if (!r || !r.draft_id || r.outcome !== 'created') return;
+  import('../product-hub/services/drive-image-folder.js')
+    .then((m) => m.attemptImageFolderCreation(r.draft_id, { actor: 'system:master-edit-register' }))
+    .catch((e) => console.error(`[master-edit] 画像フォルダの作成の呼び出しの失敗: ${e && e.message}`));
 }
 /** まとまりのカードの取り込み (SQLite・#1675 の cdb-group-intake.js)。試験は差し替える */
 let groupCardApplier = null;
@@ -401,7 +415,9 @@ export function __setGroupCardApplier(fn) { groupCardApplier = fn || null; }
 async function applyGroupCard(ev) {
   if (groupCardApplier) return groupCardApplier(ev);
   const m = await import('../product-hub/services/cdb-group-intake.js');
-  return m.applyCdbGroupEvent(ev);
+  const r = m.applyCdbGroupEvent(ev);
+  kickImageFolder(r);
+  return r;
 }
 /** まとまりの知らせを 1 つ取り込む (まとめての登録の直後)。誤りは投げない (取れなければ product-hub の sweep が続きをする) */
 async function tryGroupCard(db, eventId) {

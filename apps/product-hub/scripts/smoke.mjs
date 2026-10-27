@@ -1103,10 +1103,19 @@ check('一括登録: 空入力は弾く', intake.registerByCodes([], {}).error =
   const built = listingEarly.buildItemPayload(db, card.id, LEGACY_TAX);
   check('色追加: カードからは楽天に出品しない (理由に直すページが出る)',
     built.ok === false && built.reasons.some((x) => /既存の楽天ページ「sgs」に追加する商品です/.test(x)), JSON.stringify(built.reasons));
-  // 画像フォルダは既存ページのものを使うので自動では作らない
+  // 画像フォルダは既存ページのものを使うので自動では作らない (足し先にフォルダがあればその URL を写す・2026-10-27)
   const dif0 = await import('../services/drive-image-folder.js');
+  const sgsUrl0 = db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(sgsId).drive_folder_url;
+  db.prepare('UPDATE product_drafts SET drive_folder_url = NULL WHERE id = ?').run(sgsId);
   const fold = await dif0.attemptImageFolderCreationBatch([card.id], { actor: 'smoke' });
-  check('色追加: 画像フォルダを自動で作らない', fold.skipped === 1 && fold.created === 0 && fold.failed === 0, JSON.stringify(fold));
+  check('色追加: 画像フォルダを自動で作らない (足し先にフォルダが無ければ待つ)', fold.skipped === 1 && fold.created === 0 && fold.failed === 0
+    && !db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(card.id).drive_folder_url, JSON.stringify(fold));
+  db.prepare('UPDATE product_drafts SET drive_folder_url = ? WHERE id = ?').run('https://drive.google.com/drive/folders/SGS-PAGE', sgsId);
+  const fold2 = await dif0.attemptImageFolderCreation(card.id, { actor: 'smoke' });
+  check('🚨 色追加: 足し先のページにフォルダがあれば、その URL を写す (新しいフォルダは作らない)',
+    fold2.outcome === 'linked_target' && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(card.id).drive_folder_url === 'https://drive.google.com/drive/folders/SGS-PAGE', JSON.stringify(fold2));
+  db.prepare('UPDATE product_drafts SET drive_folder_url = ? WHERE id = ?').run(sgsUrl0, sgsId);
+  db.prepare('UPDATE product_drafts SET drive_folder_url = NULL WHERE id = ?').run(card.id);
   // 前からある色を一括登録し直しても、色追加のカードは出さない (見たことのあるコード = まとめる)
   const regOld = intake.registerByCodes(['sgs-or'], { actor: 'smoke' });
   check('色追加: 前からある色の登録し直しではカードを出さない',
@@ -8475,10 +8484,14 @@ check('白抜きのみの取込は商品画像を触らず、draft_rakuten の�
   check('単品判定: 通常ドラフトは対象', dif.isSingleProductDraft({ parent_draft_id: null, provisional_code: 0 }) === true);
   check('単品判定: セット派生 (仮コード) は対象外', dif.isSingleProductDraft({ parent_draft_id: 1, provisional_code: 1 }) === false);
   check('単品判定: コード確定後のセットも対象外', dif.isSingleProductDraft({ parent_draft_id: 1, provisional_code: 0 }) === false);
+  // 🆕 2026-10-27 中原さん「全部の商品にフォルダを」: セットも対象。仮コードのあいだだけ待つ
+  check('フォルダの対象: セットもコードが確定していれば対象・仮コードは待つ',
+    dif.isFolderEligibleDraft({ parent_draft_id: 1, provisional_code: 0 }) === true && dif.isFolderEligibleDraft({ parent_draft_id: 1, provisional_code: 1 }) === false
+    && dif.isFolderEligibleDraft({ parent_draft_id: null, provisional_code: 0 }) === true);
 
   const setDifId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, parent_draft_id, provisional_code, created_by)
     VALUES ('SET-DIF-01', 'セット派生', 999, 1, 'smoke')`).run().lastInsertRowid);
-  check('セット派生はフォルダを作らない', (await dif.attemptImageFolderCreation(setDifId, {})).outcome === 'skipped_set');
+  check('仮コードのセットはまだフォルダを作らない', (await dif.attemptImageFolderCreation(setDifId, {})).outcome === 'skipped_provisional');
   check('URL入力済みのカードは触らない', (await dif.attemptImageFolderCreation(fdraft.id, {})).outcome === 'skipped_has_url');
 
   // SA 鍵なし → disabled (fail-soft。カード作成は成功のまま)
@@ -8607,6 +8620,62 @@ check('白抜きのみの取込は商品画像を触らず、draft_rakuten の�
   const pid = dif.imageFolderParentId();
   delete process.env.PH_IMAGE_FOLDER_PARENT_ID;
   check('不正な親フォルダIDは既定値へ', /^[A-Za-z0-9_-]+$/.test(pid) && pid !== "bad'id --", pid);
+
+  // 🆕 2026-10-27 見回り: URL の空いたカードを拾って作る (新商品の登録から来たカード・セット・作り損ね)
+  {
+    const mk = (code, extra = {}) => Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, parent_draft_id, provisional_code, source, status, created_at)
+      VALUES (@code, '見回り', 'smoke', @parent, @prov, @source, @status, @created)`).run({ code, parent: null, prov: 0, source: 'portal', status: 'draft',
+        created: '2026-10-20T00:00:00.000Z', ...extra }).lastInsertRowid);
+    const urlOf = (id) => db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(id).drive_folder_url;
+    const idCard = mk('SWEEP-CARD');                                  // 新商品の登録から来たカード (フォルダを作っていなかった)
+    const idSet = mk('SWEEP-SET', { parent: idCard });                 // コードが確定したセット
+    const idProv = mk('SWEEP-PROV', { parent: idCard, prov: 1 });      // 仮コードのセット = まだ
+    const idNotion = mk('SWEEP-NOTION', { source: 'notion_import' });  // Notion から取り込んだ既存カード = 触らない
+    const idEx = mk('SWEEP-EX', { status: 'excluded' });               // 対象外 = 触らない
+    const idOld = mk('SWEEP-OLD', { created: '2026-08-01T00:00:00.000Z' });   // 自動作成を始める前のカード = 触らない
+    const idAdd = mk('SWEEP-ADD');
+    db.prepare('UPDATE product_drafts SET added_to_draft_id = ? WHERE id = ?').run(idCard, idAdd);   // 色追加 = 足し先のフォルダを写す
+    // 🚨 鍵が無い呼び出し (すぐ終わる) の後でも、次の見回りが動く (終わった約束を覚えたままにしない)
+    const none = await dif.sweepMissingImageFolders();
+    check('見回り: 鍵が無ければ何もしない', none.found === 0 && !urlOf(idCard));
+    const sw = await dif.sweepMissingImageFolders({ limit: 1000, driveClient: fakeDrive([], 'SWEEP-ID') });
+    check('🚨 見回り: URL の空いたカード (新商品の登録から来たカード・コードの確定したセット) にフォルダを作る',
+      urlOf(idCard)?.endsWith('SWEEP-ID') && urlOf(idSet)?.endsWith('SWEEP-ID'), JSON.stringify(sw));
+    check('見回り: 仮コードのセット・Notion から取り込んだカード・対象外・自動作成を始める前のカードは触らない',
+      !urlOf(idProv) && !urlOf(idNotion) && !urlOf(idEx) && !urlOf(idOld));
+    check('見回り: 色追加のカードは足し先にフォルダができてから (同じ回では待つ)', !urlOf(idAdd));
+    // 足し先にフォルダが無い色追加のカードは見回りに選ばない (LIMIT を食って、ほかのカードが回らなくならない・Codex)
+    const idNoTarget = mk('SWEEP-NOTARGET', { source: 'notion_import' });
+    const waiting = [1, 2, 3].map((i) => { const id = mk(`SWEEP-WAIT-${i}`); db.prepare('UPDATE product_drafts SET added_to_draft_id = ? WHERE id = ?').run(idNoTarget, id); return id; });
+    const idLater = mk('SWEEP-LATER');
+    await dif.sweepMissingImageFolders({ limit: 1, driveClient: fakeDrive([], 'LATER-ID') });
+    check('🚨 見回り: 足し先にフォルダの無い色追加のカードは選ばない (ほかのカードが先に回る)',
+      waiting.every((id) => !urlOf(id)) && (urlOf(idAdd) === urlOf(idCard) || urlOf(idLater)?.endsWith('LATER-ID')));
+    await dif.sweepMissingImageFolders({ limit: 1000, driveClient: fakeDrive([], 'LATER-ID') });
+    check('見回り: 次の回で、足し先にフォルダのできた色追加のカードはその URL を写す', urlOf(idAdd) === urlOf(idCard) && urlOf(idLater)?.endsWith('LATER-ID'));
+    const sw2 = await dif.sweepMissingImageFolders({ limit: 1000, driveClient: fakeDrive([], 'X') });
+    check('見回り: 2 回目は作り直さない (URL が入ったカードは対象外)', urlOf(idCard)?.endsWith('SWEEP-ID') && urlOf(idSet)?.endsWith('SWEEP-ID'), JSON.stringify(sw2));
+    // 失敗の回数と間隔は今までの再試行と同じ決まり (直近の失敗は待つ)
+    const idFail = mk('SWEEP-FAIL');
+    db.prepare(`INSERT INTO draft_events (draft_id, event, detail, actor) VALUES (?, 'drive_folder_failed', '直近の失敗', 'smoke')`).run(idFail);
+    await dif.sweepMissingImageFolders({ limit: 1000, driveClient: fakeDrive([], 'FAIL-ID') });
+    check('見回り: 直近に失敗したカードは間をあける (Drive を叩きすぎない)', !urlOf(idFail));
+    const [a, b] = [dif.sweepMissingImageFolders({ limit: 1, driveClient: fakeDrive([], 'P') }), dif.sweepMissingImageFolders({ limit: 1, driveClient: fakeDrive([], 'Q') })];
+    check('見回り: 重なって呼ばれたら 1 本にまとめる', a === b);
+    await a;
+    // 🚨 選んだ後に対象外にした・守るカードは、1 枚ずつ作る直前にもう一度見て触らない (Codex)
+    const idLateEx = mk('SWEEP-LATE-EX', { status: 'excluded' });
+    // 古い再試行の列も、対象外は LIMIT の前に外す (作らないカードで毎回の枠を埋めない・Codex)
+    db.prepare(`INSERT INTO draft_events (draft_id, event, detail, actor, created_at) VALUES (?, 'drive_folder_failed', '昔の失敗', 'smoke', '2026-09-01T00:00:00.000Z')`).run(idLateEx);
+    const idRetryOk = mk('SWEEP-RETRY-OK');
+    db.prepare(`INSERT INTO draft_events (draft_id, event, detail, actor, created_at) VALUES (?, 'drive_folder_failed', '昔の失敗', 'smoke', '2026-09-02T00:00:00.000Z')`).run(idRetryOk);
+    const rtx = await dif.retryFailedImageFolders({ limit: 1, driveClient: fakeDrive([], 'RETRY-OK-ID') });
+    check('🚨 再試行: 対象外のカードは選ばない (後ろの失敗が回る)', !urlOf(idLateEx) && urlOf(idRetryOk)?.endsWith('RETRY-OK-ID'), JSON.stringify(rtx));
+    check('見回り: 対象外のカードは作る直前に見て作らない', (await dif.attemptImageFolderCreation(idLateEx, { driveClient: fakeDrive([], 'NO') })).outcome === 'skipped_excluded' && !urlOf(idLateEx));
+    const idLateNotion = mk('SWEEP-LATE-NOTION', { source: 'notion_import' });
+    check('見回り: Notion から取り込んだカードは見回りでは作らない (作る直前にも見る)',
+      (await dif.attemptImageFolderCreation(idLateNotion, { driveClient: fakeDrive([], 'NO'), sweep: true })).outcome === 'skipped_protected' && !urlOf(idLateNotion));
+  }
 }
 
 // 店舗内カテゴリ AI 自動適用の「一度だけ」判定 (router の everSaved と同じイベント名・同じクエリ)
