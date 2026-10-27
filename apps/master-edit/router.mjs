@@ -36,7 +36,7 @@
  *                                          lib/master-draft-cancel.mjs)。Postgres の前に product-hub のカード (SQLite) を読み、除外していないカードがあれば 409 card_exists
  *   POST /api/sku/:code/draft-in-ne        🆕 0098: NE にあるので登録済みにする { request_id, check_hash } (下書き・NE 登録待ちで NE にもう同じ商品がある・名簿 MASTER_DECISION_APPROVERS の人 =
  *                                          NE 登録の CSV と同じ・lib/master-draft-in-ne.mjs)。答え = DB の関数の答え + message (画面の 1 行)
- *   GET  /api/code-check?code= 新しい商品コードを確かめる (形 + Company DB・NE・使ったことがあるか)
+ *   GET  /api/code-check?code= 新しい商品コードを確かめる (形 + Company DB・NE・使ったことがあるか)。&kind=set = 引き継ぐ product-hub のセットのカード (set_card) も
  *   POST /api/new            新商品の登録 { request_id, kind, code, reason?, values: {...}, card: {...} } (lib/master-register.mjs)。
  *                            保存が成功したら、同じ要求の中で product-hub のカードの取り込みを 1 回試す (うまくいかなくても登録は成功のまま)
  *   POST /api/sku/:code/card-retry  カードの取り込みをもう一度 (名簿の人・衝突 / 失敗の知らせも試す)
@@ -603,10 +603,12 @@ async function setCodeReservedFor(code, requestId, db = null, take = null) {
   if (held.reason === 'ph_draft' && held.is_set) {
     const link = { card_url: phCardUrl(held.draft_id), draft_id: held.draft_id };
     if (take && card && card.takeable && card.draft_id === held.draft_id) {
-      if (take.cardCreate === false) return { status: 409, reason: 'set_card_needed', ...link, message: `${held.message}。このセットのカードとして引き継ぐので、「出品カードを作る」を外さずに登録してください` };
+      //   🆕 2026-10-27 中原さん: どこを押せばよいかを言う (画面は引き継ぐカードがあると ⑤ を「カードを作る」にして「作らない」を押せなくする = public/me-new.js)
+      if (take.cardCreate === false) return { status: 409, reason: 'set_card_needed', ...link, message: `${held.message}。⑤ 出品カードを「作る」にしてから保存してください (カード #${card.draft_id} を引き継ぎます)` };
       // 登録の取引の中の 2 回目 (take.inTx): 予約したカードと違う・入口では無かったカードを初めて見つけた (予約が無い) = 断る (予約したカードにしか結ばない・Codex R2 Medium 1)
       if (take.inTx && take.reservedId !== card.draft_id) return { status: 409, reason: 'set_card_changed', ...link, message: `${held.message}。引き継ぐカードがちょうど変わりました。画面を開き直してください` };
       take.draftId = card.draft_id;
+      take.card = card;   // 🆕 2026-10-27: 商品コードの確かめ (/api/code-check?kind=set) が引き継ぐカードを画面に返す
       return null;   // 引き継ぐ (登録の前に予約 → 登録の後のカードの取り込みが、このカードを Company DB のセットに結ぶ)
     }
     const why = take && card && card.why ? ` (${card.why})` : '';
@@ -1654,10 +1656,25 @@ router.post('/api/sku/:code/packing-guide', (req, res) => {
   }, 'write');
 });
 
+/**
+ * 新しい商品コードを確かめる (読むだけ・画面がその場で)。
+ *   🆕 2026-10-27 中原さん (nazoru-4): &kind=set = セットの登録。product-hub のセットのカード (まだ登録していないセットの下書き) が同じコード = 引き継ぐカード
+ *     set_card { draft_id, card_url, code, name, members } を返す (画面が ⑤ 出品カードを「カードを作る」にする)。構成はここでは比べない (保存のときに比べる・画面も一言を出す)。
+ *     ほかの登録の作るセット・引き継げないセットのカード = 使えない (保存のときと同じ一言)。product-hub を読めない = 503
+ */
 router.get('/api/code-check', (req, res) => withPgApi(res, async (db) => {
   const code = String(req.query.code ?? '');
   if (code.length > 60) return res.status(400).json({ ok: false, error: '長すぎます' });
-  res.json(await checkNewCodeInDb(db, code));
+  const cc = await checkNewCodeInDb(db, code);
+  if (!cc.ok || String(req.query.kind ?? '') !== 'set') return res.json(cc);
+  const take = { components: null, cardCreate: true };
+  //   db を渡さない = 予約の時間を過ぎた作るセットを記録で決める整理 (resolveStaleSetPlans = 書く) をしない (Codex R1 Medium 1: GET は読むだけ)。
+  //   時間を過ぎた waiting は held が数えない = ここで「使えない」と言いすぎない (保存のときは今までどおり整理してから確かめる)
+  const held = await setCodeReservedFor(code, null, null, take);
+  if (held && held.status === 503) return res.status(503).json({ ok: false, reason: held.reason, error: held.message });
+  if (held) return res.json({ ok: false, reason: held.reason, message: held.message, ...(held.card_url ? { card_url: held.card_url, draft_id: held.draft_id } : {}) });
+  const c = take.card;
+  res.json({ ...cc, set_card: c ? { draft_id: c.draft_id, card_url: phCardUrl(c.draft_id), code: c.code, name: c.name, members: (c.members || []).map((m) => ({ code: m.code, qty: Number(m.qty) })) } : null });
 }));
 
 /**

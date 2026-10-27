@@ -19,6 +19,9 @@
  *     構成品の欄はコード・名前・JAN で探せる (候補 = public/me-comp-suggest.js・GET /api/new/components = 構成品にできる単品だけ・日本語入力の変換中は選ばない)。
  *     打っている字がコードの形 (英数字・記号・空白なし) のときだけ打つとその場で引き当てる (名前を打っている間に「見つかりません」を出さない)。欄を出たら今までどおり引き当てる。
  *     引き当てた構成品の名前の横に「コピー」(クリップボード) と「名前に使う」(セットの名前が空・数が 2 以上のとき = 名前 N個セット = lib/set-plan.mjs defaultSetName と同じ形)
+ *   🆕 2026-10-27 中原さん (nazoru-4): セットの商品コードが product-hub のセットのカード (まだ登録していないセットの下書き) と同じ = そのカードを引き継ぐ。
+ *     コードの横と ⑤ に「product-hub のカード #N を引き継ぎます」・⑤ は「カードを作る」にして「作らない」を押せなくする・右の ③ に「カード #N を引き継ぐ」
+ *     (構成がカードとちがう = 「構成をカード #N と同じにする」で止める)。コードを変えた・カードが無いコード = ⑤ を前の選び方に戻す
  */
 (function () {
   'use strict';
@@ -112,6 +115,64 @@
   }
   function segVal(id) { var s = document.getElementById(id); return s ? s.getAttribute('data-value') || '' : ''; }
   function cardOn() { return segVal('card-create') !== '0'; }
+
+  /* ---------- 🆕 2026-10-27 中原さん (nazoru-4): 引き継ぐ product-hub のセットのカード ---------- */
+  // 商品コードの確かめ (/api/code-check?kind=set) が set_card を返した = ⑤ 出品カードを「カードを作る」にして「作らない」を押せなくする
+  //   (作らないで保存するとサーバーが set_card_needed で断る)。コードを変えた・カードが無いコード = 引き継ぐ前の ⑤ の選び方に戻す
+  var take = null;       // { code, card: { draft_id, card_url, members (無い = null) } }
+  var takePrev = null;   // 引き継ぐ前の ⑤ の選び方 ('1' / '0')
+  var cardSeg = document.getElementById('card-create');
+  function setCardSeg(v) {
+    if (!cardSeg || segVal('card-create') === v) return;
+    $$('button', cardSeg).forEach(function (b) { var on = b.getAttribute('data-v') === v; b.classList.toggle('on', on); b.setAttribute('aria-pressed', on ? 'true' : 'false'); });
+    cardSeg.setAttribute('data-value', v);
+    cardSeg.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  function setTake(code, card) {
+    if (!isSet || saved) return;
+    if (card) {
+      if (!take) takePrev = segVal('card-create') || '1';
+      take = { code: code, card: card };
+      setCardSeg('1');
+    } else if (take) {
+      take = null;
+      var prev = takePrev; takePrev = null;
+      if (prev) setCardSeg(prev);
+    }
+    var off = cardSeg ? $('button[data-v="0"]', cardSeg) : null;
+    if (off) {
+      off.disabled = !canSave || !!take;
+      if (take) off.title = 'product-hub のカード #' + take.card.draft_id + ' を引き継ぐので選べません'; else off.removeAttribute('title');
+    }
+  }
+  var takeText = function (c) { return 'product-hub のカード #' + c.draft_id + ' を引き継ぎます (新しいカードは作りません)'; };
+  var takeLink = function (c) { return /^\/apps\/product-hub\/detail\/\d+$/.test(String(c.card_url || '')) ? ' <a class="take-link" href="' + esc(c.card_url) + '" target="_blank" rel="noopener">product-hub で開く ↗</a>' : ''; };
+  /** 数の読み方 (サーバーの lib/master-write.mjs intIn と同じ: 全角 → 半角・カンマと空白を落とす)。整数でない = NaN */
+  function qtyNum(q) { var s = typeof q === 'number' ? String(q) : half(q).replace(/[,\s]/g, ''); return /^-?\d+$/.test(s) ? Number(s) : NaN; }
+  /** 構成の比べ方 (サーバーの cdb-set-plan.js membersKey と同じ: コードは小文字・同じ品は数を足す・並びは見ない) */
+  function membersKey(list) {
+    var m = {};
+    (list || []).forEach(function (x) { var k = String(x.code || '').trim().toLowerCase(); if (k) m[k] = (m[k] || 0) + qtyNum(x.qty); });
+    return Object.keys(m).sort().map(function (k) { return k + '×' + m[k]; }).join(',');
+  }
+  /** 入れた構成がカードの構成とちがう = 一言 (保存で断られる)。カードの構成を知らない・構成がまだ空・数の形が違う (保存でサーバーが数の誤りを言う) = '' */
+  function takeMismatch() {
+    if (!take || !Array.isArray(take.card.members)) return '';
+    var mine = components().filter(function (r) { return r.code; });
+    if (!mine.length || mine.some(function (r) { return isNaN(qtyNum(r.qty)); }) || membersKey(mine) === membersKey(take.card.members)) return '';
+    var txt = function (l) { return l.map(function (x) { return x.code + '×' + x.qty; }).join('・'); };
+    return 'カードの構成 (' + txt(take.card.members) + ') と入れた構成 (' + txt(mine) + ') がちがいます。構成をカードと同じにするか、別のコードにしてください';
+  }
+  function paintTake() {
+    var n = document.getElementById('card-take-note');
+    if (!n) return;
+    n.hidden = !take;
+    if (!take) return;
+    var mis = takeMismatch();
+    paint('#card-take-note', '<svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><div class="t">' + esc(takeText(take.card)) + '</div>'
+      + '<div class="hint">引き継ぐので「作らない」は選べません。' + takeLink(take.card) + '</div>'
+      + (mis ? '<div class="wrn"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg>' + esc(mis) + '</div>' : '') + '</div>');
+  }
   function priceOk(id) { var v = half(val(id)).replace(/,/g, ''); return /^\d+$/.test(v) && Number(v) >= 1; }
   /** 推奨保有月数の形 (サーバーの PARSERS.reorder_months と同じ: 0〜60・小数は 1 桁まで) */
   function monthsOk() { var v = half(val('f-reorder_months')); return /^\d{1,2}(\.\d)?$/.test(v) && Number(v) <= 60; }
@@ -148,6 +209,11 @@
     };
     var card = cardOn();
     if (!isSet) opt('cost', 'sec-money', '原価 (1 円以上)', '#cost-jpy', 2, priceOk('cost-jpy'));
+    // 🆕 2026-10-27: 引き継ぐ product-hub のカード (③ の先頭)。構成がカードとちがう = 保存で断られる = 直すまで止める
+    if (card && take) {
+      var mis = takeMismatch();
+      list.push({ id: 'card.take', sec: mis ? 'sec-comp' : 'sec-card', t: mis ? '構成をカード #' + take.card.draft_id + ' と同じにする' : 'カード #' + take.card.draft_id + ' を引き継ぐ', ok: !mis, focus: mis ? '#comp-rows .c-code' : '#card-take-note', level: 3 });
+    }
     if (card) {
       opt('card.amazon', 'sec-card', 'Amazon URL か ASIN', '#amazon-url', 3);
       opt('card.official_url', 'sec-card', '公式ページ URL', '#official-url', 3);
@@ -208,6 +274,7 @@
       });
     });
     paint('#checklist', h);
+    paintTake();
     var rm = $('#remain');
     rm.classList.toggle('ok', need.length === 0);
     var rh = need.length ? '下書き保存まで あと<b>' + need.length + '</b>つ' : '<b><svg class="ic" aria-hidden="true" style="width:20px;height:20px;vertical-align:-3px"><use href="#i-check"/></svg></b>下書きを保存できます';
@@ -265,21 +332,28 @@
   function checkCode() {
     var code = $('#code').value;
     var shape = codeShape(code);
-    if (shape) { codeState = { code: code, ok: false, message: shape }; sayCode(code ? shape : '', 'err'); update(); return; }
+    if (shape) { codeState = { code: code, ok: false, message: shape }; sayCode(code ? shape : '', 'err'); setTake(null, null); update(); return; }
     var my = ++codeSeq;
     sayCode('確かめています…', 'info');
-    fetch(BASE + '/api/code-check?code=' + encodeURIComponent(code), { headers: { Accept: 'application/json' } })
+    // 🆕 2026-10-27: セット = 引き継ぐ product-hub のセットのカードも聞く (set_card)
+    fetch(BASE + '/api/code-check?code=' + encodeURIComponent(code) + (isSet ? '&kind=set' : ''), { headers: { Accept: 'application/json' } })
       .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { r: r, j: j }; }); })
       .then(function (x) {
         if (my !== codeSeq || $('#code').value !== code) return;
-        if (x.r.ok && x.j.ok) { codeState = { code: code, ok: true }; sayCode('使えます', 'ok'); }
-        else if (x.r.status === 200 || x.r.status === 400) { codeState = { code: code, ok: false }; sayCode(x.j.message || x.j.error || '使えません', 'err'); }
-        else { codeState = { code: code, ok: null }; sayCode('いまは確かめられません (保存のときにもう一度確かめます)', 'warn'); }
+        if (x.r.ok && x.j.ok && isSet && x.j.set_card && x.j.set_card.draft_id) {
+          codeState = { code: code, ok: true };
+          setTake(code, x.j.set_card);
+          codeMsg.className = 'fmsg ok';
+          codeMsg.innerHTML = '<svg class="ic s" aria-hidden="true"><use href="#i-check"/></svg>' + esc(takeText(x.j.set_card)) + takeLink(x.j.set_card);
+        } else if (x.r.ok && x.j.ok) { codeState = { code: code, ok: true }; setTake(null, null); sayCode('使えます', 'ok'); }
+        else if (x.r.status === 200 || x.r.status === 400) { codeState = { code: code, ok: false }; setTake(null, null); sayCode(x.j.message || x.j.error || '使えません', 'err'); }
+        else { codeState = { code: code, ok: null }; if (take && take.code !== code) setTake(null, null); sayCode('いまは確かめられません (保存のときにもう一度確かめます)', 'warn'); }
         update();
       })
-      .catch(function () { if (my === codeSeq) { codeState = { code: code, ok: null }; sayCode('確かめられません (通信)。保存のときにもう一度確かめます', 'warn'); update(); } });
+      .catch(function () { if (my === codeSeq) { codeState = { code: code, ok: null }; if (take && take.code !== code) setTake(null, null); sayCode('確かめられません (通信)。保存のときにもう一度確かめます', 'warn'); update(); } });
   }
-  function codeLater() { clearTimeout(codeTimer); codeState = { code: null, ok: null }; sayCode(''); codeTimer = setTimeout(checkCode, 450); }
+  // コードを打ち直した = 前のコードの引き継ぐカードは外す (⑤ を前の選び方に戻す。同じカードのコードなら確かめの答えでまた引き継ぐ)
+  function codeLater() { clearTimeout(codeTimer); codeState = { code: null, ok: null }; sayCode(''); setTake(null, null); codeTimer = setTimeout(checkCode, 450); }
   var cc = $('#code-check'); if (cc) cc.addEventListener('click', function () { clearTimeout(codeTimer); checkCode(); });
 
   /* ---------- セットの構成 ---------- */
@@ -779,12 +853,15 @@
    * ここに無い項目は data-row の行の最初の欄
    */
   var FIELD_INPUT = { logizard_barcode: '#f-lzbc-in', maker: '#f-maker-in', brand: '#f-brand-in', 'card.yahoo': '#y-price', 'card.yahoo.price': '#y-price', 'card.yahoo.price_sagawa': '#y-price-sagawa', 'card.yahoo.delivery_label': '#y-delivery', 'card.yahoo.category_id': '#y-category', 'card.yahoo.path': '#y-path', reason: '#reason' };
-  function showError(j, status) {
+  function showError(j, status, sentCode) {
     var h = '<div class="result err" role="alert"><div class="rt">' + esc(j.error || ('HTTP ' + status)) + '</div>';
     if (j.reason === 'set_underivable' && Array.isArray(j.blockers)) h += '<ul>' + j.blockers.map(function (b) { return '<li>' + esc(b) + '</li>'; }).join('') + '</ul>';
     // 🆕 2026-10-21: コードを使っている product-hub のカード (同じポータルの URL だけ)
     if (j.card_url && /^\/apps\/product-hub\/detail\/\d+$/.test(String(j.card_url))) h += '<div><a id="held-card" href="' + esc(j.card_url) + '" target="_blank" rel="noopener">product-hub でカード #' + esc(j.draft_id) + ' を開く ↗</a></div>';
     $('#result').innerHTML = h + '</div>';
+    // 🆕 2026-10-27: 「作らない」のまま保存して断られた (コードの確かめが間に合わなかったなど) = そのカードを引き継ぐ形にする (⑤ を「カードを作る」に)
+    //   送ったコードのまま (返事を待つ間に打ち直していない) のときだけ (Codex R1 Medium 2: 前のコードのカードを今のコードに付けない)
+    if (j.reason === 'set_card_needed' && j.draft_id && sentCode != null && $('#code').value === sentCode) setTake(sentCode, { draft_id: j.draft_id, card_url: j.card_url, members: take && take.card.draft_id === j.draft_id ? take.card.members : null });
     if (j.field) {
       if (/^card\./.test(String(j.field))) { var cf = $('#card-fields'); if (cf) cf.hidden = false; }   // 隠れた欄の誤りでも直せるように開く
       var row = $('[data-row="' + String(j.field).replace(/"/g, '') + '"]', scope);
@@ -866,7 +943,7 @@
           return;
         }
         msg('', 'err');
-        showError(x.j, x.r.status);
+        showError(x.j, x.r.status, body.code);
         // 返事が来た = この番号の登録は終わった。直してもう一度押すときは新しい番号。
         //   🆕 成否が分からない (keep_request_id・作るセットの予約を持ったまま) = 同じ番号のまま押し直す (Codex R6 Medium 1)
         if (!x.j.keep_request_id) requestId = uuid();
