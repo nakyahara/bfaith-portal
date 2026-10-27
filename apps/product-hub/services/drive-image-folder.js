@@ -271,6 +271,7 @@ export async function retryFailedImageFolders({ limit = MAX_RETRY_PER_RUN, actor
         JOIN draft_events e ON e.draft_id = d.id AND e.event = 'drive_folder_failed'
        WHERE (d.drive_folder_url IS NULL OR TRIM(d.drive_folder_url) = '')
          AND COALESCE(d.provisional_code, 0) = 0
+         AND d.status != 'excluded'   -- 対象外は LIMIT の前に外す (作らないカードで毎回の枠を埋めない・Codex)
        GROUP BY d.id
       HAVING COUNT(e.id) < ?
          AND MAX(e.created_at) <= strftime('%Y-%m-%dT%H:%M:%fZ','now','-${Number(RETRY_BACKOFF_HOURS)} hours')

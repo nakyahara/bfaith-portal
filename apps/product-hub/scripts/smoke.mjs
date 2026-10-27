@@ -8665,6 +8665,12 @@ check('白抜きのみの取込は商品画像を触らず、draft_rakuten の�
     await a;
     // 🚨 選んだ後に対象外にした・守るカードは、1 枚ずつ作る直前にもう一度見て触らない (Codex)
     const idLateEx = mk('SWEEP-LATE-EX', { status: 'excluded' });
+    // 古い再試行の列も、対象外は LIMIT の前に外す (作らないカードで毎回の枠を埋めない・Codex)
+    db.prepare(`INSERT INTO draft_events (draft_id, event, detail, actor, created_at) VALUES (?, 'drive_folder_failed', '昔の失敗', 'smoke', '2026-09-01T00:00:00.000Z')`).run(idLateEx);
+    const idRetryOk = mk('SWEEP-RETRY-OK');
+    db.prepare(`INSERT INTO draft_events (draft_id, event, detail, actor, created_at) VALUES (?, 'drive_folder_failed', '昔の失敗', 'smoke', '2026-09-02T00:00:00.000Z')`).run(idRetryOk);
+    const rtx = await dif.retryFailedImageFolders({ limit: 1, driveClient: fakeDrive([], 'RETRY-OK-ID') });
+    check('🚨 再試行: 対象外のカードは選ばない (後ろの失敗が回る)', !urlOf(idLateEx) && urlOf(idRetryOk)?.endsWith('RETRY-OK-ID'), JSON.stringify(rtx));
     check('見回り: 対象外のカードは作る直前に見て作らない', (await dif.attemptImageFolderCreation(idLateEx, { driveClient: fakeDrive([], 'NO') })).outcome === 'skipped_excluded' && !urlOf(idLateEx));
     const idLateNotion = mk('SWEEP-LATE-NOTION', { source: 'notion_import' });
     check('見回り: Notion から取り込んだカードは見回りでは作らない (作る直前にも見る)',
