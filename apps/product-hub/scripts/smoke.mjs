@@ -11984,7 +11984,8 @@ for (const [name, file, data] of renders) {
     const srcB = fs.readFileSync(path.join(views, 'board.ejs'), 'utf8');
     const so = srcB.slice(srcB.indexOf('async function saveOrder(col) {'), srcB.indexOf('async function saveOrder(col) {') + 300);
     check('🚨 ボードの並び: 更新順で表示中は並びを保存しない (保存した手動の並びを日付で上書きしない)',
-      so.includes("if (kbSortMode() !== 'manual') return true;") && so.indexOf("kbSortMode()") < so.indexOf('const items'));
+      so.includes("if (kbSortMode() !== 'manual') return true;") && so.indexOf("kbSortMode()") < so.indexOf('saveOrderNow(col)')
+      && so.includes('rememberManualOrder(col)'));
     check('ボードの並び: 更新順で表示中は同じ列の中の並べ替えをしない (元に戻して案内する)',
       srcB.includes("if (kbSortMode() !== 'manual') { applyKbSort(); flashSortNote(); return; }"));
   }

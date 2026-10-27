@@ -1029,10 +1029,15 @@
   // 更新順は画面の中で並べ替えるだけ。保存した手動の並びは変えない (saveOrder が更新順のあいだは保存しない)。選んだ並びは自分の画面に覚える
   const KB_SORT_KEY = 'ph-board-sort';
   const kbSortSel = document.getElementById('kb-sort');
-  // 読み込んだときの並び (= 保存した手動の並び)。「手動」に戻すときはこの順に戻す
-  document.querySelectorAll('.kb-col[data-col] .kb-body').forEach((body) => {
-    [...body.querySelectorAll(':scope > .kb-card')].forEach((c, i) => { c.dataset.manualIdx = String(i); });
-  });
+  // 手動の並びを覚える (読み込んだとき・手動の並びを保存したとき・手動から離れる直前)。「手動」に戻すときはこの順に戻す
+  // (読み込んだときの順だけだと、ドラッグで並べ直して保存した後に更新順を見て戻ると、古い順に戻っていた・Codex)
+  function rememberManualOrder(scope) {
+    (scope ? [scope.querySelector('.kb-body')].filter(Boolean) : [...document.querySelectorAll('.kb-col[data-col] .kb-body')]).forEach((body) => {
+      [...body.querySelectorAll(':scope > .kb-card')].forEach((c, i) => { c.dataset.manualIdx = String(i); });
+    });
+  }
+  rememberManualOrder();
+  let kbPrevSort = 'manual';
   function kbSortMode() {
     const v = kbSortSel ? kbSortSel.value : 'manual';
     return v === 'updated_desc' || v === 'updated_asc' ? v : 'manual';
@@ -1066,9 +1071,12 @@
     try { const saved = localStorage.getItem(KB_SORT_KEY); if (saved) kbSortSel.value = saved; } catch (_) { /* 覚えられない画面でも並べ替えはできる */ }
     if (!['manual', 'updated_desc', 'updated_asc'].includes(kbSortSel.value)) kbSortSel.value = 'manual';
     kbSortSel.addEventListener('change', () => {
+      if (kbPrevSort === 'manual') rememberManualOrder();   // 手動から離れる直前の並び (保存した並び) を覚える
+      kbPrevSort = kbSortMode();
       try { localStorage.setItem(KB_SORT_KEY, kbSortSel.value); } catch (_) { /* 覚えられなくても並べ替える */ }
       applyKbSort();
     });
+    kbPrevSort = kbSortMode();
     applyKbSort();
   }
 
@@ -1533,6 +1541,11 @@
   async function saveOrder(col) {
     // 更新順で表示中の並びは画面だけ (保存した手動の並びを、日付の並びで上書きしない・2026-10-27)
     if (kbSortMode() !== 'manual') return true;
+    const ok = await saveOrderNow(col);
+    if (ok) rememberManualOrder(col);   // 保存できた並びを、更新順から戻るときの手動の並びにする
+    return ok;
+  }
+  async function saveOrderNow(col) {
     const items = [...col.querySelectorAll('.kb-card[data-draft]')]
       .map((c) => ({ id: Number(c.dataset.draft), kind: c.dataset.kind || '' }));
     if (items.length === 0) return true;
