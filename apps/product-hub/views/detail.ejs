@@ -2264,6 +2264,19 @@ th.attr-unknown { color: #dc2626; }
     </p>
     <%# 🆕 0090 表示の項目を商品マスタ (Company DB) と比べる箱 (Company DB構想 27 ④-2・読むだけ・部品 = _cdb-label.ejs) %>
     <%- include('_cdb-label', { draftId: draft.id }) %>
+    <%# 🆕 2026-10-27 中原さん: セット商品だけ、単品の商品ページ表記を探して写す。内容量には「× N個セット」を足す (その単品がこのセットの構成品で N が 2 以上のとき)。
+        写すのは画面の欄 (保存はいつもの自動保存・「ページ表記を保存」)。動きは下の @pi-from %>
+    <% if (typeof pageInfoSetMembers !== 'undefined' && pageInfoSetMembers.length) { %>
+    <div id="pi-from" style="margin:8px 0 12px; padding:8px 10px; border:1px dashed #f59e0b; border-radius:8px; background:#fffbeb;">
+      <div style="font-size:13px; font-weight:700; margin-bottom:4px;">🔁 単品の商品ページ表記を写す <span class="muted" style="font-weight:400; font-size:11px;">(セット商品だけ。構成: <%= pageInfoSetMembers.map((m) => m.code + ' × ' + m.qty).join(' / ') %>)</span></div>
+      <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+        <input type="search" id="pi-from-q" autocomplete="off" style="flex:1; min-width:200px;" placeholder="単品の商品名・商品コードで探す (空欄 = このセットの構成品)">
+        <select id="pi-from-src" style="flex:1; min-width:220px;"><option value="">(探しています…)</option></select>
+        <button type="button" class="btn btn-sm" id="pi-from-btn">情報を取得</button>
+      </div>
+      <div id="pi-from-msg" class="muted" style="font-size:11px; margin-top:4px;">選んだ単品の表記をこの画面の欄に写します (単品に値のある欄は上書き・空の欄はそのまま)。内容量には「× 個数セット」を付けます</div>
+    </div>
+    <% } %>
     <div class="grid-2">
       <div class="field">
         <label>商品タイプ<span class="ftag ftag-m">手入力</span></label>
@@ -5742,6 +5755,77 @@ th.attr-unknown { color: #dc2626; }
     const piPanel = document.getElementById('tab-info');
     piPanel.addEventListener('input', () => schedulePiAutoSave(1000));
     piPanel.addEventListener('change', () => schedulePiAutoSave(0));
+
+    // ─── @pi-from: セットの商品ページ表記を単品から写す (2026-10-27) ───
+    (function initPiFrom() {
+      const box = document.getElementById('pi-from');
+      if (!box) return;
+      const q = document.getElementById('pi-from-q');
+      const sel = document.getElementById('pi-from-src');
+      const btn = document.getElementById('pi-from-btn');
+      const msg = document.getElementById('pi-from-msg');
+      // 写す欄 (サーバの PAGE_INFO_COPY_FIELDS と同じ並び) → 画面の欄
+      const FIELD_IDS = {
+        product_type: 'pi-type', category_label: 'pi-category', origin_type: 'pi-origin-type', origin_country: 'pi-origin-country',
+        seller_name: 'pi-seller', importer_name: 'pi-importer', brand_name: 'pi-brand', content_volume: 'pi-volume', size_text: 'pi-size',
+        ingredients: 'pi-ingredients', usage_notes: 'pi-usage', other_notes: 'pi-other-notes',
+        food_name: 'pi-food-name', food_ingredients: 'pi-food-ingredients', food_expiry: 'pi-food-expiry', food_storage: 'pi-food-storage',
+      };
+      let seq = 0;
+      async function search() {
+        const my = ++seq;
+        const url = BASE + '/page-info-sources' + (q.value.trim() ? '?q=' + encodeURIComponent(q.value.trim()) : '');
+        let j;
+        try { j = await (await fetch(url, { credentials: 'same-origin' })).json(); } catch (_) { j = { ok: false, error: '通信エラー' }; }
+        if (my !== seq) return;   // 後から打った検索の答えを優先する
+        sel.replaceChildren();
+        const list = (j && j.ok && j.sources) || [];
+        if (!list.length) {
+          const op = document.createElement('option');
+          op.value = '';
+          op.textContent = j && j.ok ? '(見つかりません)' : '(' + ((j && j.error) || '探せませんでした') + ')';
+          sel.appendChild(op);
+          return;
+        }
+        for (const s of list) {
+          const op = document.createElement('option');
+          op.value = String(s.id);
+          op.textContent = s.ne_code + ' ' + (s.name || '') + (s.member_qty ? ' [構成 × ' + s.member_qty + ']' : '')
+            + (s.has_info ? (s.content_volume ? ' / 内容量 ' + s.content_volume : '') : ' (表記なし)');
+          op.disabled = !s.has_info;
+          sel.appendChild(op);
+        }
+        const first = [...sel.options].find((o) => !o.disabled);
+        if (first) sel.value = first.value;
+      }
+      let timer = null;
+      q.addEventListener('input', (e) => { e.stopPropagation(); clearTimeout(timer); timer = setTimeout(search, 300); });
+      q.addEventListener('change', (e) => e.stopPropagation());
+      sel.addEventListener('change', (e) => e.stopPropagation());   // 選ぶだけでは自動保存しない (写したときに保存する)
+      btn.addEventListener('click', async () => {
+        if (!sel.value) { msg.textContent = '写す単品を選んでください'; return; }
+        const filled = Object.values(FIELD_IDS).some((id) => id !== 'pi-type' && String((document.getElementById(id) || {}).value || '').trim());
+        if (filled && !confirm('選んだ単品に値のある欄は、この画面の値を上書きします (単品が空の欄はそのまま残します)。よろしいですか？')) return;
+        btn.disabled = true;
+        let j;
+        try { j = await (await fetch(BASE + '/page-info-from/' + encodeURIComponent(sel.value), { credentials: 'same-origin' })).json(); } catch (_) { j = { ok: false, error: '通信エラーで取得できませんでした' }; }
+        btn.disabled = false;
+        if (!j || !j.ok) { msg.textContent = (j && j.error) || '取得できませんでした'; return; }
+        // 単品に値のある欄だけ写す (単品が空の欄で、セットに入れた値を消さない)
+        let copied = 0;
+        for (const [k, id] of Object.entries(FIELD_IDS)) {
+          const el = document.getElementById(id);
+          const v = j.fields[k] == null ? '' : String(j.fields[k]);
+          if (!el || !v.trim()) continue;
+          el.value = v;
+          copied += 1;
+        }
+        applyTypeVisibility();   // 商品タイプに合わせて欄の出し分け・必須の印を直す
+        schedulePiAutoSave(0);   // いつもの自動保存で保存する
+        msg.textContent = j.source.ne_code + ' の表記を写しました (' + copied + ' 項目)' + (j.note ? '。' + j.note : '') + ' (自動で保存します)';
+      });
+      search();
+    })();
     // タブを閉じる/離れるときに未保存分を送る (応答は見ない best-effort)。
     // POST 進行中でも送ってよい: seq が進んでいるので、到着順がどちらでも
     // サーバー側のリビジョン判定で新しい内容 (ビーコン) が勝つ

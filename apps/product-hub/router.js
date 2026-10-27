@@ -176,7 +176,7 @@ import { fetchAmazonCatalog } from './lib/catalog-client.js';
 import { listSpManualKeywordsByAsin } from '../keyword-researcher/ads-api.js';
 import {
   PRODUCT_TYPES, CATEGORY_LABELS, CATEGORY_LABELS_BY_TYPE, adResponsibility, validatePageInfo,
-  buildPageInfoHtml, mapNeShippingToRakuten, listShippingMethodMap, saveShippingMethodMap,
+  buildPageInfoHtml, mapNeShippingToRakuten, listShippingMethodMap, saveShippingMethodMap, setContentVolume,
 } from './lib/page-info.js';
 import {
   parseShopCategoryText, replaceShopCategories, countActiveShopCategories,
@@ -548,6 +548,8 @@ router.get('/detail/:id', (req, res) => {
     rakutenGroupNeHints: RAKUTEN_GROUP_NE_HINTS,
     skuAttrGrid, skuExemptions,
     pageInfo, pageInfoHtml, neShipping,
+    // セットの構成 (商品ページ表記を単品から写す欄はセットだけに出す・2026-10-27)
+    pageInfoSetMembers: setMembersOf(db, draft.id),
     productTypes: PRODUCT_TYPES, categoryLabels: CATEGORY_LABELS,
     categoryLabelsByType: CATEGORY_LABELS_BY_TYPE,
     adResponsibilityText: adResponsibility(),
@@ -2658,6 +2660,64 @@ router.post('/api/drafts/:id/rakuten/visibility', async (req, res) => {
 });
 
 // ─── API: 商品ページ表記 (化粧品・食品) ──────────────────
+
+// ─── セットの商品ページ表記を単品から写す (2026-10-27 中原さん) ───
+// セット (draft_set_members がある) の商品情報タブで、単品の商品ページ表記を検索して取得し、画面の欄に写す。
+// 写すのは画面 (保存は今の自動保存・ページ表記を保存)。サーバは候補の検索と、写す値 (内容量に「× N個セット」を足す) を返すだけ
+/** セットの構成 [{ code, qty }]。セットでなければ [] */
+function setMembersOf(db, draftId) {
+  try {
+    return db.prepare('SELECT member_ne_code AS code, qty FROM draft_set_members WHERE set_draft_id = ? ORDER BY sort, member_ne_code').all(draftId);
+  } catch { return []; }
+}
+const PAGE_INFO_COPY_FIELDS = ['product_type', 'category_label', 'origin_type', 'origin_country', 'seller_name', 'importer_name', 'brand_name',
+  'content_volume', 'size_text', 'ingredients', 'usage_notes', 'other_notes', 'food_name', 'food_ingredients', 'food_expiry', 'food_storage'];
+/** 写す元の候補: 単品 (セットでない) のカード。検索語が無ければセットの構成品のカードを先に */
+router.get('/api/drafts/:id/page-info-sources', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const db = getDB();
+  const members = setMembersOf(db, draft.id);
+  if (!members.length) return res.status(400).json({ ok: false, error: 'セット商品のときだけ使えます' });
+  const qtyOf = new Map(members.map((m) => [String(m.code).trim().toLowerCase(), m.qty]));
+  const q = cleanText(req.query?.q, 100);
+  const isSingle = `NOT EXISTS (SELECT 1 FROM draft_set_members sm WHERE sm.set_draft_id = d.id) AND d.parent_draft_id IS NULL AND d.id != @self`;
+  let rows;
+  if (q) {
+    // LIKE の % _ は文字として探す (エスケープ文字は ! = バックスラッシュの二重エスケープを避ける)
+    const like = '%' + q.replace(/[!%_]/g, (c) => '!' + c) + '%';
+    rows = db.prepare(`SELECT d.id, d.ne_code, d.name, p.content_volume, p.draft_id IS NOT NULL AS has_info FROM product_drafts d
+      LEFT JOIN draft_page_info p ON p.draft_id = d.id
+      WHERE ${isSingle} AND (d.ne_code LIKE @like ESCAPE '!' OR d.name LIKE @like ESCAPE '!') ORDER BY has_info DESC, d.id DESC LIMIT 20`).all({ like, self: draft.id });
+  } else {
+    const codes = members.map((m) => String(m.code).trim().toLowerCase());
+    rows = db.prepare(`SELECT d.id, d.ne_code, d.name, p.content_volume, p.draft_id IS NOT NULL AS has_info FROM product_drafts d
+      LEFT JOIN draft_page_info p ON p.draft_id = d.id
+      WHERE ${isSingle} AND LOWER(TRIM(d.ne_code)) IN (SELECT value FROM json_each(@codes)) ORDER BY d.id`).all({ codes: JSON.stringify(codes), self: draft.id });
+  }
+  res.json({ ok: true, sources: rows.map((r) => ({ id: r.id, ne_code: r.ne_code, name: r.name, has_info: !!r.has_info, content_volume: r.content_volume || null,
+    member_qty: qtyOf.get(String(r.ne_code || '').trim().toLowerCase()) ?? null })) });
+});
+/** 写す値: 単品の商品ページ表記 + 内容量に「× N個セット」(その単品がセットの構成品で N が 2 以上のとき) */
+router.get('/api/drafts/:id/page-info-from/:srcId', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const db = getDB();
+  const members = setMembersOf(db, draft.id);
+  if (!members.length) return res.status(400).json({ ok: false, error: 'セット商品のときだけ使えます' });
+  const srcId = Number.parseInt(req.params.srcId, 10);
+  const src = Number.isInteger(srcId) && srcId > 0 ? db.prepare('SELECT id, ne_code, name, parent_draft_id FROM product_drafts WHERE id = ?').get(srcId) : null;
+  if (!src || src.id === draft.id) return res.status(404).json({ ok: false, error: '写す元の商品が見つかりません' });
+  if (src.parent_draft_id != null || setMembersOf(db, src.id).length) return res.status(400).json({ ok: false, error: '写す元は単品の商品にしてください' });
+  const info = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(src.id);
+  if (!info) return res.status(404).json({ ok: false, error: `${src.ne_code} にはまだ商品ページ表記がありません` });
+  const qty = members.find((m) => String(m.code).trim().toLowerCase() === String(src.ne_code || '').trim().toLowerCase())?.qty ?? null;
+  const fields = Object.fromEntries(PAGE_INFO_COPY_FIELDS.map((k) => [k, info[k] ?? null]));
+  fields.content_volume = setContentVolume(info.content_volume, qty);
+  res.json({ ok: true, source: { id: src.id, ne_code: src.ne_code, name: src.name }, member_qty: qty, fields,
+    note: qty == null ? `${src.ne_code} はこのセットの構成品ではないので、内容量はそのまま写しました`
+      : qty >= 2 && info.content_volume ? `内容量に「× ${qty}個セット」を付けました` : null });
+});
 
 router.post('/api/drafts/:id/page-info', (req, res) => {
   const draft = loadDraftOr404(req, res);
