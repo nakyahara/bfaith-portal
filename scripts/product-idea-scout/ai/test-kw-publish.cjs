@@ -19,3 +19,13 @@ test('収集は04:15で終わり、再試行しても朝のKW枠へ延長しな�
   const start=Date.parse('2026-09-10T05:00:00Z');assert.equal(new Date(deadline(start,19*3600000,true)).toISOString(),'2026-09-10T19:15:00.000Z');
   const morning=Date.parse('2026-09-10T20:00:00Z');assert.equal(deadline(morning,19*3600000,true),morning);assert.equal(deadline(start,19*3600000,false),start+19*3600000);
 });
+test('失敗した呼出の undefined を含む版でも、ポータルが受け取る JSON と同じハッシュで照合する (2026-10-27)',async t=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kw-publish-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  const edition={run_id:'failed-night',status:'failed',new_count:0,model_audit:[{batch:1,status:'CLI_FAILED',actual_model:undefined,usage:undefined}]};let stored=null;
+  const fetchFn=async(_url,opt)=>({ok:true,json:async()=>{
+    if(opt.method==='POST'){const body=JSON.parse(opt.body);stored=hash(body);return {run_id:body.run_id,body_hash:stored};}
+    return stored?{run_id:'failed-night',body_hash:stored}:{history:[]};
+  }});
+  assert.equal((await publish({state_dir:dir},{env:{MIRROR_SYNC_KEY:'test'},runFn:async()=>edition,fetchFn})).status,'failed');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir,'last-published.json'),'utf8')).body_hash,stored);
+});

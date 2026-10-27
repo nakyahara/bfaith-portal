@@ -200,3 +200,11 @@ test('incomplete, conflicting and malformed model streams do not pass',()=>{
 });
 
 test('market lower-bound and separate demand date survive R03 packet',()=>{const row=source();Object.assign(row.observations[0],{monthly_units:100,monthly_units_kind:'amazon_bought_past_month_lower_bound',demand_observed_at:'2026-09-08T00:00:00Z',retrieved_at:'2026-09-09T00:00:00Z',price_kind:'NEW'});const r=buildPacket(packet([row]),['C1'],now).candidates[0].observations[0];assert.equal(r.monthly_units_kind,'amazon_bought_past_month_lower_bound');assert.equal(r.demand_observed_at,'2026-09-08T00:00:00Z');assert.equal(r.price_kind,'NEW');});
+test('CLI_FAILED gets one retry, keeps the first failure when the retry slot is used, and keeps a masked error tail',async()=>{
+  const {withRetry,errorExcerpt}=require('./cli.cjs');const waits=[];const sleep=async ms=>{waits.push(ms);};
+  let seen=[];assert.equal((await withRetry(async retry=>{seen.push(retry);return {status:retry?'OK':'CLI_FAILED'};},{sleep})).status,'OK');assert.deepEqual(seen,[false,true]);assert.deepEqual(waits,[60000]);
+  seen=[];assert.equal((await withRetry(async retry=>{seen.push(retry);return {status:retry?'RETRY_LIMIT':'CLI_FAILED'};},{sleep})).status,'CLI_FAILED');
+  for(const status of ['OK','QUOTA_BLOCKED','AUTH_REQUIRED','TIMEOUT','MODEL_UNAVAILABLE']){seen=[];await withRetry(async retry=>{seen.push(retry);return {status};},{sleep});assert.deepEqual(seen,[false]);}
+  assert.equal(errorExcerpt({stderr:'  API Error: 500 for someone@example.co.jp\n'}),'API Error: 500 for <email>');
+  assert.equal(errorExcerpt({stderr:'x'.repeat(400)}).length,300);assert.equal(errorExcerpt({stderr:'',stdout:''}),null);
+});

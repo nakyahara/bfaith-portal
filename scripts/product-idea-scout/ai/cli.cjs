@@ -26,6 +26,24 @@ function classifyError(value) {
   if (/model.*(?:not found|unavailable|not supported|not exist|access)|invalid.model|unknown.model/i.test(value)) return 'MODEL_UNAVAILABLE';
   return 'CLI_FAILED';
 }
+// The tail of a failed CLI's output, kept so the next CLI_FAILED can be diagnosed (2026-10-27: nothing was left to read).
+// Mail addresses are masked; the prompt is sent on stdin and is not echoed back by the CLI.
+function errorExcerpt({stderr='',stdout=''}={}) {
+  const text=(String(stderr).trim()||String(stdout).trim()).replace(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g,'<email>').replace(/\s+/g,' ');
+  return text?text.slice(-300):null;
+}
+// One more try, after a pause, for a failure with no classified reason. 2026-10-27 05:00: R01 ended CLI_FAILED in 11 s
+// and the same call passed later, but the run stopped at batch 1. Quota, auth, model and timeout are not retried.
+// The retry takes the run's single retry slot (budget.cjs); a second failure is returned as is, and when the slot
+// is already used the first failure is kept so the stop reason stays CLI_FAILED.
+const RETRY_STATUSES=new Set(['CLI_FAILED']);
+async function withRetry(call,{waitMs=60000,sleep=ms=>new Promise(r=>setTimeout(r,ms))}={}) {
+  const first=await call(false);
+  if(!RETRY_STATUSES.has(first?.status))return first;
+  await sleep(waitMs);
+  const second=await call(true);
+  return second?.status==='RETRY_LIMIT'?first:second;
+}
 function commandFor(provider, env=process.env) {
   const npm = env.APPDATA && path.join(env.APPDATA,'npm','node_modules');
   check(npm, 'CLI_PATH_REQUIRED');
@@ -135,12 +153,12 @@ async function invoke(stage,prompt,options={}) {
   let timeoutMs=Number.isFinite(options.timeout_ms)&&options.timeout_ms>0?Math.min(600000,options.timeout_ms):600000;
   if(Number.isFinite(options.deadline_ms))timeoutMs=Math.max(1000,Math.min(timeoutMs,options.deadline_ms-Date.now()));
   const result=await execute(options.command||commandFor(route.provider,options.env||process.env),invocationArgs(stage),{cwd:options.cwd,env:options.env||process.env,stdin:prompt,timeoutMs});
-  const completed = result.stopped || result.code!==0 ? {...ready,status:result.stopped||classifyError(result.stderr+' '+result.stdout),requested_model:route.model} : {...ready,...parseResponse(route.provider,result.stdout,route.model,prompt),requested_model:route.model,effort:route.effort};
+  const completed = result.stopped || result.code!==0 ? {...ready,status:result.stopped||classifyError(result.stderr+' '+result.stdout),requested_model:route.model,...(result.stopped?{}:{error_excerpt:errorExcerpt(result)})} : {...ready,...parseResponse(route.provider,result.stdout,route.model,prompt),requested_model:route.model,effort:route.effort};
   options.budget.finish(reservation.id,completed);
   try {await options.save_budget(options.budget.snapshot());}catch{return {...completed,status:'BUDGET_SAVE_FAILED'};}
   return completed;
 }
-module.exports={ROUTING,billingEnvironment,configHazards,classifyError,commandFor,runProcess,preflight,invocationArgs,parseResponse,invoke};
+module.exports={ROUTING,billingEnvironment,configHazards,classifyError,errorExcerpt,withRetry,commandFor,runProcess,preflight,invocationArgs,parseResponse,invoke};
 if(require.main===module) {
   // Read only probe: invoking a model is deliberately not available through an ambient CLI flag.
   (async()=>{for(const provider of ['claude','codex'])console.log(JSON.stringify(await preflight(provider,{cwd:__dirname})));})().catch(e=>{console.error(JSON.stringify({status:e.code||'PROBE_FAILED'}));process.exitCode=1;});
