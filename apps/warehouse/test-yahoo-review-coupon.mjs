@@ -3,7 +3,7 @@
 import Database from 'better-sqlite3';
 import {
   ensureYahooCouponLedger, monthlyCouponPeriod, makeOperationId, couponDescription, isValidCouponUrl,
-  reserveMonth, markSubmitting, markIssued, markReconcileRequired, escalateStale, usableCouponFor, getCouponRow, isValidMonth, findByOperationId,
+  reserveMonth, refreshPlannedPeriod, markSubmitting, markIssued, markReconcileRequired, escalateStale, usableCouponFor, getCouponRow, isValidMonth, findByOperationId,
   couponUrlMatchesId, isUsableCopySource, EXPECTED_FORM, COUPON_TITLE,
 } from './yahoo-review-coupon-lib.js';
 
@@ -94,6 +94,24 @@ console.log('=== 3. 状態機械 (二重発行より未発行を選ぶ) ===');
   check('再マークしても reconcile_since は動かない', getCouponRow(db, '2026-10').reconcile_since === '2026-10-01T00:00:00.000Z');
   check('24時間超で manual_intervention', escalateStale(db, { nowIso: '2026-10-03T00:00:00.000Z' }).join() === '2026-10'
     && getCouponRow(db, '2026-10').status === 'manual_intervention');
+}
+
+console.log('=== 3b. planned のまま日をまたいだ行の期間を付け直す (2026-10 の 10/1 予約→毎日過去日で失敗) ===');
+{
+  const mdb = new Database(':memory:');
+  ensureYahooCouponLedger(mdb);
+  const p1 = monthlyCouponPeriod('2026-11', '2026-10-31T16:00:00.000Z'); // JST 11/1
+  reserveMonth(mdb, { month: '2026-11', period: p1, operationId: makeOperationId('2026-11', 'BBB'), nowIso: '2026-10-31T16:00:00.000Z' });
+  const p27 = monthlyCouponPeriod('2026-11', '2026-11-27T01:10:00.000Z'); // JST 11/27
+  check('同じ期間なら書き換えない', refreshPlannedPeriod(mdb, { month: '2026-11', period: p1 }) === false);
+  check('planned は今日開始に付け直す', refreshPlannedPeriod(mdb, { month: '2026-11', period: p27 }) === true
+    && getCouponRow(mdb, '2026-11').coupon_start === '2026/11/27 00:00' && getCouponRow(mdb, '2026-11').coupon_end === '2026/12/31 23:00',
+  JSON.stringify(getCouponRow(mdb, '2026-11')));
+  check('op-id は変えない', getCouponRow(mdb, '2026-11').operation_id.endsWith('-BBB'));
+  markSubmitting(mdb, '2026-11', '2026-11-27T01:10:00.000Z');
+  check('submitting 以降は期間を触らない (照合に使う)', refreshPlannedPeriod(mdb, { month: '2026-11', period: p1 }) === false
+    && getCouponRow(mdb, '2026-11').coupon_start === '2026/11/27 00:00');
+  mdb.close();
 }
 
 console.log('=== 4. 送信側が使えるクーポンの判定 ===');

@@ -29,7 +29,7 @@ import { openYahooContext, gotoStorePage, ensureStoreLogin, STORE_TOP_URL } from
 import { initRunLog, sendGChat, buildErrorReport } from './lib-notify.mjs';
 import {
   ensureYahooCouponLedger, monthlyCouponPeriod, makeOperationId, couponDescription, isValidCouponUrl,
-  reserveMonth, markSubmitting, markIssued, markReconcileRequired, escalateStale, getCouponRow,
+  reserveMonth, refreshPlannedPeriod, markSubmitting, markIssued, markReconcileRequired, escalateStale, getCouponRow,
   couponUrlMatchesId, isUsableCopySource, COUPON_TITLE, COUPON_DISCOUNT_RATIO, EXPECTED_FORM, FORM_HOUR_START, FORM_HOUR_END,
 } from '../../apps/warehouse/yahoo-review-coupon-lib.js';
 
@@ -353,6 +353,13 @@ async function main() {
       // dry-run は台帳に一切書かない (完全非破壊 — Codex Y-C3 R1 補足)
       row = { status: 'planned', operation_id: operationId };
       console.log('(dry-run のため台帳には書き込まない)');
+    }
+  } else if (row.status === 'planned') {
+    // まだ画面に送っていない → 今日を基準に計算し直した期間を使う (予約日の開始日は過去日になりうる)
+    operationId = row.operation_id;
+    if (LIVE && refreshPlannedPeriod(db, { month: MONTH, period, nowIso: nowIso() })) {
+      console.log(`台帳の期間を付け直し: ${row.coupon_start}〜${row.coupon_end} → ${period.startYmd}〜${period.endYmd}`);
+      row = getCouponRow(db, MONTH);
     }
   } else {
     operationId = row.operation_id;
