@@ -2907,6 +2907,11 @@ check('page-info: 化粧品の海外製は原産国なしでも通る (原則記
 check('page-info: 海外製 (輸入品) は輸入者名が必須 (メーカー名との両記載)',
   pinfo.validatePageInfo({ product_type: 'cosmetics', seller_name: 'X社', origin_type: '海外製', category_label: '化粧品' })
     .some((r) => r.includes('輸入者名')));
+// 🆕 2026-10-27 セットの内容量 = 単品の内容量 × N個セット
+check('page-info: セットの内容量は単品の内容量に「× N個セット」を足す (2 個以上・空は足さない・付いていれば足さない)',
+  pinfo.setContentVolume('30g', 2) === '30g × 2個セット' && pinfo.setContentVolume('30g', 1) === '30g'
+  && pinfo.setContentVolume('', 3) === null && pinfo.setContentVolume(null, 3) === null && pinfo.setContentVolume('30g × 2個セット', 2) === '30g × 2個セット'
+  && pinfo.setContentVolume('50ml', null) === '50ml');
 check('page-info: 健康食品の海外製は原産国名が必須',
   pinfo.validatePageInfo({ product_type: 'health_food', seller_name: 'X社', origin_type: '海外製', importer_name: '輸入X', category_label: '健康食品' })
     .some((r) => r.includes('原産国')));
@@ -5404,6 +5409,50 @@ let wfSetParentId = null;
     });
     return { status: res.status, json: await res.json() };
   };
+
+  // ─── 🆕 2026-10-27 セットの商品ページ表記を単品から写す ───
+  {
+    const ins = (code, name) => Number(db.prepare('INSERT INTO product_drafts (ne_code, name, created_by) VALUES (?, ?, ?)').run(code, name, 'smoke').lastInsertRowid);
+    const idSingle = ins('PIF-CRAN', 'クランベリーパウダー30g');
+    db.prepare(`INSERT INTO draft_page_info (draft_id, product_type, brand_name, content_volume, seller_name, origin_type, origin_country, ingredients, other_notes)
+      VALUES (?, 'food', 'B-Faith', '30g', '株式会社ビーフェイス', '海外製', 'アメリカ', 'クランベリー', '開封後は早めに')`).run(idSingle);
+    const idOther = ins('PIF-OTHER', '別の単品 クランベリー風味');
+    db.prepare(`INSERT INTO draft_page_info (draft_id, product_type, content_volume) VALUES (?, 'general', '100g')`).run(idOther);
+    const idNoInfo = ins('PIF-NOINFO', '表記なしのクランベリー');
+    const idSet = ins('PIF-CRAN-2', 'クランベリーパウダー30g 2個セット');
+    db.prepare('INSERT INTO draft_set_members (set_draft_id, member_ne_code, qty, sort) VALUES (?, ?, ?, 0)').run(idSet, 'pif-cran', 2);
+    // 構成品が候補の先頭に出る (検索語なし)
+    let r = await call('GET', `/api/drafts/${idSet}/page-info-sources`);
+    check('セットの表記を写す: 検索語なしならこのセットの構成品が候補 (個数つき)',
+      r.status === 200 && r.json.sources.length === 1 && r.json.sources[0].id === idSingle && r.json.sources[0].member_qty === 2 && r.json.sources[0].has_info === true, JSON.stringify(r.json));
+    r = await call('GET', `/api/drafts/${idSet}/page-info-sources?q=${encodeURIComponent('クランベリー')}`);
+    const ids = (r.json.sources || []).map((s) => s.id);
+    check('セットの表記を写す: 名前で探せる (単品だけ・セット自身は出さない・表記なしは has_info=false)',
+      ids.includes(idSingle) && ids.includes(idOther) && ids.includes(idNoInfo) && !ids.includes(idSet)
+      && r.json.sources.find((s) => s.id === idNoInfo).has_info === false, JSON.stringify(r.json));
+    r = await call('GET', `/api/drafts/${idSet}/page-info-sources?q=${encodeURIComponent('100%_')}`);
+    check('セットの表記を写す: 検索語の % _ は文字として探す (全部に当たらない)', r.status === 200 && r.json.sources.length === 0, JSON.stringify(r.json));
+    // 取得: 内容量に × 2個セット・ほかの欄はそのまま
+    r = await call('GET', `/api/drafts/${idSet}/page-info-from/${idSingle}`);
+    check('🚨 セットの表記を写す: 単品の表記を返し、内容量は「30g × 2個セット」',
+      r.status === 200 && r.json.fields.content_volume === '30g × 2個セット' && r.json.fields.brand_name === 'B-Faith' && r.json.fields.product_type === 'food'
+      && r.json.fields.origin_country === 'アメリカ' && r.json.fields.other_notes === '開封後は早めに' && r.json.member_qty === 2 && /× 2個セット/.test(r.json.note), JSON.stringify(r.json));
+    r = await call('GET', `/api/drafts/${idSet}/page-info-from/${idOther}`);
+    check('セットの表記を写す: 構成品でない単品からは内容量をそのまま (そう知らせる)',
+      r.status === 200 && r.json.fields.content_volume === '100g' && r.json.member_qty === null && /構成品ではない/.test(r.json.note), JSON.stringify(r.json));
+    r = await call('GET', `/api/drafts/${idSet}/page-info-from/${idNoInfo}`);
+    check('セットの表記を写す: 表記の無い単品は 404 (理由つき)', r.status === 404 && /まだ商品ページ表記がありません/.test(r.json.error));
+    r = await call('GET', `/api/drafts/${idSingle}/page-info-sources`);
+    check('セットの表記を写す: セットでない商品では使えない (400)', r.status === 400 && /セット商品のときだけ/.test(r.json.error));
+    r = await call('GET', `/api/drafts/${idSet}/page-info-from/${idSet}`);
+    check('セットの表記を写す: 自分自身からは写さない', r.status === 404);
+    // 画面: セットにだけ欄が出る
+    const htmlSet = await (await fetch(`${base}/detail/${idSet}`)).text();
+    const htmlSingle = await (await fetch(`${base}/detail/${idSingle}`)).text();
+    check('セットの表記を写す: 画面の欄はセットにだけ出る (構成の個数つき)',
+      htmlSet.includes('id="pi-from"') && htmlSet.includes('pif-cran × 2') && htmlSet.includes('id="pi-from-btn"') && !htmlSingle.includes('id="pi-from"'));
+    check('セットの表記を写す: 「HTMLをコピー」のボタンと id がぶつからない', (htmlSet.match(/id="pi-copy-btn"/g) || []).length === 1);
+  }
 
   const idE = Number(db.prepare(`
     INSERT INTO product_drafts (ne_code, name, official_url, created_by)

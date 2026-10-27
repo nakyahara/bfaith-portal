@@ -44,6 +44,18 @@ export const FIXED_NOTES =
   '※モニター画面の状況によって実際のお色と見え方が異なる場合がございます。予めご了承くださいませ。<br>'
   + '※予告なくパッケージラベル・外観等変更になる場合がございます。予めご了承お願いいたします。';
 
+/**
+ * セットの内容量 = 単品の内容量に「× N個セット」を足す (2026-10-27 中原さん: セットの商品ページ表記を単品から写すとき)。
+ * N が 2 以上・内容量がある・末尾に既に「× N個セット」が付いていないときだけ足す。空は null
+ */
+export function setContentVolume(volume, qty) {
+  const v = String(volume ?? '').trim();
+  const n = Number(qty);
+  if (!v || !Number.isInteger(n) || n < 2) return v || null;
+  if (/[×xX＊*]\s*\d+\s*個セット\s*$/.test(v)) return v;
+  return `${v} × ${n}個セット`;
+}
+
 /** 楽天必須記載 (化粧品・健康食品等) の対象タイプか */
 export function isRegulatedType(productType) {
   return productType === 'cosmetics' || productType === 'health_food';
