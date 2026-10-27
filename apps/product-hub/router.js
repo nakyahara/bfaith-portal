@@ -81,7 +81,7 @@ import { SET_PLAN_ALERT_DAYS } from '../../lib/set-plan.mjs';
 import { applyCdbGroupEvent, ackCdbGroupAttention } from './services/cdb-group-intake.js';
 import { cdbGroupCardView, cdbGroupBoardTags } from './services/cdb-group-gate.js';
 import { sweepCardOutbox, newEntryGate } from '../../lib/product-hub-outbox.mjs';
-import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFailedImageFolders, getDriveWriteClient, ensureImageFolder } from './services/drive-image-folder.js';
+import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFailedImageFolders, getDriveWriteClient, ensureImageFolder, sweepMissingImageFolders } from './services/drive-image-folder.js';
 import {
   requestImageJob as requestLpImageJob, imageStateFor as lpImageStateFor, createLpImageWorker, openaiGenerateImage,
   imageBlockReason as lpImageBlockReason, imageRefCandidates as lpImageRefCandidates, validImageRequestKey as lpImageValidKey,
@@ -104,6 +104,13 @@ if (process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
   const iv = setInterval(sweep, 30 * 60_000);
   if (t.unref) t.unref();
   if (iv.unref) iv.unref();
+  // 🆕 2026-10-27 中原さん「全部の商品に画像フォルダを」: URL の空いたカードを見回って作る (起動 1 分後・その後 10 分おき)。
+  // 新商品の登録 (Company DB) から来るカード・セット・作り損ねた分もここで拾う (services/drive-image-folder.js)
+  const folderSweep = () => { void sweepMissingImageFolders(); };
+  const ft = setTimeout(folderSweep, 60_000);
+  const fiv = setInterval(folderSweep, 10 * 60_000);
+  if (ft.unref) ft.unref();
+  if (fiv.unref) fiv.unref();
 }
 import { listWhiteBgInbox, registerWhiteBgFromInbox, whiteBgInboxFolderUrl, inboxThumbRef } from './services/white-bg-inbox.js';
 // 🆕 入荷受付チェックで撮ったパッケージ裏面の写真 (2026-09-18)。写真の正本は向こう側で、ここは読むだけ
@@ -3417,7 +3424,10 @@ async function sweepCdbCards() {
   } finally { clearTimeout(timer); }
 }
 
-router.get('/board', (req, res, next) => { sweepCdbCards().then(() => next()); }, (req, res) => {
+router.get('/board', (req, res, next) => {
+  // カードを取り込んだら、画像フォルダの空いたカードの見回りも裏で起こす (待たない・重なれば何もしない・2026-10-27)
+  sweepCdbCards().then(() => { void sweepMissingImageFolders({ limit: 10 }); next(); });
+}, (req, res) => {
   const db = getDB();
   maybeBackfillDerivedStatus(db);
   const me = staffByPortalEmail(req.session?.email);
