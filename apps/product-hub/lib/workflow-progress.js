@@ -1727,7 +1727,11 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
   // 画像ビューでは「詳細画像は対象外」の商品も候補から外す (Codex R1 medium): 画像の工程は
   // 詳細 (LP) の 1 本なのでカードにならず、候補に残すと LIMIT を食って実際に作業がある商品が欠ける
   const drafts = db.prepare(`
-    SELECT d.id, d.ne_code, d.name, d.status, d.created_at, d.updated_at, d.detail_images_excluded, d.image_priority, d.own_brand,
+    SELECT d.id, d.ne_code, d.name, d.status, d.created_at, d.updated_at,
+      ${/* カードの更新日時 (2026-10-27 中原さん: 同じ列の中を更新日で並べ替える)。カードの行の updated_at と、そのカードの操作の記録 (draft_events)
+            の新しい方 = 工程・画像・ページ表記など行を書かない操作も「更新」に数える */''}
+      MAX(d.updated_at, COALESCE((SELECT MAX(e.created_at) FROM draft_events e WHERE e.draft_id = d.id), d.updated_at)) AS last_activity_at,
+      d.detail_images_excluded, d.image_priority, d.own_brand,
       d.existing_page, d.source, d.added_to_draft_id,
       (SELECT ne_code FROM product_drafts ap WHERE ap.id = d.added_to_draft_id) AS added_to_ne_code,
       d.generation_block_code, d.generation_block_reason,
@@ -1906,6 +1910,7 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
     ];
     const baseCard = {
       id: d.id, ne_code: d.ne_code, name: d.name, status: d.status, image_priority: d.image_priority,
+      updatedAt: d.last_activity_at || d.updated_at || null,
       // カードの画像 (2026-09-13 スタッフ要望で _00 白抜きに統一)。白抜きがまだ無い商品は空にせず、
       // 従来どおり 枠1 (TOP) → _01 を出す
       card_image_id: d.white_bg_image_id || d.first_image_id,

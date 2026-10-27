@@ -3611,6 +3611,12 @@ let wfDraftId = null;
                 VALUES (?, 'thumb-00', '2026-09-13T00:00:00Z')`).run(idT);
     check('カードの画像: 白抜き (_00) があればそれを出す (更新日時もそちら)',
       cardT().card_image_id === 'thumb-00' && cardT().card_image_mtime === '2026-09-13T00:00:00Z', JSON.stringify(cardT().card_image_id));
+    // 🆕 2026-10-27 カードの更新日時 = カードの行の updated_at と操作の記録 (draft_events) の新しい方
+    db.prepare("UPDATE product_drafts SET updated_at = '2026-10-01T00:00:00.000Z' WHERE id = ?").run(idT);
+    db.prepare("DELETE FROM draft_events WHERE draft_id = ?").run(idT);
+    check('カードの更新日時: 操作の記録が無ければカードの行の updated_at', cardT().updatedAt === '2026-10-01T00:00:00.000Z', JSON.stringify(cardT().updatedAt));
+    db.prepare("INSERT INTO draft_events (draft_id, event, detail, actor, created_at) VALUES (?, 'step_changed', 'x', 'smoke', '2026-10-20T03:04:05.000Z')").run(idT);
+    check('🚨 カードの更新日時: 工程などの操作 (行を書かない) も更新に数える (新しい方)', cardT().updatedAt === '2026-10-20T03:04:05.000Z', JSON.stringify(cardT().updatedAt));
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idT);
   }
 
@@ -12088,6 +12094,19 @@ for (const [name, file, data] of renders) {
     rows.length > 0 && !rows.some((r) => r.includes('>構成<') || r.includes('>撮影指示書<')),
     rows.filter((r) => r.includes('>構成<') || r.includes('>撮影指示書<')).slice(0, 2).join(' | '));
   // まとめて移動 (2026-09-13 スタッフ要望)。カードごとに選択のチェックがあり、リンクの外に置く (押しても詳細へ飛ばない)
+  // 🆕 2026-10-27 同じ列の中の並び (手動 / 更新が新しい順 / 古い順)
+  check('ボード: 並びの選択 (手動 / 更新が新しい順 / 古い順) があり、カードは更新日時を持つ',
+    bh.includes('id="kb-sort"') && bh.includes('value="updated_desc"') && bh.includes('value="updated_asc"') && bh.includes('value="manual"')
+    && /data-updated="20[0-9][0-9]-/.test(bh) && /<div class="kb-updated"[^>]*>更新 [0-9]{1,2}[/][0-9]{1,2} [0-9][0-9]:[0-9][0-9]<[/]div>/.test(bh));
+  {
+    const srcB = fs.readFileSync(path.join(views, 'board.ejs'), 'utf8');
+    const so = srcB.slice(srcB.indexOf('async function saveOrder(col) {'), srcB.indexOf('async function saveOrder(col) {') + 900);
+    check('🚨 ボードの並び: 更新順で表示中は並びを保存しない (保存した手動の並びを日付で上書きしない)',
+      so.includes("if (kbSortMode() !== 'manual') return true;") && so.indexOf("kbSortMode()") < so.indexOf('saveOrderNow(col)')
+      && so.includes('const sent = [') && so.indexOf('const sent = [') < so.indexOf('await saveOrderNow(col)') && so.includes('col._kbSaveGen === gen'));
+    check('ボードの並び: 更新順で表示中は同じ列の中の並べ替えをしない (元に戻して案内する)',
+      srcB.includes("if (kbSortMode() !== 'manual') { applyKbSort(); flashSortNote(); return; }"));
+  }
   check('ボード: カードにまとめて移動の選択チェックがあり、リンクの外にある',
     /<label class="kb-pick"[^>]*><input type="checkbox" class="kb-pick-box"[^>]*><\/label>\s*<a class="kb-card-link"/.test(bh));
   // 画像ビューは担当者で絞らない (2026-09-13 中原さん決定: 画像の工程は担当者を置かない)。全体ビューは従来どおり
