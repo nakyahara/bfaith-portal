@@ -200,6 +200,8 @@
           <div class="panel-h"><span class="stepno" data-step="sec-card" aria-hidden="true"><%= no('sec-card') %></span><h2 id="h-card">出品カード (product-hub)</h2>
             <span class="right"><span class="sr" id="lab-card-create">出品カードを作るか</span><%- seg('card-create', 'card_create', '1', [['1', 'カードを作る'], ['0', '作らない']], '出品カード') %></span></div>
           <div class="hint" id="card-off-note" hidden style="margin-bottom:6px">カードは作りません (保存しても product-hub のボードにカードはできません)。</div>
+          <%# 🆕 2026-10-27 中原さん (nazoru-4): 商品コードが product-hub のセットのカード (まだ登録していないセットの下書き) と同じ = そのカードを引き継ぐ (中身 = public/me-new.js) %>
+          <% if (isSet) { %><div class="callout info" id="card-take-note" role="status" aria-live="polite" tabindex="-1" hidden style="margin-bottom:10px"></div><% } %>
           <div id="card-fields">
             <div class="f" data-row="card.official_url"><label class="lab" for="official-url">公式ページ URL</label><div class="ctl"><input class="in w-l" id="official-url" autocomplete="off" data-dirty-field="official_url" data-label="公式ページ URL" placeholder="https://"<%- part('card.official_url') %><%= dis %>><%- none('card.official_url') %></div></div>
             <div class="f" data-row="card.amazon_url"><label class="lab" for="amazon-url">Amazon URL</label><div class="ctl"><input class="in w-l" id="amazon-url" autocomplete="off" data-dirty-field="amazon_url" data-label="Amazon URL" placeholder="https://www.amazon.co.jp/dp/…  (貼ると ASIN を読み取ります)"<%- part('card.amazon') %><%= dis %>><%- none('card.amazon') %><span class="hint" style="flex-basis:100%">Amazon URL か ASIN のどちらか · Amazon に無い商品は「入力なし」</span></div></div>

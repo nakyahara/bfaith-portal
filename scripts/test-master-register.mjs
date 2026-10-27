@@ -3601,7 +3601,8 @@ await ta('[TK2] 引き継がない = 断る (どのカードか・なぜか・�
   };
   await refuse(setRegBody('sp-nt-2', [{ code: 'sp-nt', qty: 3 }]), 'set_code_reserved', new RegExp(`\\(#${planned.id}\\) が使っています \\(カードの構成 \\(sp-nt×2\\) と入れた構成 \\(sp-nt×3\\) がちがいます\\)。構成をカードと同じにするか、別のコードにしてください`));
   await refuse(setRegBody('sp-nt-2', [{ code: 'sp-nt', qty: 2 }, { code: 's001', qty: 1 }]), 'set_code_reserved', /がちがいます/);
-  await refuse(setRegBody('sp-nt-2', [{ code: 'sp-nt', qty: 2 }], { card: { create: false } }), 'set_card_needed', /「出品カードを作る」を外さずに登録してください/);
+  // 🆕 2026-10-27 中原さん (nazoru-4): どこを押せばよいかを言う
+  await refuse(setRegBody('sp-nt-2', [{ code: 'sp-nt', qty: 2 }], { card: { create: false } }), 'set_card_needed', new RegExp(`\\(#${planned.id}\\) が使っています。⑤ 出品カードを「作る」にしてから保存してください \\(カード #${planned.id} を引き継ぎます\\)。何も保存していません$`));
   await refuse({ request_id: uuid(), kind: 'single', code: 'sp-nt-2', values: withReq('single', single()), card: { create: false } }, 'set_code_reserved', /セットのカード \(下書き\) \(#\d+\) が使っています。別のコードにするか、product-hub でカードを確かめてください/);
   ph.prepare(`UPDATE product_drafts SET status = 'excluded' WHERE id = ?`).run(planned.id);
   await refuse(setRegBody('sp-nt-2', [{ code: 'sp-nt', qty: 2 }]), 'set_code_reserved', /\(除外にしてあります\)/);
@@ -3611,6 +3612,46 @@ await ta('[TK2] 引き継がない = 断る (どのカードか・なぜか・�
   const js = (await checkScripts(page.text, 0)).find((x) => x.includes('me-new.js — 新商品の登録の画面')) || '';
   assert.ok(js.includes("/^\\/apps\\/product-hub\\/detail\\/\\d+$/.test(String(j.card_url))"), '画面がカードのリンクを出さない');
   assert.ok(js.includes('を、このセットの出品カードとして引き継ぎました'), '画面が引き継いだことを知らせない');
+});
+
+await ta('[TK8] 2026-10-27 中原さん (nazoru-4): 商品コードの確かめ (?kind=set) = 引き継ぐ product-hub のセットのカード (set_card) を返す・引き継げないカード = 使えない (保存と同じ一言)・単品 (kind なし) は今までどおり', async () => {
+  const planned = await plannedSet('sp-cc', 'sp-cc-2');
+  const cc = (code, kind) => call('GET', '/apps/master-edit/api/code-check?code=' + encodeURIComponent(code) + (kind ? '&kind=' + kind : ''));
+  // 確かめは読むだけ (Codex R1 Medium 1): 作るセットの表・引き継ぐカードの予約の表を変えない (時間を過ぎた waiting の整理 = 保存のときだけ)
+  const snap = () => JSON.stringify([ph.prepare('SELECT request_id, state, note, created_at FROM ph_cdb_set_plans ORDER BY request_id').all(), ph.prepare('SELECT * FROM ph_set_card_takeovers ORDER BY request_id').all()]);
+  const oldRid = uuid();
+  ph.prepare(`INSERT INTO ph_cdb_set_plans (request_id, schema, parent_code, parent_name, plan_hash, request_hash, state, created_by, created_at) VALUES (?, 'set-plan-v1', 'sp-cc-old', 'x', ?, ?, 'waiting', 'x', '2000-01-01T00:00:00.000Z')`).run(oldRid, 'a'.repeat(64), 'b'.repeat(64));
+  ph.prepare(`INSERT INTO ph_cdb_set_plan_items (request_id, sort, qty, code, code_key, name) VALUES (?, 0, 2, 'sp-cc-none', 'sp-cc-none', 'x')`).run(oldRid);
+  const before = snap();
+  let r = await cc('SP-CC-2', 'set');   // 大文字小文字は同じと見る
+  assert.equal(r.status, 200, r.text);
+  assert.deepEqual([r.j.ok, r.j.code], [true, 'SP-CC-2']);
+  assert.deepEqual(r.j.set_card, { draft_id: planned.id, card_url: `/apps/product-hub/detail/${planned.id}`, code: 'sp-cc-2', name: planned.name, members: [{ code: 'sp-cc', qty: 2 }] });
+  // カードが無いコード = set_card: null (使えます)
+  r = await cc('sp-cc-none', 'set');
+  assert.deepEqual([r.status, r.j.ok, r.j.set_card], [200, true, null], r.text);
+  // kind なし (単品の画面) = 今までどおり (product-hub は聞かない = set_card が無い)
+  r = await cc('sp-cc-2');
+  assert.deepEqual([r.status, r.j.ok, 'set_card' in r.j], [200, true, false], r.text);
+  // Company DB にあるコード = 今までどおり使えない (product-hub は聞かない)
+  r = await cc('sp-cc', 'set');
+  assert.deepEqual([r.j.ok, 'set_card' in r.j], [false, false], r.text);
+  // 引き継げないカード (除外) = 使えない (保存と同じ一言・カードの URL)
+  ph.prepare(`UPDATE product_drafts SET status = 'excluded' WHERE id = ?`).run(planned.id);
+  r = await cc('sp-cc-2', 'set');
+  assert.deepEqual([r.status, r.j.ok, r.j.reason, r.j.card_url, r.j.draft_id], [200, false, 'set_code_reserved', `/apps/product-hub/detail/${planned.id}`, planned.id], r.text);
+  assert.match(r.j.message, /\(除外にしてあります\)。別のコードにするか、product-hub でカードを確かめてください/);
+  ph.prepare(`UPDATE product_drafts SET status = 'draft' WHERE id = ?`).run(planned.id);
+  // 確かめは読むだけ (予約を作らない・時間を過ぎた waiting もそのまま)
+  assert.equal(ph.prepare('SELECT COUNT(*) AS c FROM ph_set_card_takeovers WHERE draft_id = ?').get(planned.id).c, 0);
+  assert.equal(snap(), before, 'GET の確かめが product-hub の表を書いた');
+  ph.prepare('DELETE FROM ph_cdb_set_plan_items WHERE request_id = ?').run(oldRid);
+  ph.prepare('DELETE FROM ph_cdb_set_plans WHERE request_id = ?').run(oldRid);
+  // 画面の JS: セットのときは &kind=set で聞き、set_card を受けて ⑤ を「カードを作る」にする
+  const page = await call('GET', '/apps/master-edit/new?kind=set');
+  const js = (await checkScripts(page.text, 0)).find((x) => x.includes('me-new.js — 新商品の登録の画面')) || '';
+  assert.ok(js.includes("(isSet ? '&kind=set' : '')") && js.includes('x.j.set_card'), '画面が引き継ぐカードを聞かない');
+  assert.match(page.text, /id="card-take-note"/);
 });
 
 await ta('[TK3] 確かめた後にカードが変わった (構成を直した) = 結ばずに衝突 (人が決める)・直したら「もう一度作る」で引き継ぐ・登録の取引の中でももう一度確かめる', async () => {
