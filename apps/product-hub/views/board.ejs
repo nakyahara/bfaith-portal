@@ -1543,8 +1543,10 @@
     if (kbSortMode() !== 'manual') return true;
     // 送る並びを先に控える (保存を待つあいだに更新順へ切り替えると画面の並びが変わるので、答えの後に画面から読まない・Codex)
     const sent = [...col.querySelectorAll('.kb-body > .kb-card')];
+    // 同じ列で続けて並べ替えたとき、前の保存の答えが後の並びを上書きしないように、いちばん新しい保存だけが覚え直す (Codex)
+    const gen = (col._kbSaveGen = (col._kbSaveGen || 0) + 1);
     const ok = await saveOrderNow(col);
-    if (ok) sent.forEach((c, i) => { c.dataset.manualIdx = String(i); });   // 保存できた並びを、更新順から戻るときの手動の並びにする
+    if (ok && col._kbSaveGen === gen) sent.forEach((c, i) => { c.dataset.manualIdx = String(i); });   // 保存できた並びを、更新順から戻るときの手動の並びにする
     return ok;
   }
   async function saveOrderNow(col) {
