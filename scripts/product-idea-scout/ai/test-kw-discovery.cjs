@@ -50,8 +50,9 @@ test('枠切れや壊れた出力で、未確認の商品を確認済みにし�
 test('理由の分からないCLIの失敗は60秒後に1回だけやり直し、枠切れはやり直さない (2026-10-27)',async()=>{
  const session=()=>({state:{deadline:new Date(Date.now()+80*60000).toISOString()},budget:()=>({}),saveBudget:()=>{},recordStage:()=>{}});
  const base={day:'2026-10-27',rows:[row(1)],execution:{attestations:{}},saveState:async()=>{},saveStage:async()=>{},retryWaitMs:0};
- const calls=[];const r=await discover({...base,run_id:'cli-failed',state:{scan:{cycle:1,seen_asins:[]},history:[]},session:session(),invokeFn:async(stage,_p,o)=>{calls.push([stage,o.retry]);return {status:'CLI_FAILED',requested_model:'claude-sonnet-5'};}});
- assert.deepEqual(calls,[['R01',false],['R01',true]]);assert.equal(r.status,'failed');assert.match(r.warnings[0],/CLI_FAILED/);
+ const calls=[];const r=await discover({...base,run_id:'cli-failed',state:{scan:{cycle:1,seen_asins:[]},history:[]},session:session(),invokeFn:async(stage,_p,o)=>{calls.push([stage,o.retry,o.deadline_ms]);return {status:'CLI_FAILED',requested_model:'claude-sonnet-5'};}});
+ // 2回目だけ run の締め切りで縛る (残り1分を切っていれば呼ばない・10分の上限も残り時間まで)
+ assert.equal(calls.length,2);assert.deepEqual(calls[0],['R01',false,undefined]);assert.deepEqual(calls[1].slice(0,2),['R01',true]);assert.ok(Number.isFinite(calls[1][2]));assert.equal(r.status,'failed');assert.match(r.warnings[0],/CLI_FAILED/);
  // 失敗した呼出の記録に undefined が残っても、JSON にした内容とハッシュが変わらない形で公開できる (kw-publish の側で正規化)
  assert.equal(r.model_audit[0].actual_model,undefined);
  const quota=[];await discover({...base,run_id:'quota',state:{scan:{cycle:1,seen_asins:[]},history:[]},session:session(),invokeFn:async(stage,_p,o)=>{quota.push(o.retry);return {status:'QUOTA_BLOCKED'};}});

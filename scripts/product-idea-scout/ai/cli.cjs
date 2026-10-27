@@ -34,15 +34,17 @@ function errorExcerpt({stderr='',stdout=''}={}) {
 }
 // One more try, after a pause, for a failure with no classified reason. 2026-10-27 05:00: R01 ended CLI_FAILED in 11 s
 // and the same call passed later, but the run stopped at batch 1. Quota, auth, model and timeout are not retried.
-// The retry takes the run's single retry slot (budget.cjs); a second failure is returned as is, and when the slot
-// is already used the first failure is kept so the stop reason stays CLI_FAILED.
+// call({retry,again}): retry=true takes the run's single retry slot (budget.cjs). invoke sets requested_model only after
+// it reserved a call, so a failure before that (e.g. --version) is called again as a normal call. again=true tells the
+// caller to bound the second call by the run deadline. When the slot is used or no time is left, the first failure is
+// kept so the stop reason stays CLI_FAILED.
 const RETRY_STATUSES=new Set(['CLI_FAILED']);
 async function withRetry(call,{waitMs=60000,sleep=ms=>new Promise(r=>setTimeout(r,ms))}={}) {
-  const first=await call(false);
+  const first=await call({retry:false,again:false});
   if(!RETRY_STATUSES.has(first?.status))return first;
   await sleep(waitMs);
-  const second=await call(true);
-  return second?.status==='RETRY_LIMIT'?first:second;
+  const second=await call({retry:typeof first.requested_model==='string',again:true});
+  return ['RETRY_LIMIT','DEADLINE','DEADLINE_EXCEEDED'].includes(second?.status)?first:second;
 }
 function commandFor(provider, env=process.env) {
   const npm = env.APPDATA && path.join(env.APPDATA,'npm','node_modules');
