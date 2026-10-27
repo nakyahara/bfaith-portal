@@ -402,7 +402,9 @@ async function applyCard(ev) {
  * (待たない・失敗しても登録は止めない。作れなければ product-hub の見回りが拾う)。
  */
 function kickImageFolder(r) {
-  if (!r || !r.draft_id || !['created', 'linked'].includes(r.outcome)) return;
+  // 新しく作ったカードだけ (既にあるカードに結んだ linked は、Notion から取り込んだカードなど見回りが守るカードのことがある。
+  // そちらは見回り = 守る決まりつき に任せる・Codex)
+  if (!r || !r.draft_id || r.outcome !== 'created') return;
   import('../product-hub/services/drive-image-folder.js')
     .then((m) => m.attemptImageFolderCreation(r.draft_id, { actor: 'system:master-edit-register' }))
     .catch((e) => console.error(`[master-edit] 画像フォルダの作成の呼び出しの失敗: ${e && e.message}`));

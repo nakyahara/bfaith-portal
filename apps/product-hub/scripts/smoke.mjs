@@ -8643,7 +8643,16 @@ check('白抜きのみの取込は商品画像を触らず、draft_rakuten の�
       urlOf(idCard)?.endsWith('SWEEP-ID') && urlOf(idSet)?.endsWith('SWEEP-ID'), JSON.stringify(sw));
     check('見回り: 仮コードのセット・Notion から取り込んだカード・対象外・自動作成を始める前のカードは触らない',
       !urlOf(idProv) && !urlOf(idNotion) && !urlOf(idEx) && !urlOf(idOld));
-    check('見回り: 色追加のカードは、同じ回で先に作った足し先のフォルダの URL を写す', urlOf(idAdd) === urlOf(idCard));
+    check('見回り: 色追加のカードは足し先にフォルダができてから (同じ回では待つ)', !urlOf(idAdd));
+    // 足し先にフォルダが無い色追加のカードは見回りに選ばない (LIMIT を食って、ほかのカードが回らなくならない・Codex)
+    const idNoTarget = mk('SWEEP-NOTARGET', { source: 'notion_import' });
+    const waiting = [1, 2, 3].map((i) => { const id = mk(`SWEEP-WAIT-${i}`); db.prepare('UPDATE product_drafts SET added_to_draft_id = ? WHERE id = ?').run(idNoTarget, id); return id; });
+    const idLater = mk('SWEEP-LATER');
+    await dif.sweepMissingImageFolders({ limit: 1, driveClient: fakeDrive([], 'LATER-ID') });
+    check('🚨 見回り: 足し先にフォルダの無い色追加のカードは選ばない (ほかのカードが先に回る)',
+      waiting.every((id) => !urlOf(id)) && (urlOf(idAdd) === urlOf(idCard) || urlOf(idLater)?.endsWith('LATER-ID')));
+    await dif.sweepMissingImageFolders({ limit: 1000, driveClient: fakeDrive([], 'LATER-ID') });
+    check('見回り: 次の回で、足し先にフォルダのできた色追加のカードはその URL を写す', urlOf(idAdd) === urlOf(idCard) && urlOf(idLater)?.endsWith('LATER-ID'));
     const sw2 = await dif.sweepMissingImageFolders({ limit: 1000, driveClient: fakeDrive([], 'X') });
     check('見回り: 2 回目は作り直さない (URL が入ったカードは対象外)', urlOf(idCard)?.endsWith('SWEEP-ID') && urlOf(idSet)?.endsWith('SWEEP-ID'), JSON.stringify(sw2));
     // 失敗の回数と間隔は今までの再試行と同じ決まり (直近の失敗は待つ)

@@ -306,6 +306,8 @@ export function sweepMissingImageFolders({ limit = FOLDER_SWEEP_LIMIT, actor = '
            AND d.status != 'excluded'
            AND COALESCE(d.source, 'portal') != 'notion_import'
            AND d.created_at >= ?
+           -- 色追加のカードは、足し先にフォルダがあるときだけ (無いカードで毎回 LIMIT を食って、ほかのカードが回らなくならないように・Codex)
+           AND (d.added_to_draft_id IS NULL OR EXISTS (SELECT 1 FROM product_drafts t WHERE t.id = d.added_to_draft_id AND TRIM(COALESCE(t.drive_folder_url, '')) <> ''))
            AND (f.n IS NULL OR (f.n < ? AND f.last <= strftime('%Y-%m-%dT%H:%M:%fZ','now','-${Number(RETRY_BACKOFF_HOURS)} hours')))
          ORDER BY (d.added_to_draft_id IS NOT NULL), d.id
          LIMIT ?
