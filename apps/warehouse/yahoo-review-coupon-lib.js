@@ -152,6 +152,20 @@ export function reserveMonth(db, { month, period, operationId, nowIso = new Date
   return tx.immediate();
 }
 
+/**
+ * planned のまま日をまたいだ行の期間を付け直す (まだ画面に何も送っていないので安全)。
+ * 予約した日の開始日を使い続けると過去日になり、Yahoo が毎日弾く (2026-10: 10/1 に予約 → 2FA 切れで中断 → 10/2〜27 失敗)。
+ * @returns {boolean} 書き換えたら true (planned 以外・期間が同じなら false)
+ */
+export function refreshPlannedPeriod(db, { month, period, nowIso = new Date().toISOString() }) {
+  const start = `${period.startYmd} ${period.startHour}:00`;
+  const end = `${period.endYmd} ${period.endHour}:00`;
+  const r = db.prepare(`UPDATE yahoo_campaign_coupons SET coupon_start = ?, coupon_end = ?, updated_at = ?
+                         WHERE month = ? AND status = 'planned' AND (coupon_start <> ? OR coupon_end <> ?)`)
+    .run(start, end, nowIso, month, start, end);
+  return r.changes === 1;
+}
+
 /** planned → submitting (画面操作の直前に commit する。以後 status で自動再作成を止める) */
 export function markSubmitting(db, month, nowIso = new Date().toISOString()) {
   const r = db.prepare(`UPDATE yahoo_campaign_coupons SET status = 'submitting', submitted_at = ?, updated_at = ?
