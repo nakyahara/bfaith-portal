@@ -12106,6 +12106,92 @@ for (const [name, file, data] of renders) {
       && so.includes('const sent = [') && so.indexOf('const sent = [') < so.indexOf('await saveOrderNow(col)') && so.includes('col._kbSaveGen === gen'));
     check('ボードの並び: 更新順で表示中は同じ列の中の並べ替えをしない (元に戻して案内する)',
       srcB.includes("if (kbSortMode() !== 'manual') { applyKbSort(); flashSortNote(); return; }"));
+
+    // 🆕 2026-10-28 画像ボードで「仮構成」に落とした = LP構成を AI に作らせる。もう構成があれば作り直すかを聞く。
+    //    画面の本物の関数 (requestComposeFor) を取り出し、fetch / confirm を差し替えて動かす
+    const fnSrc = srcB.slice(srcB.indexOf("const COMPOSE_COL = 'compose';"), srcB.indexOf('(function showFlash()'));
+    const runCompose = async (states, { confirmAnswer = true, view = 'image', postFail = {} } = {}) => {
+      const calls = { get: [], post: [], confirm: [] };
+      const store = new Map();
+      const fakeFetch = async (url, init = {}) => {
+        const id = Number(String(url).match(/drafts\/(\d+)\/lp-compose/)[1]);
+        const json = (status, body) => ({ ok: status < 400, status, json: async () => body });
+        if (!init.method) { calls.get.push(id); return json(200, { ok: true, enabled: true, job: null, blocked: null, lp_effective: null, ...states[id] }); }
+        calls.post.push({ id, key: JSON.parse(init.body).idempotency_key });
+        return postFail[id] ? json(409, { ok: false, error: postFail[id] }) : json(200, { ok: true, created: true });
+      };
+      const f = new Function('BOARD_VIEW', 'fetch', 'confirm', 'sessionStorage', 'window', 'crypto',
+        fnSrc + '\nreturn { requestComposeFor, composeTarget };');
+      const api = f(view, fakeFetch, (m) => { calls.confirm.push(m); return confirmAnswer; },
+        { setItem: (k, v) => store.set(k, v), getItem: (k) => store.get(k) ?? null, removeItem: (k) => store.delete(k) },
+        { crypto: { randomUUID: () => 'k-' + Math.random().toString(36).slice(2, 12) } }, { randomUUID: () => 'k-' + Math.random().toString(36).slice(2, 12) });
+      const card = (id, name, kind = 'detail') => ({ dataset: { draft: String(id), name, kind } });
+      return { api, calls, store, card };
+    };
+    {
+      const { api, card } = await runCompose({});
+      check('仮構成: 構成を頼むのは画像ボードの詳細カードを「仮構成」(compose) に落としたときだけ',
+        api.composeTarget(card(1, 'A'), 'compose') && !api.composeTarget(card(1, 'A'), 'material')
+        && !api.composeTarget(card(1, 'A', 'top'), 'compose') && !(await runCompose({}, { view: 'all' })).api.composeTarget(card(1, 'A'), 'compose'));
+    }
+    {
+      const r = await runCompose({});
+      const msg = await r.api.requestComposeFor([r.card(11, '新しい商品')]);
+      check('仮構成: 構成がまだ無ければ聞かずに頼む (キー付き・知らせを残す)',
+        msg === '' && r.calls.confirm.length === 0 && r.calls.post.length === 1 && r.calls.post[0].id === 11
+        && /^[A-Za-z0-9_-]{8,80}$/.test(r.calls.post[0].key) && /新しい商品/.test(r.store.get('ph-board-flash') || ''), JSON.stringify(r.calls));
+    }
+    {
+      const r = await runCompose({ 12: { lp_effective: { text: 'x' } } }, { confirmAnswer: false });
+      const msg = await r.api.requestComposeFor([r.card(12, '構成あり')]);
+      check('🚨 仮構成: もう構成があれば作り直すかを聞き、キャンセルなら頼まない',
+        msg === '' && r.calls.confirm.length === 1 && /構成あり/.test(r.calls.confirm[0]) && /作り直しますか/.test(r.calls.confirm[0])
+        && r.calls.post.length === 0 && !r.store.has('ph-board-flash'), JSON.stringify(r.calls));
+    }
+    {
+      const r = await runCompose({ 13: { lp_effective: { text: 'x' } } }, { confirmAnswer: true });
+      await r.api.requestComposeFor([r.card(13, '構成あり'), r.card(14, '構成なし')]);
+      check('仮構成: まとめて落としたとき、構成のあるカードだけを 1 回の確認で聞き、OK なら両方頼む',
+        r.calls.confirm.length === 1 && /構成あり/.test(r.calls.confirm[0]) && !/構成なし/.test(r.calls.confirm[0])
+        && r.calls.post.map((p) => p.id).sort().join(',') === '13,14', JSON.stringify(r.calls));
+    }
+    {
+      const r = await runCompose({ 13: { lp_effective: { text: 'x' } } }, { confirmAnswer: false });
+      await r.api.requestComposeFor([r.card(13, '構成あり'), r.card(14, '構成なし')]);
+      check('仮構成: まとめて落として作り直しをキャンセルしても、構成の無いカードは頼む',
+        r.calls.post.map((p) => p.id).join(',') === '14', JSON.stringify(r.calls));
+    }
+    {
+      const r = await runCompose({ 21: { job: { status: 'running' }, lp_effective: { text: 'x' } }, 22: { blocked: '商品画像がありません' }, 23: { enabled: false } },
+        { postFail: {} });
+      const msg = await r.api.requestComposeFor([r.card(21, '作成中'), r.card(22, '画像なし'), r.card(23, '止めてある')]);
+      check('仮構成: 作っている途中・作れない・止めてある商品は頼まず、理由を知らせる (確認も出さない)',
+        r.calls.post.length === 0 && r.calls.confirm.length === 0
+        && /作成中.*いま作っています/.test(msg) && /画像なし.*商品画像がありません/.test(msg) && /止めてある.*止めてあります/.test(msg), msg);
+    }
+    {
+      const r = await runCompose({}, { postFail: { 31: 'この商品の構成をいま作っています' } });
+      const msg = await r.api.requestComposeFor([r.card(31, '断られた')]);
+      check('仮構成: サーバに断られたら理由を知らせ、頼んだ知らせは残さない',
+        /断られた.*頼めませんでした.*いま作っています/.test(msg) && !r.store.has('ph-board-flash'), msg);
+    }
+    const dropSrc = srcB.slice(srcB.indexOf("col.addEventListener('drop'"), srcB.indexOf('// ─── 画像の重要度セレクト'));
+    check('仮構成: 1 枚の移動は、工程が動いて落とした列に止まったときだけ構成を頼む',
+      dropSrc.includes('if (moved && !reopenBlocked && composeTarget(card, to)) {')
+      && dropSrc.indexOf('composeTarget(card, to)') < dropSrc.lastIndexOf('location.reload()'));
+    const grpSrc = srcB.slice(srcB.indexOf('async function dropGroup('), srcB.indexOf('function insertTargetIn('));
+    check('仮構成: まとめて移動は、工程が動いて落とした列に止まったカードだけ構成を頼む',
+      grpSrc.includes('moved.filter((c) => c.dataset.fromCol !== to && !blockedEls.includes(c) && composeTarget(c, to))')
+      && grpSrc.indexOf('requestComposeFor(composeCards)') < grpSrc.indexOf('location.reload()'));
+    const detSrc = fs.readFileSync(path.join(views, 'detail.ejs'), 'utf8');
+    const lpcAt = detSrc.indexOf('// もう構成があるときは作り直すかを聞く');
+    const lpcClick = detSrc.slice(lpcAt, lpcAt + 700);
+    check('詳細の「構成をAIに作らせる」ボタンも、もう構成があれば作り直すかを聞く (押し直しは聞かない)',
+      lpcClick.includes('if (!idemKey && state && state.lp_effective && !confirm(') && lpcClick.indexOf('confirm(') < lpcClick.indexOf('posting = true'));
+  }
+  {
+    const bhImg0 = renderedHtml.get('board.ejs (画像ビュー)') || '';
+    check('画像ボード: 「仮構成」の列は data-col="compose" (構成を頼む目印)', /data-col="compose"/.test(bhImg0));
   }
   check('ボード: カードにまとめて移動の選択チェックがあり、リンクの外にある',
     /<label class="kb-pick"[^>]*><input type="checkbox" class="kb-pick-box"[^>]*><\/label>\s*<a class="kb-card-link"/.test(bh));

@@ -83,6 +83,10 @@
                 gap: 10px; align-items: center; background: #1e3a8a; color: #fff; border-radius: 999px;
                 padding: 8px 14px; font-size: 13px; box-shadow: 0 4px 14px rgba(15,23,42,.25); }
   .kb-pickbar[hidden] { display: none; }
+  /* 「仮構成」に落として LP構成を頼んだ知らせ (読み直した後に数秒) */
+  .kb-flash { position: fixed; left: 50%; top: 16px; transform: translateX(-50%); z-index: 60; max-width: min(640px, calc(100vw - 32px));
+              background: #065f46; color: #fff; border-radius: 8px; padding: 8px 14px; font-size: 13px;
+              box-shadow: 0 4px 14px rgba(15,23,42,.25); }
   .kb-pickbar button { background: #fff; color: #1e3a8a; border: 0; border-radius: 999px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
   /* 読み直した直後に、いま動かしたカードを知らせる (2026-09-13: 読み直すと一番上に戻っていた) */
   .kb-card.just-moved { animation: kb-just-moved 1.6s ease-out 3; }
@@ -1463,6 +1467,78 @@
     refreshPickBar();
   });
 
+  // ─── 「仮構成」に落とした = LP構成を AI に作らせる (2026-10-28 中原さん) ───
+  // 詳細画面の「🤖 構成をAIに作らせる」と同じ API を通す (受付の条件・二重受付の防止・素材の読み込みはサーバのまま)。
+  // ボタンはそのまま残す。もう構成がある商品は「作り直しますか」と聞き、OK のときだけ作り直す。
+  // 構成を頼めなくても工程の移動はそのまま (頼めなかった理由を知らせるだけ)
+  const COMPOSE_COL = 'compose';
+  const composeTarget = (c, to) => BOARD_VIEW === 'image' && to === COMPOSE_COL && (c.dataset.kind || '') === 'detail';
+  const composeKey = () => (window.crypto && crypto.randomUUID) ? crypto.randomUUID()
+    : (Date.now() + '-' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2));
+  const FLASH_KEY = 'ph-board-flash';
+  /** 頼んだ結果。頼めた分は読み直した後に数秒だけ出し、頼めなかった分は alert の文にして返す */
+  async function requestComposeFor(cards) {
+    const nameOf = (c) => '「' + (c.dataset.name || ('#' + c.dataset.draft)) + '」';
+    const problems = [];
+    const started = [];
+    const fresh = [];
+    const redo = [];
+    for (const c of cards) {
+      let s = null;
+      try {
+        const res = await fetch('/apps/product-hub/api/drafts/' + c.dataset.draft + '/lp-compose', { headers: { Accept: 'application/json' } });
+        s = await res.json().catch(() => null);
+        if (!res.ok || !s || !s.ok) throw new Error((s && s.error) || ('HTTP ' + res.status));
+      } catch (err) {
+        problems.push(nameOf(c) + ': 構成の状況を読めませんでした (' + err.message + ')。詳細画面のボタンから作ってください');
+        continue;
+      }
+      const st = s.job ? s.job.status : null;
+      if (st === 'queued' || st === 'running') { problems.push(nameOf(c) + ': 構成はいま作っています (そのまま待ってください)'); continue; }
+      if (!s.enabled) { problems.push(nameOf(c) + ': 構成の AI 作成は止めてあります'); continue; }
+      if (s.blocked) { problems.push(nameOf(c) + ': 構成を作れません — ' + s.blocked); continue; }
+      (s.lp_effective ? redo : fresh).push(c);
+    }
+    let go = fresh;
+    if (redo.length) {
+      const ok = confirm(redo.map(nameOf).join('\n') + '\n\nは、もう LP構成があります。作り直しますか?\n\n'
+        + 'OK = AI がもう一度作ります (1〜3 分)。新しい構成ができると、今の構成 (人が直した版も) に替わって使われます\n'
+        + 'キャンセル = 今の構成のまま (カードの移動はそのままです)');
+      if (ok) go = fresh.concat(redo);
+    }
+    for (const c of go) {
+      try {
+        const res = await fetch('/apps/product-hub/api/drafts/' + c.dataset.draft + '/lp-compose', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ idempotency_key: composeKey() }),
+        });
+        const j = await res.json().catch(() => null);
+        if (res.ok && j && j.ok) started.push(nameOf(c));
+        else problems.push(nameOf(c) + ': 構成を頼めませんでした — ' + ((j && j.error) || ('HTTP ' + res.status)));
+      } catch (err) {
+        // 届いたかどうか分からない。自動では頼み直さない (詳細画面で状況を見られる)
+        problems.push(nameOf(c) + ': 構成を頼めたか分かりません (通信エラー)。詳細画面で状況を見てください');
+      }
+    }
+    if (started.length) {
+      try {
+        sessionStorage.setItem(FLASH_KEY, JSON.stringify({ at: Date.now(),
+          text: started.join('・') + ' の LP構成を AI に頼みました。1〜3 分でできます (詳細画面の「🤖 構成をAIに作らせる」で見られます)' }));
+      } catch (_) { /* 知らせが出ないだけ */ }
+    }
+    return problems.length ? 'LP構成について:\n\n' + problems.join('\n') : '';
+  }
+  (function showFlash() {
+    let f = null;
+    try { f = JSON.parse(sessionStorage.getItem(FLASH_KEY) || 'null'); sessionStorage.removeItem(FLASH_KEY); } catch (_) { return; }
+    if (!f || !f.text || Date.now() - Number(f.at || 0) > 60000) return;
+    const el = document.createElement('div');
+    el.className = 'kb-flash';
+    el.textContent = '🤖 ' + f.text;
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), 8000);
+  })();
+
   // 選んだカードをまとめて移動する。1 枚ずつ移動 API を通し、動かせなかったカードは理由をまとめて出す。
   // home = 掴んだカードの元の位置。🚨 dragend が最初の await の直後に dragHome を null にするので、
   // グローバルを後から読まずに drop の時点で受け取る (読むと、動けなかったカードを元に戻せない)
@@ -1512,6 +1588,9 @@
       for (const c of blockedEls) c.remove();
       await saveOrder(col);
     }
+    // 「仮構成」に工程が動いたカードだけ構成を頼む (元からその列にいた・先の列に進んだカードは頼まない)
+    const composeCards = moved.filter((c) => c.dataset.fromCol !== to && !blockedEls.includes(c) && composeTarget(c, to));
+    const composeMsg = composeCards.length ? await requestComposeFor(composeCards) : '';
     let msg = '';
     if (errors.length) msg += moved.length + ' 件を移動しました。移動できなかったカード (' + errors.length + ' 件):\n\n' + errors.join('\n');
     if (blocked.length) msg += (msg ? '\n\n' : '') + '落とした列に止まらなかったカード (' + blocked.length + ' 件):\n\n' + blocked.join('\n');
@@ -1519,6 +1598,7 @@
     if (moved.length && BOARD_VIEW !== 'image' && to === 'listing') {
       msg += (msg ? '\n\n' : '') + 'まとめて移動したときは楽天への出品の確認を出しません。出品は 1 枚ずつ「出品・展開」に落とすか、詳細画面から行ってください';
     }
+    if (composeMsg) msg += (msg ? '\n\n' : '') + composeMsg;
     if (msg) alert(msg);
     rememberFocus(moved.length ? moved : group);
     location.reload();
@@ -1667,6 +1747,11 @@
       // 読み直しで元の列に戻ったカードが変な順で並ぶ)。
       // 開き直せなかったときは落とした列に止まらないので、その列の並び順は保存しない
       if (moved && !reopenBlocked) await saveOrder(col);
+      // 画像ボードで「仮構成」に落とした = LP構成を AI に作らせる (2026-10-28)。もう構成があれば作り直すかを聞く
+      if (moved && !reopenBlocked && composeTarget(card, to)) {
+        const composeMsg = await requestComposeFor([card]);
+        if (composeMsg) alert(composeMsg);
+      }
       // 「出品・展開」に落とした = 楽天に出す番 (2026-09-01 中原さん要望)。工程移動が済んだあとに
       // 確認を出し、OK なら 画像転送 → 公開で登録 まで続ける。取りやめても工程移動は残る。
       // 楽天が済み/対象外の商品 (他モールの展開で戻ってきた等) には聞かない。

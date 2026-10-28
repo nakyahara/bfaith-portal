@@ -7671,6 +7671,10 @@ th.attr-unknown { color: #dc2626; }
 
     btn.addEventListener('click', async () => {
       if (posting) return;
+      // もう構成があるときは作り直すかを聞く (2026-10-28 中原さん。ボードで「仮構成」に落としたときと同じ)。
+      // 通信エラーの押し直し (同じキーで送る) は前に聞いているので聞かない
+      if (!idemKey && state && state.lp_effective && !confirm('この商品はもう LP構成があります。作り直しますか?\n\n'
+        + 'OK = AI がもう一度作ります (1〜3 分)。新しい構成ができると、今の構成 (人が直した版も) に替わって使われます')) return;
       posting = true;
       btn.disabled = true;
       statusEl.textContent = '依頼しています…';
