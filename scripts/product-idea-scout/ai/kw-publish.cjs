@@ -27,7 +27,9 @@ async function publish(config,{fetchFn=fetch,runFn=run,env}={}){
   }
   const judgements=latestJudgements(events);write(feedbackFile,{cursor,judgements,synced_at:new Date().toISOString()});
   write(path.join(config.state_dir,'feedback.json'),judgements);
-  const edition=await runFn(config);
+  // Hash what the portal receives: an in-memory edition can hold undefined fields (a failed call's actual_model/usage),
+  // which canonical() hashes but JSON drops, so a failed night ended PUBLISH_HASH_MISMATCH (2026-10-27).
+  const edition=JSON.parse(JSON.stringify(await runFn(config)));
   if(edition.schema_version==='kw-discovery-v2')check(edition.policy_version===require('./kw-policy.json').version&&edition.items.every(i=>i.screening?.decision==='propose'),'EDITION_REQUIRES_RESCREEN');
   const recoveries=load(path.join(config.state_dir,'pending-recovery.json'),[]);
   for(const id of recoveries){check(/^[\w.-]{1,80}$/.test(id),'INVALID_RUN_ID');const recovered=load(path.join(config.state_dir,'editions',id+'.json'),null);if(recovered?.schema_version==='kw-discovery-v2'&&(recovered.policy_version!==require('./kw-policy.json').version||!recovered.items.every(i=>i.screening?.decision==='propose')))continue;if(recovered){const receipt=await request('POST',recovered);check(receipt.body_hash===hash(recovered),'PUBLISH_HASH_MISMATCH');}}

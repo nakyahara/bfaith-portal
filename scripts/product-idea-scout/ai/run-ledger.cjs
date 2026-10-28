@@ -40,6 +40,7 @@ function safeResult(result = {}) {
       input_tokens: Number.isFinite(result.usage.input_tokens) ? result.usage.input_tokens : null,
       output_tokens: Number.isFinite(result.usage.output_tokens) ? result.usage.output_tokens : null,
     } : null,
+    ...(typeof result.error_excerpt === 'string' ? { error_excerpt: result.error_excerpt.slice(-300) } : {}),
   };
 }
 

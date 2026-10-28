@@ -200,3 +200,33 @@ test('incomplete, conflicting and malformed model streams do not pass',()=>{
 });
 
 test('market lower-bound and separate demand date survive R03 packet',()=>{const row=source();Object.assign(row.observations[0],{monthly_units:100,monthly_units_kind:'amazon_bought_past_month_lower_bound',demand_observed_at:'2026-09-08T00:00:00Z',retrieved_at:'2026-09-09T00:00:00Z',price_kind:'NEW'});const r=buildPacket(packet([row]),['C1'],now).candidates[0].observations[0];assert.equal(r.monthly_units_kind,'amazon_bought_past_month_lower_bound');assert.equal(r.demand_observed_at,'2026-09-08T00:00:00Z');assert.equal(r.price_kind,'NEW');});
+test('CLI_FAILED gets one retry, keeps the first failure when the retry slot is used, and keeps a masked error tail',async()=>{
+  const {withRetry,errorExcerpt}=require('./cli.cjs');const waits=[];const sleep=async ms=>{waits.push(ms);};
+  const reservedFail={status:'CLI_FAILED',requested_model:'claude-sonnet-5'};
+  let seen=[];assert.equal((await withRetry(async o=>{seen.push(o);return o.again?{status:'OK'}:reservedFail;},{sleep})).status,'OK');
+  assert.deepEqual(seen,[{retry:false,again:false},{retry:true,again:true}]);assert.deepEqual(waits,[60000]);
+  // A failure before the reservation (preflight) is called again as a normal call, not as the retry
+  seen=[];await withRetry(async o=>{seen.push(o);return {status:'CLI_FAILED'};},{sleep});assert.deepEqual(seen,[{retry:false,again:false},{retry:false,again:true}]);
+  for(const late of ['RETRY_LIMIT','DEADLINE','DEADLINE_EXCEEDED'])assert.equal((await withRetry(async o=>o.again?{status:late}:reservedFail,{sleep})).status,'CLI_FAILED');
+  for(const status of ['OK','QUOTA_BLOCKED','AUTH_REQUIRED','TIMEOUT','MODEL_UNAVAILABLE']){seen=[];await withRetry(async o=>{seen.push(o.retry);return {status};},{sleep});assert.deepEqual(seen,[false]);}
+  assert.equal(errorExcerpt({stderr:'  API Error: 500 for someone@example.co.jp\n'}),'API Error: 500 for <email>');
+  assert.equal(errorExcerpt({stderr:'x'.repeat(400)}).length,300);assert.equal(errorExcerpt({stderr:'',stdout:''}),null);
+});
+test('the retry goes through the real budget: preflight failure, reserved failure, and the run deadline',async()=>{
+  const {withRetry}=require('./cli.cjs');const sleep=async()=>{};
+  const attestation={provider:'claude',additional_usage_disabled:true,checked_by:'test',checked_at:'2026-01-01T00:00:00Z'};
+  const auth={code:0,stdout:JSON.stringify({loggedIn:true,authMethod:'claude.ai',subscriptionType:'max'}),stderr:''};
+  const ok={code:0,stdout:JSON.stringify({type:'result',result:'{}',usage:{}})+'\n',stderr:''};
+  const run=async({versionFails=0,inferenceFails=0,deadlineMs})=>{
+    let versions=0,inferences=0;const budget=new RunBudget({run_id:'retry',deadline:new Date(Date.now()+80*60000).toISOString(),profile:'kw-screened-v3'});
+    const execute=async(_c,args)=>{if(args[0]==='--version')return ++versions<=versionFails?{code:1,stdout:'',stderr:'busy'}:{code:0,stdout:'test',stderr:''};if(args[0]==='auth')return auth;return ++inferences<=inferenceFails?{code:1,stdout:'',stderr:'API Error: 500'}:ok;};
+    const result=await withRetry(o=>invoke('R01','synthetic',{env:{},command:{file:'unused'},cwd:process.cwd(),execute,budget,save_budget:async()=>{},billing_attestation:attestation,retry:o.retry,...(o.again&&deadlineMs?{deadline_ms:deadlineMs}:{})}),{sleep});
+    return {result,inferences,calls:budget.snapshot().calls.map(c=>[c.retry,c.status])};
+  };
+  // Codex R1: --version failed once -> the second attempt is reserved as a normal call and reaches the model
+  let r=await run({versionFails:1});assert.equal(r.inferences,1);assert.deepEqual(r.calls,[[false,'MODEL_UNVERIFIED']]);
+  r=await run({inferenceFails:1});assert.equal(r.inferences,2);assert.deepEqual(r.calls,[[false,'CLI_FAILED'],[true,'MODEL_UNVERIFIED']]);
+  assert.equal(r.result.status,'MODEL_UNVERIFIED');
+  // Codex R1: less than a minute left in the run -> no second model call, the stop reason stays CLI_FAILED
+  r=await run({inferenceFails:1,deadlineMs:Date.now()+30000});assert.equal(r.inferences,1);assert.equal(r.result.status,'CLI_FAILED');assert.equal(r.result.error_excerpt,'API Error: 500');
+});
