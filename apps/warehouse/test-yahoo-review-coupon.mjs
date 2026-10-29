@@ -4,7 +4,7 @@ import Database from 'better-sqlite3';
 import {
   ensureYahooCouponLedger, monthlyCouponPeriod, makeOperationId, couponDescription, isValidCouponUrl,
   reserveMonth, refreshPlannedPeriod, markSubmitting, markIssued, markReconcileRequired, escalateStale, usableCouponFor, getCouponRow, isValidMonth, findByOperationId,
-  couponUrlMatchesId, isUsableCopySource, EXPECTED_FORM, COUPON_TITLE,
+  couponUrlMatchesId, isUsableCopySource, EXPECTED_FORM, COUPON_TITLE, formHour,
 } from './yahoo-review-coupon-lib.js';
 
 let passed = 0, failed = 0;
@@ -30,6 +30,26 @@ console.log('=== 1. 期間計算 (vendor と同じ 月初〜翌月末) ===');
     const mm = `2027-${String(m).padStart(2, '0')}`;
     return monthlyCouponPeriod(mm, `2027-${String(m).padStart(2, '0')}-01T00:00:00.000Z`).spanDays <= 90;
   }));
+}
+
+console.log('=== 1b. 開始時刻は今より後 (2026-10: 当日 00:00 開始で「利用開始日時は現在から60日以内」と毎日弾かれた) ===');
+{
+  const inc = monthlyCouponPeriod('2026-10', '2026-10-29T01:10:13.594Z'); // JST 10/29 10:10 (失敗した回そのもの)
+  check('当日発行は次の正時に開始 (10:10 → 11:00)', inc.startYmd === '2026/10/29' && inc.startHour === '11' && inc.endYmd === '2026/11/30' && inc.endHour === '23', JSON.stringify(inc));
+  const first = monthlyCouponPeriod('2026-11', '2026-11-01T01:10:00.000Z'); // JST 11/1 10:10
+  check('月初当日の発行も 00:00 にしない (11/1 10:10 → 11:00)', first.startYmd === '2026/11/01' && first.startHour === '11', JSON.stringify(first));
+  check('猶予15分を見て切り上げ (10:45 → 11:00 / 10:46 → 12:00)',
+    monthlyCouponPeriod('2026-10', '2026-10-29T01:45:00.000Z').startHour === '11'
+    && monthlyCouponPeriod('2026-10', '2026-10-29T01:46:00.000Z').startHour === '12');
+  const late = monthlyCouponPeriod('2026-10', '2026-10-29T14:50:00.000Z'); // JST 10/29 23:50
+  check('深夜は翌日の正時へ (23:50 → 翌 01:00)', late.startYmd === '2026/10/30' && late.startHour === '01', JSON.stringify(late));
+  const adv = monthlyCouponPeriod('2026-11', '2026-10-29T01:10:00.000Z');
+  check('月初より前の発行は月初 00:00 のまま', adv.startYmd === '2026/11/01' && adv.startHour === '00', JSON.stringify(adv));
+  const edge = monthlyCouponPeriod('2026-11', '2026-10-31T14:50:00.000Z'); // JST 10/31 23:50
+  check('月初直前 (猶予内) は月初 01:00', edge.startYmd === '2026/11/01' && edge.startHour === '01', JSON.stringify(edge));
+  let badHour = false;
+  try { formHour('24'); } catch { badHour = true; }
+  check('フォームの時刻値 HH0000', formHour('00') === '000000' && formHour('11') === '110000' && formHour('23') === '230000' && badHour);
 }
 
 console.log('=== 2. op-id / URL 検証 ===');
@@ -104,13 +124,13 @@ console.log('=== 3b. planned のまま日をまたいだ行の期間を付け直
   reserveMonth(mdb, { month: '2026-11', period: p1, operationId: makeOperationId('2026-11', 'BBB'), nowIso: '2026-10-31T16:00:00.000Z' });
   const p27 = monthlyCouponPeriod('2026-11', '2026-11-27T01:10:00.000Z'); // JST 11/27
   check('同じ期間なら書き換えない', refreshPlannedPeriod(mdb, { month: '2026-11', period: p1 }) === false);
-  check('planned は今日開始に付け直す', refreshPlannedPeriod(mdb, { month: '2026-11', period: p27 }) === true
-    && getCouponRow(mdb, '2026-11').coupon_start === '2026/11/27 00:00' && getCouponRow(mdb, '2026-11').coupon_end === '2026/12/31 23:00',
+  check('planned は今日の次の正時開始に付け直す', refreshPlannedPeriod(mdb, { month: '2026-11', period: p27 }) === true
+    && getCouponRow(mdb, '2026-11').coupon_start === '2026/11/27 11:00' && getCouponRow(mdb, '2026-11').coupon_end === '2026/12/31 23:00',
   JSON.stringify(getCouponRow(mdb, '2026-11')));
   check('op-id は変えない', getCouponRow(mdb, '2026-11').operation_id.endsWith('-BBB'));
   markSubmitting(mdb, '2026-11', '2026-11-27T01:10:00.000Z');
   check('submitting 以降は期間を触らない (照合に使う)', refreshPlannedPeriod(mdb, { month: '2026-11', period: p1 }) === false
-    && getCouponRow(mdb, '2026-11').coupon_start === '2026/11/27 00:00');
+    && getCouponRow(mdb, '2026-11').coupon_start === '2026/11/27 11:00');
   mdb.close();
 }
 

@@ -18,11 +18,18 @@
 
 export const COUPON_DISCOUNT_RATIO = 5;          // 定率 5% (vendor 現行と同じ)
 export const COUPON_TITLE = '雑貨イズムYahoo!ショッピング店で次回購入に使える5％割引クーポン'; // vendor の実タイトルと完全一致 (％は全角)
-export const COUPON_START_HOUR = '00';   // 台帳表記 (YYYY/MM/DD HH:00)
-export const COUPON_END_HOUR = '23';
+export const COUPON_END_HOUR = '23';     // 台帳表記 (YYYY/MM/DD HH:00)
+// 開始が「今」より前だと Yahoo は「利用開始日時は現在から60日以内で設定してください」で弾く
+// (2026-10: 当日 00:00 開始で 10/2〜10/29 毎日失敗。9月分は 8/28 に 9/1 00:00 開始で前もって発行したので通っていた)。
+// 確認→発行の間に過去にならないよう、今から START_LEAD_MIN 分以上先の正時に切り上げる
+export const START_LEAD_MIN = 15;
 // 発行フォームの時刻セレクトは HHMMSS 形式 (2026-08-28 実測: '000000' / '230000')
-export const FORM_HOUR_START = '000000';
 export const FORM_HOUR_END = '230000';
+/** 台帳表記の時 'HH' → フォームの時刻セレクトの値 'HH0000' */
+export function formHour(hh) {
+  if (!/^([01]\d|2[0-3])$/.test(String(hh))) throw new Error(`時刻が不正 (${hh})`);
+  return `${hh}0000`;
+}
 export const OP_ID_PREFIX = 'RVW';
 // コピー元クーポンに要求する条件 (一覧の hidden input。実測 2026-08-27: vendor の月次クーポン)
 export const SOURCE_DISCOUNT_TYPE = '2';   // 2 = 定率割引
@@ -80,20 +87,26 @@ function lastDayOf(year, month1) {
 
 /**
  * 月次クーポンの掲載期間を決める。vendor と同じ「月初発行・翌月末まで有効」。
- * 実行が月の途中なら開始は当日 (Yahoo は過去日を開始にできない)。
- * @returns { startYmd, endYmd, startHour, endHour, spanDays } (YYYY/MM/DD)
+ * 月初 00:00 を過ぎてから発行するなら、開始は「今から START_LEAD_MIN 分以上先の正時」
+ * (Yahoo は今より前の日時を開始にできない。当日の 00:00 も不可)。
+ * @returns { startYmd, endYmd, startHour, endHour, spanDays } (YYYY/MM/DD, HH)
  */
 export function monthlyCouponPeriod(month, nowIso = new Date().toISOString()) {
   if (!isValidMonth(month)) throw new Error(`月の形式が不正 (${month})`);
   const [y, m] = month.split('-').map(Number);
-  const jstNow = new Date(Date.parse(nowIso) + 9 * 3600 * 1000);
+  const HOUR_MS = 3600 * 1000;
+  const nowMs = Date.parse(nowIso);
+  const jstNow = new Date(nowMs + 9 * HOUR_MS);
   const today = { y: jstNow.getUTCFullYear(), m: jstNow.getUTCMonth() + 1, d: jstNow.getUTCDate() };
-  // 開始 = 月初。ただし当月かつ既に月初を過ぎているなら当日 (過去日は Yahoo が受け付けない)
-  let start = { y, m, d: 1 };
-  if (y === today.y && m === today.m && today.d > 1) start = today;
   if (new Date(Date.UTC(y, m - 1, 1)) < new Date(Date.UTC(today.y, today.m - 1, today.d)) && !(y === today.y && m === today.m)) {
     throw new Error(`過去の月には発行できない (${month})`);
   }
+  // 開始 = 月初 00:00 (JST)。それが今+猶予より前なら、今+猶予を正時に切り上げた時刻 (JST は UTC+9 ちょうどなので UTC で切り上げてよい)
+  const earliestMs = Math.ceil((nowMs + START_LEAD_MIN * 60 * 1000) / HOUR_MS) * HOUR_MS;
+  const startMs = Math.max(Date.UTC(y, m - 1, 1) - 9 * HOUR_MS, earliestMs);
+  const s = new Date(startMs + 9 * HOUR_MS);
+  const start = { y: s.getUTCFullYear(), m: s.getUTCMonth() + 1, d: s.getUTCDate() };
+  const startHour = String(s.getUTCHours()).padStart(2, '0');
   // 終了 = 翌月末
   const endMonth = m === 12 ? 1 : m + 1;
   const endYear = m === 12 ? y + 1 : y;
@@ -104,7 +117,7 @@ export function monthlyCouponPeriod(month, nowIso = new Date().toISOString()) {
   return {
     startYmd: ymdSlash(start.y, start.m, start.d),
     endYmd: ymdSlash(end.y, end.m, end.d),
-    startHour: COUPON_START_HOUR, endHour: COUPON_END_HOUR, spanDays,
+    startHour, endHour: COUPON_END_HOUR, spanDays,
   };
 }
 

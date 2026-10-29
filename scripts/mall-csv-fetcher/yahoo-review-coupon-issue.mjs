@@ -30,7 +30,7 @@ import { initRunLog, sendGChat, buildErrorReport } from './lib-notify.mjs';
 import {
   ensureYahooCouponLedger, monthlyCouponPeriod, makeOperationId, couponDescription, isValidCouponUrl,
   reserveMonth, refreshPlannedPeriod, markSubmitting, markIssued, markReconcileRequired, escalateStale, getCouponRow,
-  couponUrlMatchesId, isUsableCopySource, COUPON_TITLE, COUPON_DISCOUNT_RATIO, EXPECTED_FORM, FORM_HOUR_START, FORM_HOUR_END,
+  couponUrlMatchesId, isUsableCopySource, COUPON_TITLE, COUPON_DISCOUNT_RATIO, EXPECTED_FORM, FORM_HOUR_END, formHour,
 } from '../../apps/warehouse/yahoo-review-coupon-lib.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -203,8 +203,10 @@ async function applyPlan(page, { period, operationId }) {
   await setField(page, 'publish_end_date', period.endYmd);
   await setField(page, 'start_date', period.startYmd);
   await setField(page, 'end_date', period.endYmd);
-  // 時刻セレクトは HHMMSS 形式 (実測 '000000'/'230000')。台帳の '00'/'23' 表記とは別物
-  for (const [n, v] of [['PublishStartHour', FORM_HOUR_START], ['PublishEndHour', FORM_HOUR_END], ['StartHour', FORM_HOUR_START], ['EndHour', FORM_HOUR_END]]) {
+  // 時刻セレクトは HHMMSS 形式 (実測 '000000'/'230000')。台帳の '00'/'23' 表記とは別物。
+  // 開始時刻は月初より前の発行なら 00、当日の発行なら「今より後の正時」(monthlyCouponPeriod が決める)
+  const startHour = formHour(period.startHour);
+  for (const [n, v] of [['PublishStartHour', startHour], ['PublishEndHour', FORM_HOUR_END], ['StartHour', startHour], ['EndHour', FORM_HOUR_END]]) {
     await page.selectOption(`select[name="${n}"]`, v);
   }
 }
@@ -230,8 +232,8 @@ async function verifyForm(page, { period, operationId, invariants }) {
     Title: COUPON_TITLE, Description: couponDescription(operationId),
     publish_start_date: period.startYmd, publish_end_date: period.endYmd,
     start_date: period.startYmd, end_date: period.endYmd,
-    PublishStartHour: FORM_HOUR_START, PublishEndHour: FORM_HOUR_END,
-    StartHour: FORM_HOUR_START, EndHour: FORM_HOUR_END,
+    PublishStartHour: formHour(period.startHour), PublishEndHour: FORM_HOUR_END,
+    StartHour: formHour(period.startHour), EndHour: FORM_HOUR_END,
   };
   for (const [k, w] of Object.entries(want)) if (got[k] !== w) diffs.push(`${k}: 期待"${w}" 実際"${got[k]}"`);
   // コピー元から引き継いだ設定 (割引種別・率・公開範囲・対象商品・併用可否) が編集で変わっていないこと。
@@ -358,7 +360,7 @@ async function main() {
     // まだ画面に送っていない → 今日を基準に計算し直した期間を使う (予約日の開始日は過去日になりうる)
     operationId = row.operation_id;
     if (LIVE && refreshPlannedPeriod(db, { month: MONTH, period, nowIso: nowIso() })) {
-      console.log(`台帳の期間を付け直し: ${row.coupon_start}〜${row.coupon_end} → ${period.startYmd}〜${period.endYmd}`);
+      console.log(`台帳の期間を付け直し: ${row.coupon_start}〜${row.coupon_end} → ${period.startYmd} ${period.startHour}:00〜${period.endYmd} ${period.endHour}:00`);
       row = getCouponRow(db, MONTH);
     }
   } else {
